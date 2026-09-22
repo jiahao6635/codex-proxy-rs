@@ -60,6 +60,12 @@ pub struct RuntimeSettingsView {
     pub account_auto_freeze_probe_enabled: bool,
     pub account_auto_freeze_probe_model: Option<String>,
     pub account_auto_freeze_adaptive_concurrency: bool,
+    pub account_model_downgrade_enabled: bool,
+    pub account_model_downgrade_threshold: u64,
+    pub account_model_downgrade_window_seconds: u64,
+    pub account_model_downgrade_probe_interval_seconds: u64,
+    pub account_model_downgrade_ladder: Vec<String>,
+    pub account_model_downgrade_probe_model: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -95,6 +101,12 @@ pub struct UpdateRuntimeSettingsRequest {
     pub account_auto_freeze_probe_enabled: bool,
     pub account_auto_freeze_probe_model: Option<String>,
     pub account_auto_freeze_adaptive_concurrency: bool,
+    pub account_model_downgrade_enabled: bool,
+    pub account_model_downgrade_threshold: u64,
+    pub account_model_downgrade_window_seconds: u64,
+    pub account_model_downgrade_probe_interval_seconds: u64,
+    pub account_model_downgrade_ladder: Vec<String>,
+    pub account_model_downgrade_probe_model: Option<String>,
 }
 
 impl UpdateRuntimeSettingsRequest {
@@ -174,6 +186,43 @@ impl UpdateRuntimeSettingsRequest {
             self.account_auto_freeze_probe_model.as_deref(),
             "accountAutoFreezeProbeModel",
         )?;
+        for (value, field) in [
+            (
+                self.account_model_downgrade_threshold,
+                "accountModelDowngradeThreshold",
+            ),
+            (
+                self.account_model_downgrade_window_seconds,
+                "accountModelDowngradeWindowSeconds",
+            ),
+            (
+                self.account_model_downgrade_probe_interval_seconds,
+                "accountModelDowngradeProbeIntervalSeconds",
+            ),
+        ] {
+            require_positive_i64(value, field)?;
+        }
+        if !(1..=1_000).contains(&self.account_model_downgrade_threshold) {
+            return Err(WireValidationError::new("accountModelDowngradeThreshold"));
+        }
+        if !(60..=3_600).contains(&self.account_model_downgrade_window_seconds) {
+            return Err(WireValidationError::new(
+                "accountModelDowngradeWindowSeconds",
+            ));
+        }
+        if !(300..=604_800).contains(&self.account_model_downgrade_probe_interval_seconds) {
+            return Err(WireValidationError::new(
+                "accountModelDowngradeProbeIntervalSeconds",
+            ));
+        }
+        validate_optional_probe_model(
+            self.account_model_downgrade_probe_model.as_deref(),
+            "accountModelDowngradeProbeModel",
+        )?;
+        validate_downgrade_ladder(
+            &self.account_model_downgrade_ladder,
+            self.account_model_downgrade_enabled,
+        )?;
         Ok(())
     }
 
@@ -220,6 +269,16 @@ impl UpdateRuntimeSettingsRequest {
             account_auto_freeze_probe_enabled: self.account_auto_freeze_probe_enabled,
             account_auto_freeze_probe_model: self.account_auto_freeze_probe_model,
             account_auto_freeze_adaptive_concurrency: self.account_auto_freeze_adaptive_concurrency,
+            account_model_downgrade_enabled: self.account_model_downgrade_enabled,
+            account_model_downgrade_threshold: u32::try_from(
+                self.account_model_downgrade_threshold,
+            )
+            .map_err(|_| WireValidationError::new("settingsDowngradeThresholdOverflow"))?,
+            account_model_downgrade_window_seconds: self.account_model_downgrade_window_seconds,
+            account_model_downgrade_probe_interval_seconds: self
+                .account_model_downgrade_probe_interval_seconds,
+            account_model_downgrade_ladder: self.account_model_downgrade_ladder,
+            account_model_downgrade_probe_model: self.account_model_downgrade_probe_model,
         })
     }
 }
@@ -258,6 +317,15 @@ impl From<RuntimeSettings> for RuntimeSettingsView {
             account_auto_freeze_probe_model: settings.account_auto_freeze_probe_model,
             account_auto_freeze_adaptive_concurrency: settings
                 .account_auto_freeze_adaptive_concurrency,
+            account_model_downgrade_enabled: settings.account_model_downgrade_enabled,
+            account_model_downgrade_threshold: u64::from(
+                settings.account_model_downgrade_threshold,
+            ),
+            account_model_downgrade_window_seconds: settings.account_model_downgrade_window_seconds,
+            account_model_downgrade_probe_interval_seconds: settings
+                .account_model_downgrade_probe_interval_seconds,
+            account_model_downgrade_ladder: settings.account_model_downgrade_ladder,
+            account_model_downgrade_probe_model: settings.account_model_downgrade_probe_model,
             updated_at: settings.updated_at,
         }
     }
@@ -691,6 +759,22 @@ fn validate_optional_client_version(
 }
 
 /// 探测模型为可选自由文本：非空、去首尾空白后不变、无控制字符且不超过 128 字节。
+/// 档位表校验：条目非空、去空白、无控制字符、互不重复；启用时不得为空。
+fn validate_downgrade_ladder(ladder: &[String], enabled: bool) -> Result<(), WireValidationError> {
+    const FIELD: &str = "accountModelDowngradeLadder";
+    if ladder.len() > 64 || (enabled && ladder.is_empty()) {
+        return Err(WireValidationError::new(FIELD));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for model in ladder {
+        validate_optional_probe_model(Some(model.as_str()), FIELD)?;
+        if !seen.insert(model.as_str()) {
+            return Err(WireValidationError::new(FIELD));
+        }
+    }
+    Ok(())
+}
+
 fn validate_optional_probe_model(
     value: Option<&str>,
     field: &'static str,

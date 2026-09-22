@@ -11,8 +11,8 @@ use sqlx::{PgPool, Postgres, Transaction};
 use gateway_core::account::RotationStrategy;
 use gateway_core::policy::CodexClientVersion;
 use gateway_core::provider_ports::{
-    ProviderFreezePolicy, ProviderRefreshPolicy, ProviderRuntimePolicyPort, ProviderStoreError,
-    ProviderStoreErrorKind,
+    ModelDowngradePolicy, ProviderFreezePolicy, ProviderRefreshPolicy, ProviderRuntimePolicyPort,
+    ProviderStoreError, ProviderStoreErrorKind,
 };
 
 use crate::{Revision, StoreError, StoreResult, postgres_unavailable};
@@ -47,6 +47,12 @@ pub struct RuntimeSettings {
     pub account_auto_freeze_probe_enabled: bool,
     pub account_auto_freeze_probe_model: Option<String>,
     pub account_auto_freeze_adaptive_concurrency: bool,
+    pub account_model_downgrade_enabled: bool,
+    pub account_model_downgrade_threshold: u32,
+    pub account_model_downgrade_window_seconds: u64,
+    pub account_model_downgrade_probe_interval_seconds: u64,
+    pub account_model_downgrade_ladder: Vec<String>,
+    pub account_model_downgrade_probe_model: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -137,6 +143,12 @@ pub struct RuntimeSettingsUpdate {
     pub account_auto_freeze_probe_enabled: bool,
     pub account_auto_freeze_probe_model: Option<String>,
     pub account_auto_freeze_adaptive_concurrency: bool,
+    pub account_model_downgrade_enabled: bool,
+    pub account_model_downgrade_threshold: u32,
+    pub account_model_downgrade_window_seconds: u64,
+    pub account_model_downgrade_probe_interval_seconds: u64,
+    pub account_model_downgrade_ladder: Vec<String>,
+    pub account_model_downgrade_probe_model: Option<String>,
 }
 
 impl fmt::Debug for RuntimeSettingsUpdate {
@@ -175,6 +187,13 @@ impl RuntimeSettingsUpdate {
             || !valid_client_version(self.min_codex_desktop_version.as_deref())
             || !valid_client_version(self.min_codex_cli_version.as_deref())
             || !valid_probe_model(self.account_auto_freeze_probe_model.as_deref())
+            || !(1..=1_000).contains(&self.account_model_downgrade_threshold)
+            || !(60..=3_600).contains(&self.account_model_downgrade_window_seconds)
+            || !(300..=604_800).contains(&self.account_model_downgrade_probe_interval_seconds)
+            || !valid_probe_model(self.account_model_downgrade_probe_model.as_deref())
+            || !valid_downgrade_ladder(&self.account_model_downgrade_ladder)
+            || (self.account_model_downgrade_enabled
+                && self.account_model_downgrade_ladder.is_empty())
             || RotationStrategy::parse(&self.rotation_strategy).is_none()
         {
             return Err(StoreError::InvalidData {
@@ -240,7 +259,10 @@ pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResul
                     account_auto_freeze_enabled, account_auto_freeze_threshold,
                     account_auto_freeze_window_seconds, account_auto_freeze_duration_seconds,
                     account_auto_freeze_probe_enabled, account_auto_freeze_probe_model,
-                    account_auto_freeze_adaptive_concurrency
+                    account_auto_freeze_adaptive_concurrency,
+                    account_model_downgrade_enabled, account_model_downgrade_threshold,
+                    account_model_downgrade_window_seconds, account_model_downgrade_probe_interval_seconds,
+                    account_model_downgrade_ladder_json, account_model_downgrade_probe_model
              from runtime_settings where id = 1",
         )
     .fetch_optional(pool)
@@ -312,6 +334,24 @@ impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
             )
         })
     }
+
+    fn load_model_downgrade_policy(
+        &self,
+    ) -> futures::future::BoxFuture<'_, Result<ModelDowngradePolicy, ProviderStoreError>> {
+        Box::pin(async move {
+            let settings = RuntimeSettingsRepository::load_runtime_settings(self)
+                .await
+                .map_err(|_| provider_unavailable("load model downgrade policy"))?;
+            ModelDowngradePolicy::try_new(
+                settings.account_model_downgrade_enabled,
+                settings.account_model_downgrade_threshold,
+                settings.account_model_downgrade_window_seconds,
+                settings.account_model_downgrade_probe_interval_seconds,
+                settings.account_model_downgrade_ladder,
+                settings.account_model_downgrade_probe_model,
+            )
+        })
+    }
 }
 
 pub(crate) async fn load_runtime_settings_in_transaction(
@@ -326,7 +366,10 @@ pub(crate) async fn load_runtime_settings_in_transaction(
                 account_auto_freeze_enabled, account_auto_freeze_threshold,
                 account_auto_freeze_window_seconds, account_auto_freeze_duration_seconds,
                 account_auto_freeze_probe_enabled, account_auto_freeze_probe_model,
-                account_auto_freeze_adaptive_concurrency
+                account_auto_freeze_adaptive_concurrency,
+                account_model_downgrade_enabled, account_model_downgrade_threshold,
+                account_model_downgrade_window_seconds, account_model_downgrade_probe_interval_seconds,
+                account_model_downgrade_ladder_json, account_model_downgrade_probe_model
          from runtime_settings where id = 1",
     )
     .fetch_optional(&mut **transaction)
@@ -377,6 +420,12 @@ pub(crate) async fn update_runtime_settings_in_transaction(
                      provider_request_profiles_json = provider_request_profiles_json
                          || case when $26::jsonb is null then '{}'::jsonb else jsonb_build_object('openai', $26::jsonb) end
                          || case when $27::jsonb is null then '{}'::jsonb else jsonb_build_object('xai', $27::jsonb) end,
+                     account_model_downgrade_enabled = $28,
+                     account_model_downgrade_threshold = $29,
+                     account_model_downgrade_window_seconds = $30,
+                     account_model_downgrade_probe_interval_seconds = $31,
+                     account_model_downgrade_ladder_json = $32,
+                     account_model_downgrade_probe_model = $33,
 	                 updated_at = now()
 	             where id = 1
 	             returning config_revision",
@@ -420,6 +469,18 @@ pub(crate) async fn update_runtime_settings_in_transaction(
     )
     .bind(update.openai_client_profile.as_ref().map(|profile| sqlx::types::Json(profile.expose_to_provider())))
     .bind(update.xai_client_profile.as_ref().map(|profile| sqlx::types::Json(profile.expose_to_provider())))
+    .bind(update.account_model_downgrade_enabled)
+    .bind(i64::from(update.account_model_downgrade_threshold))
+    .bind(
+        i64::try_from(update.account_model_downgrade_window_seconds)
+            .map_err(|_| invalid_numeric())?,
+    )
+    .bind(
+        i64::try_from(update.account_model_downgrade_probe_interval_seconds)
+            .map_err(|_| invalid_numeric())?,
+    )
+    .bind(sqlx::types::Json(&update.account_model_downgrade_ladder))
+    .bind(update.account_model_downgrade_probe_model.as_deref())
     .fetch_optional(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("update runtime settings in transaction"))?
@@ -499,6 +560,12 @@ struct RuntimeSettingsRow {
     account_auto_freeze_probe_enabled: bool,
     account_auto_freeze_probe_model: Option<String>,
     account_auto_freeze_adaptive_concurrency: bool,
+    account_model_downgrade_enabled: bool,
+    account_model_downgrade_threshold: i64,
+    account_model_downgrade_window_seconds: i64,
+    account_model_downgrade_probe_interval_seconds: i64,
+    account_model_downgrade_ladder_json: sqlx::types::Json<Vec<String>>,
+    account_model_downgrade_probe_model: Option<String>,
 }
 
 fn runtime_settings_from_row(mut row: RuntimeSettingsRow) -> StoreResult<RuntimeSettings> {
@@ -544,6 +611,14 @@ fn runtime_settings_from_row(mut row: RuntimeSettingsRow) -> StoreResult<Runtime
         account_auto_freeze_probe_enabled: row.account_auto_freeze_probe_enabled,
         account_auto_freeze_probe_model: row.account_auto_freeze_probe_model,
         account_auto_freeze_adaptive_concurrency: row.account_auto_freeze_adaptive_concurrency,
+        account_model_downgrade_enabled: row.account_model_downgrade_enabled,
+        account_model_downgrade_threshold: to_u32(row.account_model_downgrade_threshold)?,
+        account_model_downgrade_window_seconds: to_u64(row.account_model_downgrade_window_seconds)?,
+        account_model_downgrade_probe_interval_seconds: to_u64(
+            row.account_model_downgrade_probe_interval_seconds,
+        )?,
+        account_model_downgrade_ladder: row.account_model_downgrade_ladder_json.0,
+        account_model_downgrade_probe_model: row.account_model_downgrade_probe_model,
     })
 }
 
@@ -592,6 +667,15 @@ fn valid_model_name(value: &str, max_len: usize) -> bool {
 
 fn valid_client_version(value: Option<&str>) -> bool {
     value.is_none_or(|value| CodexClientVersion::parse(value).is_ok())
+}
+
+/// 档位表约束与 `ModelDowngradePolicy::try_new` 一致：条目非空、去空白、无控制字符、无重复。
+fn valid_downgrade_ladder(ladder: &[String]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    ladder.len() <= 64
+        && ladder
+            .iter()
+            .all(|model| valid_probe_model(Some(model.as_str())) && seen.insert(model.as_str()))
 }
 
 fn valid_probe_model(value: Option<&str>) -> bool {

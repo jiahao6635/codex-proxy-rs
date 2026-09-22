@@ -812,6 +812,17 @@ pub trait ProviderCooldownPort: Send + Sync {
         in_flight: u32,
     ) -> BoxFuture<'a, Result<u32, ProviderStoreError>>;
 
+    /// 记录一次模型档位观测并返回滑动窗口内的累计降智次数。
+    ///
+    /// `downgraded` 为 false 表示本次返回模型未低于请求档位，是账号当前未被
+    /// 降级的证据，据此清空窗口计数并返回 0；只服务降智下线触发器。
+    fn observe_model_downgrade<'a>(
+        &'a self,
+        account_id: &'a ProviderAccountId,
+        window: Duration,
+        downgraded: bool,
+    ) -> BoxFuture<'a, Result<u32, ProviderStoreError>>;
+
     /// 普通请求成功后原子清除临时限流及失败证据；必须保留任何容量冻结。
     fn clear_after_success<'a>(
         &'a self,
@@ -954,6 +965,13 @@ pub trait ProviderRuntimePolicyPort: Send + Sync {
         &self,
     ) -> BoxFuture<'_, Result<ProviderFreezePolicy, ProviderStoreError>> {
         Box::pin(async move { Ok(ProviderFreezePolicy::disabled()) })
+    }
+
+    /// 读取账号模型降智下线策略；默认关闭，只有实现运行时设置的存储需要覆盖。
+    fn load_model_downgrade_policy(
+        &self,
+    ) -> BoxFuture<'_, Result<ModelDowngradePolicy, ProviderStoreError>> {
+        Box::pin(async move { Ok(ModelDowngradePolicy::disabled()) })
     }
 }
 
@@ -1216,7 +1234,10 @@ impl ModelDowngradePolicy {
 
 /// 归一化模型名以做档位比较：去空白并剥离已知的 `responses/` 协议前缀。
 fn normalize_model_name(model: &str) -> &str {
-    model.trim().strip_prefix("responses/").unwrap_or(model.trim())
+    model
+        .trim()
+        .strip_prefix("responses/")
+        .unwrap_or(model.trim())
 }
 
 /// OAuth pending flow 的原始绑定只在 Provider 与 Store 边界内短暂存在。

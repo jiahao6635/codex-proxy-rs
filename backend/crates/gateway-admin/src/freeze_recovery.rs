@@ -11,12 +11,14 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use futures::StreamExt as _;
 use gateway_core::account::{AccountConcurrencyLimit, ProviderAccountId};
+use gateway_core::provider_ports::{ModelDowngradePolicy, ModelDowngradeVerdict};
 use gateway_core::routing::UpstreamModelId;
 use gateway_core::task::{ScheduledTask, WorkerCycleContext, WorkerTaskError};
 use tracing::warn;
 
 use crate::model::accounts::{
-    AccountConnectionTestEvent, AccountFreeze, AccountPageItem, AccountRuntimeSnapshot,
+    AccountConnectionTestEvent, AccountFreeze, AccountFreezeCause, AccountPageItem,
+    AccountRuntimeSnapshot,
 };
 use crate::model::{MutationActor, MutationContext};
 use crate::ports::store::{AccountRuntimeStore, AccountStore, SettingsStore};
@@ -76,6 +78,21 @@ impl FreezeRecoveryTask {
         .ok()
     }
 
+    /// 读取降智下线策略；读取失败返回 None，本轮跳过降智冻结，
+    /// 不能把未知配置当作"功能已关闭"而误放行仍在降智的账号。
+    async fn model_downgrade_policy(&self) -> Option<ModelDowngradePolicy> {
+        let settings = self.deps.settings.load_runtime_settings().await.ok()?;
+        ModelDowngradePolicy::try_new(
+            settings.account_model_downgrade_enabled,
+            settings.account_model_downgrade_threshold,
+            settings.account_model_downgrade_window_seconds,
+            settings.account_model_downgrade_probe_interval_seconds,
+            settings.account_model_downgrade_ladder,
+            settings.account_model_downgrade_probe_model,
+        )
+        .ok()
+    }
+
     async fn active_freezes(&self) -> BTreeMap<String, AccountFreeze> {
         self.deps.runtime.active_freezes().await.unwrap_or_default()
     }
@@ -84,14 +101,24 @@ impl FreezeRecoveryTask {
         let Some(policy) = self.freeze_policy().await else {
             return;
         };
+        let downgrade_policy = self.model_downgrade_policy().await;
         let freezes = self.active_freezes().await;
         if freezes.is_empty() {
             return;
         }
+        // 自适应并发下调的证据来自容量失败窗口，降智下线不参与。
         if policy.enabled() && policy.adaptive_concurrency() {
-            self.adapt_concurrency_limits(&freezes, &policy).await;
+            let capacity: BTreeMap<String, AccountFreeze> = freezes
+                .iter()
+                .filter(|(_, freeze)| freeze.cause == AccountFreezeCause::Capacity)
+                .map(|(id, freeze)| (id.clone(), freeze.clone()))
+                .collect();
+            if !capacity.is_empty() {
+                self.adapt_concurrency_limits(&capacity, &policy).await;
+            }
         }
-        self.recover_due_freezes(&freezes, &policy).await;
+        self.recover_due_freezes(&freezes, &policy, downgrade_policy.as_ref())
+            .await;
     }
 
     /// 对冻结中的账号执行自适应并发下调：目标为观测在途峰值的 80%（下限 2），
@@ -151,21 +178,122 @@ impl FreezeRecoveryTask {
         &self,
         freezes: &BTreeMap<String, AccountFreeze>,
         policy: &gateway_core::provider_ports::ProviderFreezePolicy,
+        downgrade_policy: Option<&ModelDowngradePolicy>,
     ) {
         for (account_id, freeze) in freezes {
-            if freeze.until > Utc::now() {
-                continue;
+            match freeze.cause {
+                AccountFreezeCause::Capacity => {
+                    if freeze.until > Utc::now() {
+                        continue;
+                    }
+                    if policy.enabled() && policy.probe_enabled() && freeze.requires_probe {
+                        self.probe_and_recover(account_id, freeze, policy).await;
+                    } else if let Err(error) = self
+                        .deps
+                        .runtime
+                        .finish_freeze(account_id, freeze, None)
+                        .await
+                    {
+                        warn!(account_id, error = %error, "解除到期冻结失败");
+                    }
+                }
+                AccountFreezeCause::ModelDowngrade => {
+                    // 读取策略失败本轮跳过；降智冻结不会自行到期，宁可继续下线。
+                    let Some(downgrade_policy) = downgrade_policy else {
+                        continue;
+                    };
+                    if !downgrade_policy.enabled() {
+                        // 功能关闭后降智冻结仍不会到期，必须显式释放，否则账号永久下线。
+                        if let Err(error) = self
+                            .deps
+                            .runtime
+                            .finish_freeze(account_id, freeze, None)
+                            .await
+                        {
+                            warn!(account_id, error = %error, "降智下线功能关闭后解除冻结失败");
+                        }
+                        continue;
+                    }
+                    if freeze.until > Utc::now() {
+                        continue;
+                    }
+                    self.probe_downgrade_and_recover(account_id, freeze, downgrade_policy)
+                        .await;
+                }
             }
-            if policy.enabled() && policy.probe_enabled() && freeze.requires_probe {
-                self.probe_and_recover(account_id, freeze, policy).await;
-            } else if let Err(error) = self
+        }
+    }
+
+    /// 降智恢复探测：请求成功还不够，上游声明的模型必须不再低于探测档位。
+    /// 上游未声明模型时按"无法确认恢复"处理，保持下线。
+    async fn probe_downgrade_and_recover(
+        &self,
+        account_id: &str,
+        freeze: &AccountFreeze,
+        policy: &ModelDowngradePolicy,
+    ) {
+        let Some(Some(item)) = self.load_account(account_id).await else {
+            return;
+        };
+        if !item.account.enabled {
+            // 停用账号没有自动恢复意义；解冻交给管理员手动恢复。
+            return;
+        }
+        let Ok(account) = ProviderAccountId::new(account_id.to_owned()) else {
+            return;
+        };
+        let Some(probe_model) = policy.probe_model().map(ToOwned::to_owned) else {
+            self.postpone(&account, freeze, policy.freeze_duration())
+                .await;
+            return;
+        };
+        let Ok(model) = UpstreamModelId::new(probe_model.clone()) else {
+            self.postpone(&account, freeze, policy.freeze_duration())
+                .await;
+            return;
+        };
+        let outcome = match self
+            .deps
+            .accounts
+            .test_connection(account.clone(), model)
+            .await
+        {
+            Ok(events) => drain_probe(events).await,
+            Err(error) => {
+                tracing::debug!(account_id, error = %error, "降智恢复探测发起失败");
+                ProbeOutcome::failed()
+            }
+        };
+        let recovered = outcome.completed
+            && outcome.reported_model.as_deref().is_some_and(|reported| {
+                policy.classify(&probe_model, reported) != ModelDowngradeVerdict::Downgraded
+            });
+        if recovered {
+            match self
                 .deps
                 .runtime
                 .finish_freeze(account_id, freeze, None)
                 .await
             {
-                warn!(account_id, error = %error, "解除到期冻结失败");
+                Ok(true) => tracing::info!(
+                    account_id,
+                    probe_model,
+                    reported_model = outcome.reported_model.as_deref().unwrap_or("<none>"),
+                    "降智恢复探测成功：账号已重新上线",
+                ),
+                Ok(false) => {}
+                Err(error) => warn!(account_id, error = %error, "解除降智冻结失败"),
             }
+        } else {
+            tracing::info!(
+                account_id,
+                probe_model,
+                reported_model = outcome.reported_model.as_deref().unwrap_or("<none>"),
+                retry_seconds = policy.freeze_duration().as_secs(),
+                "降智恢复探测未通过：账号继续下线",
+            );
+            self.postpone(&account, freeze, policy.freeze_duration())
+                .await;
         }
     }
 
@@ -187,7 +315,8 @@ impl FreezeRecoveryTask {
         };
         let Some(model) = self.resolve_probe_model(&account, policy).await else {
             // 没有可用探测模型时按失败处理，顺延冻结等待下一轮。
-            self.postpone(&account, freeze, policy).await;
+            self.postpone(&account, freeze, policy.freeze_duration())
+                .await;
             return;
         };
         let probe_succeeded = match self
@@ -196,7 +325,7 @@ impl FreezeRecoveryTask {
             .test_connection(account.clone(), model)
             .await
         {
-            Ok(events) => drain_probe(events).await,
+            Ok(events) => drain_probe(events).await.completed,
             Err(error) => {
                 tracing::debug!(account_id, error = %error, "冻结恢复探测发起失败");
                 false
@@ -214,7 +343,8 @@ impl FreezeRecoveryTask {
                 Err(error) => warn!(account_id, error = %error, "解除冻结失败"),
             }
         } else {
-            self.postpone(&account, freeze, policy).await;
+            self.postpone(&account, freeze, policy.freeze_duration())
+                .await;
         }
     }
 
@@ -223,9 +353,9 @@ impl FreezeRecoveryTask {
         &self,
         account: &ProviderAccountId,
         freeze: &AccountFreeze,
-        policy: &gateway_core::provider_ports::ProviderFreezePolicy,
+        retry_after: Duration,
     ) {
-        let Some(until) = SystemTime::now().checked_add(policy.freeze_duration()) else {
+        let Some(until) = SystemTime::now().checked_add(retry_after) else {
             return;
         };
         let until = DateTime::<Utc>::from(until);
@@ -238,7 +368,7 @@ impl FreezeRecoveryTask {
             Ok(true) => {
                 tracing::info!(
                     account_id = account.as_str(),
-                    postpone_seconds = policy.freeze_duration().as_secs(),
+                    postpone_seconds = retry_after.as_secs(),
                     "冻结恢复探测失败：账号冻结顺延",
                 );
             }
@@ -290,15 +420,35 @@ fn adaptive_target(peak_in_flight: u32) -> Option<u32> {
     Some(scaled.max(ADAPTIVE_CONCURRENCY_FLOOR))
 }
 
-/// 消耗连接测试事件流并返回是否以 `Completed` 终止。
-async fn drain_probe(mut events: crate::model::accounts::AccountConnectionTestEventStream) -> bool {
-    let mut completed = false;
+/// 探测流的终态观测：是否正常完成，以及上游为本次探测声明的模型。
+pub(crate) struct ProbeOutcome {
+    completed: bool,
+    reported_model: Option<String>,
+}
+
+impl ProbeOutcome {
+    const fn failed() -> Self {
+        Self {
+            completed: false,
+            reported_model: None,
+        }
+    }
+}
+
+/// 消耗连接测试事件流并返回终态观测；显式失败事件直接判定未完成。
+async fn drain_probe(
+    mut events: crate::model::accounts::AccountConnectionTestEventStream,
+) -> ProbeOutcome {
+    let mut outcome = ProbeOutcome::failed();
     while let Some(event) = events.next().await {
         match event {
-            AccountConnectionTestEvent::Completed => completed = true,
-            AccountConnectionTestEvent::Failed { .. } => return false,
+            AccountConnectionTestEvent::Completed { reported_model } => {
+                outcome.completed = true;
+                outcome.reported_model = reported_model;
+            }
+            AccountConnectionTestEvent::Failed { .. } => return ProbeOutcome::failed(),
             _ => {}
         }
     }
-    completed
+    outcome
 }

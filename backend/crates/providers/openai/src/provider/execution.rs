@@ -958,6 +958,18 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 selector
                     .observe_cyber_policy_success(cyber_policy_scope.as_ref())
                     .await;
+                // 成功响应才谈得上降智：比较请求档位与上游声明的模型。
+                // 恢复探测只验证账号是否回升，不能作为业务观测证据重复计数。
+                if failure_context.allows_capacity_feedback {
+                    quota
+                        .apply_model_downgrade(
+                            &active_account,
+                            upstream_model.as_str(),
+                            decoder.response_model(),
+                            std::time::SystemTime::now(),
+                        )
+                        .await;
+                }
             }
             if (rate_limits_changed
                 || response_model_changed
@@ -1089,6 +1101,18 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             selector
                 .observe_cyber_policy_success(cyber_policy_scope.as_ref())
                 .await;
+            // 成功响应才谈得上降智：比较请求档位与上游声明的模型。
+            // 恢复探测只验证账号是否回升，不能作为业务观测证据重复计数。
+            if failure_context.allows_capacity_feedback {
+                quota
+                    .apply_model_downgrade(
+                        &active_account,
+                        upstream_model.as_str(),
+                        decoder.response_model(),
+                        std::time::SystemTime::now(),
+                    )
+                    .await;
+            }
         }
         if (response_model_changed
             || service_tier_changed

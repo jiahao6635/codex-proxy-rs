@@ -147,6 +147,12 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
         account_auto_freeze_probe_enabled: true,
         account_auto_freeze_probe_model: None,
         account_auto_freeze_adaptive_concurrency: true,
+        account_model_downgrade_enabled: false,
+        account_model_downgrade_threshold: 3,
+        account_model_downgrade_window_seconds: 600,
+        account_model_downgrade_probe_interval_seconds: 3_600,
+        account_model_downgrade_ladder: Vec::new(),
+        account_model_downgrade_probe_model: None,
         updated_at: Utc
             .with_ymd_and_hms(2026, 8, 2, 10, 30, 0)
             .single()
@@ -250,6 +256,12 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         account_auto_freeze_probe_enabled: true,
         account_auto_freeze_probe_model: None,
         account_auto_freeze_adaptive_concurrency: true,
+        account_model_downgrade_enabled: false,
+        account_model_downgrade_threshold: 3,
+        account_model_downgrade_window_seconds: 600,
+        account_model_downgrade_probe_interval_seconds: 3_600,
+        account_model_downgrade_ladder: Vec::new(),
+        account_model_downgrade_probe_model: None,
         updated_at: chrono::Utc::now(),
     };
 

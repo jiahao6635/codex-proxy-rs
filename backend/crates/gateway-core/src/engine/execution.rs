@@ -848,15 +848,25 @@ impl DefaultExecutionService {
                 .observe_probe_failure(&observed, started_at, &error)
                 .await);
         }
+        // 同一趟事实里既取文本增量，也取上游声明的模型；终态声明优先于起始声明。
+        let mut text = Vec::new();
+        let mut started_model = None;
+        let mut completed_model = None;
+        for fact in events.into_iter().flat_map(|event| event.into_parts().0) {
+            match fact {
+                GatewayEvent::TextDelta(delta) => text.push(delta.text),
+                GatewayEvent::Started(meta) => {
+                    started_model = meta.model().map(ToOwned::to_owned);
+                }
+                GatewayEvent::Completed(meta) => {
+                    completed_model = meta.model().map(ToOwned::to_owned);
+                }
+                _ => {}
+            }
+        }
         Ok(AccountProbeResult {
-            text: events
-                .into_iter()
-                .flat_map(|event| event.into_parts().0)
-                .filter_map(|fact| match fact {
-                    GatewayEvent::TextDelta(delta) => Some(delta.text),
-                    _ => None,
-                })
-                .collect(),
+            text,
+            reported_model: completed_model.or(started_model),
         })
     }
 

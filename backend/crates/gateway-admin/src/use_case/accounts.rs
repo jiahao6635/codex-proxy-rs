@@ -920,12 +920,17 @@ impl AccountsService for DefaultAccountsService {
                 })
                 .await;
             match result {
-                Ok(result) => result
-                    .text
-                    .into_iter()
-                    .map(|text| AccountConnectionTestEvent::Content { text })
-                    .chain(std::iter::once(AccountConnectionTestEvent::Completed))
-                    .collect(),
+                Ok(result) => {
+                    let reported_model = result.reported_model;
+                    result
+                        .text
+                        .into_iter()
+                        .map(|text| AccountConnectionTestEvent::Content { text })
+                        .chain(std::iter::once(AccountConnectionTestEvent::Completed {
+                            reported_model,
+                        }))
+                        .collect()
+                }
                 Err(error) => {
                     let upstream_status = error
                         .upstream_response()

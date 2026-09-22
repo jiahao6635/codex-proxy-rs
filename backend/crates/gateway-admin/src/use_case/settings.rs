@@ -393,7 +393,24 @@ fn validate_settings(command: &ReplaceRuntimeSettings) -> Result<(), AdminError>
         && i64::try_from(command.request_interval_ms).is_ok()
         && (2..=1_000).contains(&command.account_auto_freeze_threshold)
         && (60..=3_600).contains(&command.account_auto_freeze_window_seconds)
-        && (300..=604_800).contains(&command.account_auto_freeze_duration_seconds);
+        && (300..=604_800).contains(&command.account_auto_freeze_duration_seconds)
+        && valid_probe_model(command.account_model_downgrade_probe_model.as_deref())
+        && (1..=1_000).contains(&command.account_model_downgrade_threshold)
+        && (60..=3_600).contains(&command.account_model_downgrade_window_seconds)
+        && (300..=604_800).contains(&command.account_model_downgrade_probe_interval_seconds)
+        && command.account_model_downgrade_ladder.len() <= 64
+        && command
+            .account_model_downgrade_ladder
+            .iter()
+            .all(|model| valid_probe_model(Some(model.as_str())))
+        && command
+            .account_model_downgrade_ladder
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == command.account_model_downgrade_ladder.len()
+        && !(command.account_model_downgrade_enabled
+            && command.account_model_downgrade_ladder.is_empty());
     if valid {
         Ok(())
     } else {

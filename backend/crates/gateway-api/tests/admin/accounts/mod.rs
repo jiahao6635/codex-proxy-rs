@@ -827,7 +827,9 @@ mod actions {
             DomainConnectionTestEvent::Content {
                 text: "OK".to_owned(),
             },
-            DomainConnectionTestEvent::Completed {},
+            DomainConnectionTestEvent::Completed {
+                reported_model: None,
+            },
             DomainConnectionTestEvent::Failed {
                 source: AccountProbeErrorSource::Upstream,
                 gateway_error_code: GatewayErrorKind::RateLimited,

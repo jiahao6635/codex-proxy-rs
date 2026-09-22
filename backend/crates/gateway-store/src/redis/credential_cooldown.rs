@@ -18,7 +18,12 @@ use crate::{Revision, StoreError, StoreResult, redis_unavailable, require_nonemp
 
 use super::{namespace, resource_fingerprint};
 
+// 需要探测才能解除的冻结类别，与 `AccountCooldownKind::requires_probe` 保持一致；
+// 这类冷却的 until 是下次探测时间，到期不得自动放行，因此 key 必须常驻。
 const WRITE_SCRIPT: &str = r#"
+local function requires_probe(kind)
+  return kind == 'capacity_freeze_probe' or kind == 'model_downgrade_freeze'
+end
 local current = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
 local incoming = tonumber(ARGV[1])
 local incoming_until = tonumber(ARGV[2])
@@ -32,9 +37,9 @@ if current == incoming then
 end
 local clock = redis.call('TIME')
 local now_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
-if incoming_until <= now_ms and ARGV[4] ~= 'capacity_freeze_probe' then return 0 end
+if incoming_until <= now_ms and not requires_probe(ARGV[4]) then return 0 end
 redis.call('HSET', KEYS[1], 'revision', ARGV[1], 'until_ms', incoming_until, 'kind', ARGV[4], 'generation', ARGV[5])
-if ARGV[4] == 'capacity_freeze_probe' then
+if requires_probe(ARGV[4]) then
   redis.call('PERSIST', KEYS[1])
 else
   redis.call('PEXPIRE', KEYS[1], incoming_until - now_ms + 60000)
@@ -44,12 +49,15 @@ return 1
 "#;
 
 const READ_SCRIPT: &str = r#"
+local function requires_probe(kind)
+  return kind == 'capacity_freeze_probe' or kind == 'model_downgrade_freeze'
+end
 local revision = redis.call('HGET', KEYS[1], 'revision')
 local until_ms = redis.call('HGET', KEYS[1], 'until_ms')
 local kind = redis.call('HGET', KEYS[1], 'kind') or 'rate_limit'
 local clock = redis.call('TIME')
 local now_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
-if revision == false or until_ms == false or (kind ~= 'capacity_freeze_probe' and tonumber(until_ms) <= now_ms) then
+if revision == false or until_ms == false or (not requires_probe(kind) and tonumber(until_ms) <= now_ms) then
   redis.call('DEL', KEYS[1])
   if #KEYS > 1 then redis.call('ZREM', KEYS[2], ARGV[1]) end
   return {0, '0', '0', 'rate_limit', ''}
@@ -77,18 +85,24 @@ return 1
 
 // 探测结果只能修改读到的这一代冻结；删除后重建同 revision 的冻结也不匹配。
 const FINISH_FREEZE_SCRIPT: &str = r#"
+local function requires_probe(kind)
+  return kind == 'capacity_freeze_probe' or kind == 'model_downgrade_freeze'
+end
+local function is_freeze(kind)
+  return kind == 'capacity_freeze' or requires_probe(kind)
+end
 if redis.call('HGET', KEYS[1], 'generation') ~= ARGV[2]
   or redis.call('HGET', KEYS[1], 'revision') ~= ARGV[1] then return 0 end
 local kind = redis.call('HGET', KEYS[1], 'kind')
-if kind ~= 'capacity_freeze' and kind ~= 'capacity_freeze_probe' then return 0 end
+if not is_freeze(kind) then return 0 end
 if ARGV[4] == '' then
-  redis.call('DEL', KEYS[1], KEYS[3], KEYS[4])
+  redis.call('DEL', KEYS[1], KEYS[3], KEYS[4], KEYS[5])
   redis.call('ZREM', KEYS[2], ARGV[3])
 else
   local until_ms = math.max(tonumber(redis.call('HGET', KEYS[1], 'until_ms')), tonumber(ARGV[4]))
   redis.call('HSET', KEYS[1], 'until_ms', until_ms, 'generation', ARGV[5])
   redis.call('ZADD', KEYS[2], until_ms, ARGV[3])
-  if kind == 'capacity_freeze_probe' then
+  if requires_probe(kind) then
     redis.call('PERSIST', KEYS[1])
   else
     local clock = redis.call('TIME')
@@ -114,6 +128,17 @@ if in_flight > 0 then
     redis.call('PEXPIRE', KEYS[2], ttl_ms)
   end
 end
+return count
+"#;
+
+// 健康响应是账号未被降级的证据，直接清空窗口计数；降智观测才累加并顺延窗口 TTL。
+const OBSERVE_MODEL_DOWNGRADE_SCRIPT: &str = r#"
+if ARGV[2] == '0' then
+  redis.call('DEL', KEYS[1])
+  return 0
+end
+local count = redis.call('INCR', KEYS[1])
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[1]))
 return count
 "#;
 
@@ -176,6 +201,14 @@ impl RedisCredentialCooldownRepository {
         let fingerprint = resource_fingerprint("credential cooldown", provider_account_id)?;
         Ok(format!(
             "{}:account:{fingerprint}:capacity-peak-inflight",
+            self.namespace
+        ))
+    }
+
+    fn model_downgrade_key(&self, provider_account_id: &str) -> StoreResult<String> {
+        let fingerprint = resource_fingerprint("credential cooldown", provider_account_id)?;
+        Ok(format!(
+            "{}:account:{fingerprint}:model-downgrades",
             self.namespace
         ))
     }
@@ -344,8 +377,13 @@ impl RedisCredentialCooldownRepository {
             if let Some((revision, until, kind, generation)) = self
                 .read_at_key(self.key(&account_id)?, Some(&account_id))
                 .await?
-                && kind.is_capacity_freeze()
+                && kind.is_freeze()
             {
+                let cause = if kind.is_model_downgrade() {
+                    gateway_admin::model::accounts::AccountFreezeCause::ModelDowngrade
+                } else {
+                    gateway_admin::model::accounts::AccountFreezeCause::Capacity
+                };
                 freezes.insert(
                     account_id,
                     gateway_admin::model::accounts::AccountFreeze {
@@ -354,6 +392,7 @@ impl RedisCredentialCooldownRepository {
                         until,
                         generation,
                         requires_probe: kind.requires_probe(),
+                        cause,
                     },
                 );
             }
@@ -373,6 +412,7 @@ impl RedisCredentialCooldownRepository {
             .key(self.active_index_key())
             .key(self.capacity_failures_key(account_id)?)
             .key(self.capacity_peak_key(account_id)?)
+            .key(self.model_downgrade_key(account_id)?)
             .arg(expected.credential_revision.get())
             .arg(&expected.generation)
             .arg(account_id)
@@ -682,6 +722,30 @@ impl ProviderCooldownPort for RedisCredentialCooldownRepository {
                 .await
                 .map_err(|_| provider_unavailable("record capacity failure"))?;
             u32::try_from(count).map_err(|_| provider_invalid("decode capacity failure count"))
+        })
+    }
+
+    fn observe_model_downgrade<'a>(
+        &'a self,
+        account_id: &'a ProviderAccountId,
+        window: Duration,
+        downgraded: bool,
+    ) -> futures::future::BoxFuture<'a, Result<u32, ProviderStoreError>> {
+        Box::pin(async move {
+            let mut connection = self.connection.clone();
+            let window_ms = u64::try_from(window.as_millis())
+                .map_err(|_| provider_invalid("encode model downgrade window"))?;
+            let count: i64 = Script::new(OBSERVE_MODEL_DOWNGRADE_SCRIPT)
+                .key(
+                    self.model_downgrade_key(account_id.as_str())
+                        .map_err(|_| provider_invalid("encode model downgrade key"))?,
+                )
+                .arg(i64::try_from(window_ms).unwrap_or(i64::MAX))
+                .arg(i32::from(downgraded))
+                .invoke_async(&mut connection)
+                .await
+                .map_err(|_| provider_unavailable("observe model downgrade"))?;
+            u32::try_from(count).map_err(|_| provider_invalid("decode model downgrade count"))
         })
     }
 

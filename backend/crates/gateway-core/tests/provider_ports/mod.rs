@@ -116,10 +116,15 @@ fn scheduling_state_preserves_provider_neutral_signals() {
 use gateway_core::provider_ports::{ModelDowngradePolicy, ModelDowngradeVerdict};
 
 fn downgrade_ladder() -> Vec<String> {
-    ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
+    [
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 fn downgrade_policy() -> ModelDowngradePolicy {
@@ -191,9 +196,15 @@ fn model_downgrade_probe_model_defaults_to_top_tier() {
     let policy = downgrade_policy();
     assert_eq!(policy.probe_model(), Some("gpt-6-astra"));
 
-    let explicit =
-        ModelDowngradePolicy::try_new(true, 1, 60, 300, downgrade_ladder(), Some("gpt-5.6-sol".to_owned()))
-            .expect("valid explicit probe model");
+    let explicit = ModelDowngradePolicy::try_new(
+        true,
+        1,
+        60,
+        300,
+        downgrade_ladder(),
+        Some("gpt-5.6-sol".to_owned()),
+    )
+    .expect("valid explicit probe model");
     assert_eq!(explicit.probe_model(), Some("gpt-5.6-sol"));
 }
 

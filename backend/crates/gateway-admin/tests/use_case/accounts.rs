@@ -1024,6 +1024,12 @@ impl SettingsStore for StaticSettingsStore {
             account_auto_freeze_probe_enabled: true,
             account_auto_freeze_probe_model: None,
             account_auto_freeze_adaptive_concurrency: true,
+            account_model_downgrade_enabled: false,
+            account_model_downgrade_threshold: 3,
+            account_model_downgrade_window_seconds: 600,
+            account_model_downgrade_probe_interval_seconds: 3_600,
+            account_model_downgrade_ladder: Vec::new(),
+            account_model_downgrade_probe_model: None,
             updated_at: Utc::now(),
         })
     }
@@ -2939,6 +2945,7 @@ impl AccountProbe for SuccessfulAccountProbe {
         Box::pin(async {
             Ok(AccountProbeResult {
                 text: vec!["OK".to_owned()],
+                reported_model: None,
             })
         })
     }
