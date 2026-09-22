@@ -1062,6 +1062,163 @@ impl ProviderFreezePolicy {
     }
 }
 
+/// 单次请求的模型降智判定结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelDowngradeVerdict {
+    /// 返回模型档位不低于请求模型；账号健康。
+    Healthy,
+    /// 返回模型档位严格低于请求模型；判定为降智。
+    Downgraded,
+    /// 请求或返回模型不在档位表内，无法比较；按未知处理，不触发冻结。
+    Unknown,
+}
+
+/// 账号模型降智自动下线策略；来源于 `runtime_settings`，
+/// 由 Provider 触发路径与恢复 worker 共享同一份配置事实。
+///
+/// 与容量熔断 [`ProviderFreezePolicy`] 并行：触发源是"返回模型档位低于请求模型"，
+/// 恢复探测除了要求请求成功，还要求返回模型不再降级。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDowngradePolicy {
+    enabled: bool,
+    threshold: u32,
+    window: Duration,
+    freeze_duration: Duration,
+    ladder: Vec<String>,
+    probe_model: Option<String>,
+}
+
+impl ModelDowngradePolicy {
+    /// 档位表最多条目数；与迁移 `0018` 的写入约束一致。
+    pub const MAX_LADDER_ENTRIES: usize = 64;
+    /// 单个档位模型名最大长度。
+    pub const MAX_LADDER_ENTRY_LEN: usize = 128;
+
+    /// 边界与迁移 `0018_account_model_downgrade.sql` 的 check 约束一致；
+    /// store 层写入前已校验，这里兜底防御越界配置。
+    ///
+    /// 启用时档位表不能为空；关闭时允许空表，仅代表当前不做降智判定。
+    pub fn try_new(
+        enabled: bool,
+        threshold: u32,
+        window_seconds: u64,
+        freeze_duration_seconds: u64,
+        ladder: Vec<String>,
+        probe_model: Option<String>,
+    ) -> Result<Self, ProviderStoreError> {
+        let ladder_invalid = ladder.len() > Self::MAX_LADDER_ENTRIES
+            || ladder.iter().any(|model| {
+                model.is_empty()
+                    || model.len() > Self::MAX_LADDER_ENTRY_LEN
+                    || model != model.trim()
+                    || model.bytes().any(|byte| byte.is_ascii_control())
+            })
+            || {
+                // 档位表不允许重复项，否则 rank 比较语义歧义。
+                let mut seen = BTreeSet::new();
+                ladder.iter().any(|model| !seen.insert(model.as_str()))
+            };
+        let probe_model_invalid = probe_model.as_deref().is_some_and(|model| {
+            model.is_empty()
+                || model.len() > Self::MAX_LADDER_ENTRY_LEN
+                || model != model.trim()
+                || model.bytes().any(|byte| byte.is_ascii_control())
+        });
+        if !(1..=1_000).contains(&threshold)
+            || !(60..=3_600).contains(&window_seconds)
+            || !(300..=604_800).contains(&freeze_duration_seconds)
+            || ladder_invalid
+            || probe_model_invalid
+            || (enabled && ladder.is_empty())
+        {
+            return Err(ProviderStoreError::new(
+                ProviderStoreErrorKind::InvalidData,
+                "validate model downgrade policy",
+            ));
+        }
+        Ok(Self {
+            enabled,
+            threshold,
+            window: Duration::from_secs(window_seconds),
+            freeze_duration: Duration::from_secs(freeze_duration_seconds),
+            ladder,
+            probe_model,
+        })
+    }
+
+    /// 功能关闭时的空策略；触发路径与 worker 都以此短路。
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            threshold: 1,
+            window: Duration::from_secs(60),
+            freeze_duration: Duration::from_secs(300),
+            ladder: Vec::new(),
+            probe_model: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// 窗口内触发下线的降智观测次数阈值。
+    #[must_use]
+    pub const fn threshold(&self) -> u32 {
+        self.threshold
+    }
+
+    #[must_use]
+    pub const fn window(&self) -> Duration {
+        self.window
+    }
+
+    /// 下线后两次恢复探测之间的间隔。
+    #[must_use]
+    pub const fn freeze_duration(&self) -> Duration {
+        self.freeze_duration
+    }
+
+    /// 探测使用的模型；`None` 时使用档位表最高档，最能暴露降智。
+    #[must_use]
+    pub fn probe_model(&self) -> Option<&str> {
+        self.probe_model
+            .as_deref()
+            .or_else(|| self.ladder.first().map(String::as_str))
+    }
+
+    /// 判定一次请求是否降智：仅当请求与返回模型都在档位表内、
+    /// 且返回模型档位严格低于请求模型时判定为降智。
+    #[must_use]
+    pub fn classify(&self, requested: &str, returned: &str) -> ModelDowngradeVerdict {
+        match (self.rank(requested), self.rank(returned)) {
+            (Some(requested_rank), Some(returned_rank)) => {
+                if returned_rank > requested_rank {
+                    ModelDowngradeVerdict::Downgraded
+                } else {
+                    ModelDowngradeVerdict::Healthy
+                }
+            }
+            _ => ModelDowngradeVerdict::Unknown,
+        }
+    }
+
+    /// 档位序号；数值越小档位越高。剥离 `responses/` 前缀后按档位表精确匹配。
+    fn rank(&self, model: &str) -> Option<usize> {
+        let normalized = normalize_model_name(model);
+        self.ladder
+            .iter()
+            .position(|entry| normalize_model_name(entry) == normalized)
+    }
+}
+
+/// 归一化模型名以做档位比较：去空白并剥离已知的 `responses/` 协议前缀。
+fn normalize_model_name(model: &str) -> &str {
+    model.trim().strip_prefix("responses/").unwrap_or(model.trim())
+}
+
 /// OAuth pending flow 的原始绑定只在 Provider 与 Store 边界内短暂存在。
 #[derive(Clone, PartialEq, Eq)]
 pub struct OAuthPendingBinding(String);

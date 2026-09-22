@@ -110,3 +110,115 @@ fn scheduling_state_preserves_provider_neutral_signals() {
         1
     );
 }
+
+// —— 模型降智自动下线策略 ——
+
+use gateway_core::provider_ports::{ModelDowngradePolicy, ModelDowngradeVerdict};
+
+fn downgrade_ladder() -> Vec<String> {
+    ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn downgrade_policy() -> ModelDowngradePolicy {
+    ModelDowngradePolicy::try_new(true, 3, 600, 3_600, downgrade_ladder(), None)
+        .expect("valid downgrade policy")
+}
+
+#[test]
+fn model_downgrade_flags_lower_tier_return() {
+    let policy = downgrade_policy();
+
+    assert_eq!(
+        policy.classify("gpt-6-astra", "gpt-5.6-luna"),
+        ModelDowngradeVerdict::Downgraded,
+    );
+    assert_eq!(
+        policy.classify("gpt-5.6-sol", "gpt-5.6-terra"),
+        ModelDowngradeVerdict::Downgraded,
+    );
+}
+
+#[test]
+fn model_downgrade_accepts_same_or_higher_tier() {
+    let policy = downgrade_policy();
+
+    assert_eq!(
+        policy.classify("gpt-6-astra", "gpt-6-astra"),
+        ModelDowngradeVerdict::Healthy,
+    );
+    // 返回档位高于请求（理论上罕见）不算降智。
+    assert_eq!(
+        policy.classify("gpt-5.6-luna", "gpt-6-astra"),
+        ModelDowngradeVerdict::Healthy,
+    );
+}
+
+#[test]
+fn model_downgrade_unknown_models_are_not_flagged() {
+    let policy = downgrade_policy();
+
+    // 请求模型不在档位表内：无法比较，不触发下线。
+    assert_eq!(
+        policy.classify("gpt-image-2", "gpt-5.6-luna"),
+        ModelDowngradeVerdict::Unknown,
+    );
+    // 返回模型不在档位表内：同样按未知处理。
+    assert_eq!(
+        policy.classify("gpt-6-astra", "gpt-reserve"),
+        ModelDowngradeVerdict::Unknown,
+    );
+}
+
+#[test]
+fn model_downgrade_normalizes_responses_prefix() {
+    let policy = downgrade_policy();
+
+    assert_eq!(
+        policy.classify("responses/gpt-6-astra", "gpt-5.6-luna"),
+        ModelDowngradeVerdict::Downgraded,
+    );
+    assert_eq!(
+        policy.classify("gpt-6-astra", "responses/gpt-6-astra"),
+        ModelDowngradeVerdict::Healthy,
+    );
+}
+
+#[test]
+fn model_downgrade_probe_model_defaults_to_top_tier() {
+    let policy = downgrade_policy();
+    assert_eq!(policy.probe_model(), Some("gpt-6-astra"));
+
+    let explicit =
+        ModelDowngradePolicy::try_new(true, 1, 60, 300, downgrade_ladder(), Some("gpt-5.6-sol".to_owned()))
+            .expect("valid explicit probe model");
+    assert_eq!(explicit.probe_model(), Some("gpt-5.6-sol"));
+}
+
+#[test]
+fn model_downgrade_rejects_invalid_configuration() {
+    // 启用但档位表为空。
+    assert!(ModelDowngradePolicy::try_new(true, 3, 600, 3_600, Vec::new(), None).is_err());
+    // 档位表存在重复项。
+    let dup = vec!["gpt-6-astra".to_owned(), "gpt-6-astra".to_owned()];
+    assert!(ModelDowngradePolicy::try_new(true, 3, 600, 3_600, dup, None).is_err());
+    // 阈值越界。
+    assert!(ModelDowngradePolicy::try_new(true, 0, 600, 3_600, downgrade_ladder(), None).is_err());
+    // 窗口越界。
+    assert!(ModelDowngradePolicy::try_new(true, 3, 30, 3_600, downgrade_ladder(), None).is_err());
+    // 冻结时长越界。
+    assert!(ModelDowngradePolicy::try_new(true, 3, 600, 100, downgrade_ladder(), None).is_err());
+}
+
+#[test]
+fn model_downgrade_disabled_policy_is_inert() {
+    let policy = ModelDowngradePolicy::disabled();
+    assert!(!policy.enabled());
+    assert_eq!(policy.probe_model(), None);
+    assert_eq!(
+        policy.classify("gpt-6-astra", "gpt-5.6-luna"),
+        ModelDowngradeVerdict::Unknown,
+    );
+}
