@@ -63,7 +63,13 @@ fn update_body() -> Value {
         "accountAutoFreezeDurationSeconds": 7200,
         "accountAutoFreezeProbeEnabled": true,
         "accountAutoFreezeProbeModel": null,
-        "accountAutoFreezeAdaptiveConcurrency": true
+        "accountAutoFreezeAdaptiveConcurrency": true,
+        "accountModelDowngradeEnabled": true,
+        "accountModelDowngradeThreshold": 3,
+        "accountModelDowngradeWindowSeconds": 600,
+        "accountModelDowngradeProbeIntervalSeconds": 3600,
+        "accountModelDowngradeLadder": ["gpt-6-astra", "gpt-5.6-luna"],
+        "accountModelDowngradeProbeModel": null
     })
 }
 
@@ -192,6 +198,12 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             "accountAutoFreezeProbeEnabled": true,
             "accountAutoFreezeProbeModel": null,
             "accountAutoFreezeAdaptiveConcurrency": true,
+            "accountModelDowngradeEnabled": false,
+            "accountModelDowngradeThreshold": 3,
+            "accountModelDowngradeWindowSeconds": 600,
+            "accountModelDowngradeProbeIntervalSeconds": 3600,
+            "accountModelDowngradeLadder": [],
+            "accountModelDowngradeProbeModel": null,
             "updatedAt": "2026-08-02T10:30:00Z"
         })
     );

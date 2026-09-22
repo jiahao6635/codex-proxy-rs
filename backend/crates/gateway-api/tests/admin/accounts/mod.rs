@@ -864,7 +864,7 @@ mod actions {
                     }
                 }),
                 json!({ "type": "content", "text": "OK" }),
-                json!({ "type": "test_complete", "success": true }),
+                json!({ "type": "test_complete", "success": true, "reportedModel": null }),
                 json!({
                     "type": "error",
                     "source": "upstream",

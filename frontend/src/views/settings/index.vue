@@ -13,6 +13,7 @@ import AccountAutoFreezeCard from './components/AccountAutoFreezeCard.vue'
 import SettingsBackupSection from './components/backup/SettingsBackupSection.vue'
 import ClientProfileCard from './components/ClientProfileCard.vue'
 import ModelAliasesCard from './components/ModelAliasesCard.vue'
+import ModelDowngradeCard from './components/ModelDowngradeCard.vue'
 import RequestLocationCard from './components/RequestLocationCard.vue'
 import RequestQueueCard from './components/RequestQueueCard.vue'
 import RotationStrategyCard from './components/RotationStrategyCard.vue'
@@ -71,6 +72,9 @@ const {
   accountAutoFreezeThresholdValue,
   accountAutoFreezeWindowSecondsValue,
   accountAutoFreezeDurationSecondsValue,
+  accountModelDowngradeThresholdValue,
+  accountModelDowngradeWindowSecondsValue,
+  accountModelDowngradeProbeIntervalSecondsValue,
 
   minCodexDesktopVersionError,
   minCodexCliVersionError,
@@ -164,6 +168,14 @@ watch(section, (value) => {
             v-model:probe-enabled="form.accountAutoFreezeProbeEnabled"
             v-model:probe-model="form.accountAutoFreezeProbeModel"
             v-model:adaptive-concurrency="form.accountAutoFreezeAdaptiveConcurrency"
+          />
+          <ModelDowngradeCard
+            v-model:enabled="form.accountModelDowngradeEnabled"
+            v-model:threshold="accountModelDowngradeThresholdValue"
+            v-model:window-seconds="accountModelDowngradeWindowSecondsValue"
+            v-model:probe-interval-seconds="accountModelDowngradeProbeIntervalSecondsValue"
+            v-model:ladder="form.accountModelDowngradeLadder"
+            v-model:probe-model="form.accountModelDowngradeProbeModel"
           />
         </template>
 

@@ -33,6 +33,13 @@ export interface RuntimeSettings {
   accountAutoFreezeProbeEnabled: boolean
   accountAutoFreezeProbeModel: string | null
   accountAutoFreezeAdaptiveConcurrency: boolean
+  accountModelDowngradeEnabled: boolean
+  accountModelDowngradeThreshold: number
+  accountModelDowngradeWindowSeconds: number
+  accountModelDowngradeProbeIntervalSeconds: number
+  /// 模型档位表，最高档在前。
+  accountModelDowngradeLadder: string[]
+  accountModelDowngradeProbeModel: string | null
   updatedAt: string
 }
 
