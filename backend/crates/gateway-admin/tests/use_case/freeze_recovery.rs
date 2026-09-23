@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration as TimeDelta, Utc};
 use gateway_admin::freeze_recovery::{FreezeRecoveryDeps, FreezeRecoveryTask};
 use gateway_admin::model::MutationContext;
-use gateway_admin::model::accounts::{AccountFreeze, AccountRuntimeSnapshot};
+use gateway_admin::model::accounts::{AccountFreeze, AccountFreezeCause, AccountRuntimeSnapshot};
 use gateway_admin::model::settings::{
     AdminApiKey, AdminApiKeyMutation, ReplaceRuntimeSettings, RuntimeSettings,
 };
@@ -52,6 +52,12 @@ fn runtime_settings(enabled: bool, probe_enabled: bool, adaptive: bool) -> Runti
         account_auto_freeze_probe_enabled: probe_enabled,
         account_auto_freeze_probe_model: Some("gpt-5.5".to_owned()),
         account_auto_freeze_adaptive_concurrency: adaptive,
+        account_model_downgrade_enabled: false,
+        account_model_downgrade_threshold: 3,
+        account_model_downgrade_window_seconds: 600,
+        account_model_downgrade_probe_interval_seconds: 3_600,
+        account_model_downgrade_ladder: Vec::new(),
+        account_model_downgrade_probe_model: None,
         updated_at: Utc::now(),
     }
 }
@@ -205,6 +211,7 @@ impl AccountProbe for SuccessfulProbe {
         Box::pin(async {
             Ok(AccountProbeResult {
                 text: vec!["OK".to_owned()],
+                reported_model: None,
             })
         })
     }
@@ -282,6 +289,7 @@ fn freeze_until(until: DateTime<Utc>) -> BTreeMap<String, AccountFreeze> {
             until,
             generation: "freeze-generation".to_owned(),
             requires_probe: true,
+            cause: AccountFreezeCause::Capacity,
         },
     )])
 }
@@ -444,4 +452,154 @@ async fn disabled_accounts_are_skipped() {
     assert!(runtime.cleared().is_empty());
     assert!(runtime.extended().is_empty());
     assert!(store.update_commands().is_empty());
+}
+
+// —— 模型降智下线的恢复编排 ——
+
+/// 按给定模型作答的探针；用于构造"已恢复"与"仍在降智"两种上游反馈。
+struct ModelProbe(Option<&'static str>);
+
+impl AccountProbe for ModelProbe {
+    fn probe(
+        &self,
+        _: AccountProbeRequest,
+    ) -> futures::future::BoxFuture<'_, Result<AccountProbeResult, AccountProbeError>> {
+        let reported_model = self.0.map(ToOwned::to_owned);
+        Box::pin(async move {
+            Ok(AccountProbeResult {
+                text: vec!["OK".to_owned()],
+                reported_model,
+            })
+        })
+    }
+}
+
+/// 启用降智下线的设置：档位表 astra > sol > terra > luna，探测间隔 1 小时。
+fn downgrade_settings(enabled: bool) -> RuntimeSettings {
+    let mut settings = runtime_settings(false, false, false);
+    settings.account_model_downgrade_enabled = enabled;
+    settings.account_model_downgrade_threshold = 3;
+    settings.account_model_downgrade_window_seconds = 600;
+    settings.account_model_downgrade_probe_interval_seconds = 3_600;
+    settings.account_model_downgrade_ladder = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-luna"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    settings
+}
+
+fn downgrade_freeze(until: DateTime<Utc>) -> BTreeMap<String, AccountFreeze> {
+    BTreeMap::from([(
+        "acct_test".to_owned(),
+        AccountFreeze {
+            credential_revision: revision(1),
+            until,
+            generation: "freeze-generation".to_owned(),
+            requires_probe: true,
+            cause: AccountFreezeCause::ModelDowngrade,
+        },
+    )])
+}
+
+fn downgrade_freeze_due() -> BTreeMap<String, AccountFreeze> {
+    downgrade_freeze(Utc::now() - TimeDelta::seconds(1))
+}
+
+/// 探测返回的模型已回到最高档，账号重新上线。
+#[tokio::test]
+async fn model_downgrade_probe_with_recovered_model_clears_freeze() {
+    let runtime = FreezeRuntimeStore::new(downgrade_freeze_due(), BTreeMap::new());
+    let (task, _store) = recovery_task(
+        downgrade_settings(true),
+        Arc::clone(&runtime),
+        Arc::new(ModelProbe(Some("gpt-6-astra"))),
+    )
+    .await;
+
+    run_cycle(&task).await;
+
+    assert_eq!(runtime.cleared(), vec!["acct_test".to_owned()]);
+    assert!(runtime.extended().is_empty());
+}
+
+/// 探测请求本身成功，但返回模型仍是低档位，账号必须继续下线并按探测间隔顺延。
+#[tokio::test]
+async fn model_downgrade_probe_still_downgraded_postpones_freeze() {
+    let runtime = FreezeRuntimeStore::new(downgrade_freeze_due(), BTreeMap::new());
+    let (task, _store) = recovery_task(
+        downgrade_settings(true),
+        Arc::clone(&runtime),
+        Arc::new(ModelProbe(Some("gpt-5.6-luna"))),
+    )
+    .await;
+
+    run_cycle(&task).await;
+
+    assert!(runtime.cleared().is_empty());
+    let extended = runtime.extended();
+    assert_eq!(extended.len(), 1);
+    let (account_id, until) = &extended[0];
+    assert_eq!(account_id, "acct_test");
+    let remaining = until.timestamp_millis() - Utc::now().timestamp_millis();
+    assert!(
+        remaining > 3_500_000 && remaining <= 3_600_000,
+        "postponed downgrade freeze should be about 1 hour, got {remaining}ms"
+    );
+}
+
+/// 上游没有声明模型时无法确认已恢复，保持下线而不是乐观放行。
+#[tokio::test]
+async fn model_downgrade_probe_without_reported_model_keeps_account_offline() {
+    let runtime = FreezeRuntimeStore::new(downgrade_freeze_due(), BTreeMap::new());
+    let (task, _store) = recovery_task(
+        downgrade_settings(true),
+        Arc::clone(&runtime),
+        Arc::new(ModelProbe(None)),
+    )
+    .await;
+
+    run_cycle(&task).await;
+
+    assert!(runtime.cleared().is_empty());
+    assert_eq!(runtime.extended().len(), 1);
+}
+
+/// 降智冻结不会自行到期，功能关闭后必须显式释放，否则账号永久下线。
+#[tokio::test]
+async fn disabled_model_downgrade_policy_releases_freeze() {
+    let runtime = FreezeRuntimeStore::new(
+        downgrade_freeze(Utc::now() + TimeDelta::hours(1)),
+        BTreeMap::new(),
+    );
+    let (task, _store) = recovery_task(
+        downgrade_settings(false),
+        Arc::clone(&runtime),
+        Arc::new(ModelProbe(Some("gpt-5.6-luna"))),
+    )
+    .await;
+
+    run_cycle(&task).await;
+
+    assert_eq!(runtime.cleared(), vec!["acct_test".to_owned()]);
+    assert!(runtime.extended().is_empty());
+}
+
+/// 未到探测时间的降智冻结不发起探测。
+#[tokio::test]
+async fn model_downgrade_freeze_waits_for_probe_interval() {
+    let runtime = FreezeRuntimeStore::new(
+        downgrade_freeze(Utc::now() + TimeDelta::hours(1)),
+        BTreeMap::new(),
+    );
+    let (task, _store) = recovery_task(
+        downgrade_settings(true),
+        Arc::clone(&runtime),
+        Arc::new(ModelProbe(Some("gpt-6-astra"))),
+    )
+    .await;
+
+    run_cycle(&task).await;
+
+    assert!(runtime.cleared().is_empty());
+    assert!(runtime.extended().is_empty());
 }

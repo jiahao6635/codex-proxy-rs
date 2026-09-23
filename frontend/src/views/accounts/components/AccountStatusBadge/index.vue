@@ -13,7 +13,7 @@ const props = withDefaults(
     errorReason?: AccountErrorReason | null
     errorMessage?: string | null
     rateLimitedUntil?: string | null
-    rateLimitReason?: 'upstream_rate_limit' | 'capacity_freeze' | null
+    rateLimitReason?: 'upstream_rate_limit' | 'capacity_freeze' | 'model_downgrade' | null
     recoveryProbeRequired?: boolean
     nextRefreshAt?: string | null
     variant?: 'inline' | 'pill'

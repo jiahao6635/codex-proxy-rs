@@ -202,7 +202,9 @@ pub(super) fn account_quota_view(
     let windows = quota.windows.into_iter().map(quota_window_view).collect();
     let rate_limited_until = cooldown.map(|value| china_datetime(&value.until.into()));
     let rate_limit_reason = cooldown.map(|value| {
-        if value.kind.is_capacity_freeze() {
+        if value.kind.is_model_downgrade() {
+            "model_downgrade".to_owned()
+        } else if value.kind.is_capacity_freeze() {
             "capacity_freeze".to_owned()
         } else {
             "upstream_rate_limit".to_owned()

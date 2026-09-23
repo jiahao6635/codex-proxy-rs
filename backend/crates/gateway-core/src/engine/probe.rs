@@ -21,6 +21,10 @@ pub struct AccountProbeRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountProbeResult {
     pub text: Vec<String>,
+    /// 上游为本次探测实际声明的模型；降智恢复判定据此确认账号已不再被降级。
+    ///
+    /// Provider 未声明模型时为 `None`，调用方不得据此判定已恢复。
+    pub reported_model: Option<String>,
 }
 
 /// 仅供当前管理端连接测试展示的原始上游失败响应。

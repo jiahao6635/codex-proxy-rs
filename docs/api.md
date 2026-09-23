@@ -452,7 +452,8 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 - `sortDirection`: `asc`、`desc`。
 
 账号限流详情在 `quota` 中返回：`rateLimitReason` 为 `upstream_rate_limit`（上游临时限流）、
-`capacity_freeze`（容量错误触发自动冻结）或 `null`。`recoveryProbeRequired` 表示解除冻结是否需要成功探测；
+`capacity_freeze`（容量错误触发自动冻结）、`model_downgrade`（上游返回模型低于请求档位触发下线）
+或 `null`。`recoveryProbeRequired` 表示解除冻结是否需要成功探测；
 此时 `rateLimitedUntil` 是最早探测时间，到期后仍保持 `rate_limited`，直到探测成功或手动恢复。
 未要求探测时，该字段表示冷却结束时间。所有此类情况统一显示“限流中”，仅详情原因和恢复条件不同。
 
@@ -555,7 +556,9 @@ OAuth 等待回调期间不持有保护；提交仍拒绝已删除或连接配�
 ### 账号连接测试 SSE
 
 `GET /api/admin/accounts/connection-test` 固定探测请求指定的账号，不参与普通账号轮换。成功流沿用
-`test_start`、`request`、`content`、`test_complete` 事件；失败事件为：
+`test_start`、`request`、`content`、`test_complete` 事件；`test_complete` 额外返回
+`reportedModel`（`string | null`），即上游为本次测试实际声明的模型，据此可以直接看出
+请求档位与实际服务模型是否一致。失败事件为：
 
 ```json
 {
@@ -1063,6 +1066,12 @@ accountAutoFreezeDurationSeconds
 accountAutoFreezeProbeEnabled
 accountAutoFreezeProbeModel
 accountAutoFreezeAdaptiveConcurrency
+accountModelDowngradeEnabled
+accountModelDowngradeThreshold
+accountModelDowngradeWindowSeconds
+accountModelDowngradeProbeIntervalSeconds
+accountModelDowngradeLadder
+accountModelDowngradeProbeModel
 ```
 
 `requestLocationEnabled` 是必填布尔值，默认 `false`：关闭时不覆盖客户端原有位置和时区；开启时使用已保存的
@@ -1211,6 +1220,25 @@ User-Agent 使用 `grok-shell/<版本> (<系统>; <架构>)`，其中 `arm64` �
 选择账号可用的第一个模型。`accountAutoFreezeAdaptiveConcurrency` 开启时冻结期间把账号并发上限下调到
 观测在途峰值的 80%（下限 2，只降不升）。这会持久修改账号并发设置；跟随全局默认的账号也会设为独立上限，
 解冻后不自动恢复，管理员可手动改回。
+
+### 账号降智下线
+
+账号降智下线（`accountModelDowngradeEnabled`）默认关闭，与账号自动冻结相互独立。启用后，普通请求
+成功返回时比较请求的上游模型与上游实际声明的模型：只有两者都出现在 `accountModelDowngradeLadder`
+档位表内、且返回档位严格更低时才判定为降智。档位表外的模型一律不判定，客户端正常请求低档模型不会
+被误伤；上游未声明模型时同样跳过。
+
+`accountModelDowngradeLadder` 是模型 ID 数组，最高档在前，最多 64 项，条目不得为空、重复或含控制
+字符；启用时不能为空。`accountModelDowngradeThreshold` 取值 1～1,000（默认 3，按滑动窗口内的降智
+观测次数计数，不含恢复探测）；`accountModelDowngradeWindowSeconds` 取值 60～3,600（默认 600，随每次
+降智观测顺延）。返回模型未降级的成功响应会清空该窗口计数，避免长期零散观测累计成误判。
+
+达到阈值后写入账号级 Redis 降智冷却，调度立即跳过该账号，管理端显示为 `rate_limited` 且原因为
+`model_downgrade`。该冷却不会自行到期：恢复 worker 每隔 `accountModelDowngradeProbeIntervalSeconds`
+（取值 300～604,800，默认 3,600 即 1 小时）执行一次真实探测，只有探测既成功、返回模型又不再低于探测
+档位时才重新上线；上游未声明模型按无法确认恢复处理，保持下线。`accountModelDowngradeProbeModel` 为
+`string | null`，留空时使用档位表最高档，最能暴露降智。关闭该功能会释放已有的降智冷却，否则这些
+账号将永久下线。
 
 Windows 离线包接口固定解析 Microsoft Store Product ID `9PLM9XGG6VKS` 的 Retail 包，不接受调用方提供
 产品 ID、上游地址、ring 或文件名。后端只返回通过包名、架构、Microsoft CDN host/path、scheme 和失效

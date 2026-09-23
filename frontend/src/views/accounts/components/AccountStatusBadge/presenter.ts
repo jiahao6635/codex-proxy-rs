@@ -46,7 +46,7 @@ export interface AccountStatusPresentationInput {
   errorReason: AccountErrorReason | null
   errorMessage: string | null
   rateLimitedUntil: string | null
-  rateLimitReason: 'upstream_rate_limit' | 'capacity_freeze' | null
+  rateLimitReason: 'upstream_rate_limit' | 'capacity_freeze' | 'model_downgrade' | null
   recoveryProbeRequired: boolean
   nextRefreshAt: string | null
   now: number
@@ -149,17 +149,27 @@ export function resolveAccountStatusPresentation(
     && nextRefreshTimestamp !== null
     && nextRefreshTimestamp > input.now
   const mode: AccountStatusDisplayMode = isBackoff ? 'refresh_backoff' : input.status
-  const isFreeze = mode === 'rate_limited' && input.rateLimitReason === 'capacity_freeze'
+  const isCapacityFreeze = mode === 'rate_limited' && input.rateLimitReason === 'capacity_freeze'
+  // 降智下线不会自行到期，只有探测确认返回模型回升才重新上线。
+  const isModelDowngrade = mode === 'rate_limited' && input.rateLimitReason === 'model_downgrade'
+  const isFreeze = isCapacityFreeze || isModelDowngrade
   const waitsForProbe = isFreeze && input.recoveryProbeRequired
-  const definition = isFreeze
+  const definition = isModelDowngrade
     ? {
         ...displayDefinitions.rate_limited,
-        description: '容量类请求失败累计达到阈值，系统已暂停该账号的调度',
-        recoveryHint: waitsForProbe
-          ? '冷却结束后进行恢复探测，成功后恢复调度，也可手动恢复账号'
-          : '冷却结束后自动恢复调度，也可手动恢复账号',
+        label: '降智下线',
+        description: '上游实际返回的模型低于请求档位，系统已暂停该账号的调度',
+        recoveryHint: '按探测间隔重新探测，返回模型回升后自动恢复调度，也可手动恢复账号',
       }
-    : displayDefinitions[mode]
+    : isCapacityFreeze
+      ? {
+          ...displayDefinitions.rate_limited,
+          description: '容量类请求失败累计达到阈值，系统已暂停该账号的调度',
+          recoveryHint: waitsForProbe
+            ? '冷却结束后进行恢复探测，成功后恢复调度，也可手动恢复账号'
+            : '冷却结束后自动恢复调度，也可手动恢复账号',
+        }
+      : displayDefinitions[mode]
   const nextRefreshDisplay = isBackoff ? formatDateTime(nextRefreshTimestamp) : null
   const reasonLabel = input.errorReason ? errorReasonLabels[input.errorReason] : null
   const title = definition.title ?? reasonLabel ?? definition.label

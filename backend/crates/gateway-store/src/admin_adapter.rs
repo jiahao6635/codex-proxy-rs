@@ -115,6 +115,14 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                 account_auto_freeze_probe_model: command.account_auto_freeze_probe_model,
                 account_auto_freeze_adaptive_concurrency: command
                     .account_auto_freeze_adaptive_concurrency,
+                account_model_downgrade_enabled: command.account_model_downgrade_enabled,
+                account_model_downgrade_threshold: command.account_model_downgrade_threshold,
+                account_model_downgrade_window_seconds: command
+                    .account_model_downgrade_window_seconds,
+                account_model_downgrade_probe_interval_seconds: command
+                    .account_model_downgrade_probe_interval_seconds,
+                account_model_downgrade_ladder: command.account_model_downgrade_ladder,
+                account_model_downgrade_probe_model: command.account_model_downgrade_probe_model,
             },
             audit: mutation_audit(
                 context,
@@ -139,6 +147,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                     "min_codex_cli_version".to_owned(),
                     "retention".to_owned(),
                     "account_auto_freeze".to_owned(),
+                    "account_model_downgrade".to_owned(),
                 ],
             ),
         };
@@ -259,6 +268,13 @@ pub(crate) fn admin_runtime_settings(
         account_auto_freeze_probe_enabled: settings.account_auto_freeze_probe_enabled,
         account_auto_freeze_probe_model: settings.account_auto_freeze_probe_model,
         account_auto_freeze_adaptive_concurrency: settings.account_auto_freeze_adaptive_concurrency,
+        account_model_downgrade_enabled: settings.account_model_downgrade_enabled,
+        account_model_downgrade_threshold: settings.account_model_downgrade_threshold,
+        account_model_downgrade_window_seconds: settings.account_model_downgrade_window_seconds,
+        account_model_downgrade_probe_interval_seconds: settings
+            .account_model_downgrade_probe_interval_seconds,
+        account_model_downgrade_ladder: settings.account_model_downgrade_ladder,
+        account_model_downgrade_probe_model: settings.account_model_downgrade_probe_model,
         updated_at: settings.updated_at,
     })
 }

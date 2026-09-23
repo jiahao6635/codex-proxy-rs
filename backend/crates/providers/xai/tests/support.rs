@@ -867,6 +867,15 @@ impl ProviderSessionExclusionPort for TestSessionExclusions {
 }
 
 impl ProviderCooldownPort for MemoryCooldownPort {
+    fn observe_model_downgrade<'a>(
+        &'a self,
+        _account_id: &'a gateway_core::account::ProviderAccountId,
+        _window: std::time::Duration,
+        _downgraded: bool,
+    ) -> futures::future::BoxFuture<'a, Result<u32, gateway_core::provider_ports::ProviderStoreError>>
+    {
+        Box::pin(async move { Ok(0) })
+    }
     fn put_if_later(
         &self,
         cooldown: ProviderCooldown,

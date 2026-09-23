@@ -74,6 +74,15 @@ pub struct AccountRuntimeSnapshot {
     pub in_flight: Option<BTreeMap<String, u64>>,
 }
 
+/// 冻结成因；决定恢复探测的成功判据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountFreezeCause {
+    /// 容量类错误熔断：探测请求成功即视为已恢复。
+    Capacity,
+    /// 模型降智下线：探测除了要成功，返回模型还必须不再低于请求档位。
+    ModelDowngrade,
+}
+
 /// 恢复任务读取的冻结快照；generation 将异步结果绑定到本次冻结。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountFreeze {
@@ -81,6 +90,7 @@ pub struct AccountFreeze {
     pub until: DateTime<Utc>,
     pub generation: String,
     pub requires_probe: bool,
+    pub cause: AccountFreezeCause,
 }
 
 /// Optional account membership filter.
@@ -287,7 +297,10 @@ pub enum AccountConnectionTestEvent {
     Content {
         text: String,
     },
-    Completed,
+    Completed {
+        /// 上游为本次测试实际声明的模型；未声明时为 `None`。
+        reported_model: Option<String>,
+    },
     Failed {
         source: AccountProbeErrorSource,
         gateway_error_code: GatewayErrorKind,

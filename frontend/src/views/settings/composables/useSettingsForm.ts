@@ -49,6 +49,14 @@ export function useSettingsForm() {
     accountAutoFreezeProbeEnabled: true,
     accountAutoFreezeProbeModel: '',
     accountAutoFreezeAdaptiveConcurrency: true,
+
+    accountModelDowngradeEnabled: false,
+    accountModelDowngradeThreshold: null as number | null,
+    accountModelDowngradeWindowSeconds: null as number | null,
+    accountModelDowngradeProbeIntervalSeconds: null as number | null,
+    // 档位表在界面上以逗号分隔编辑，最高档在前。
+    accountModelDowngradeLadder: '',
+    accountModelDowngradeProbeModel: '',
   })
 
   function snapshot() {
@@ -69,7 +77,7 @@ export function useSettingsForm() {
     mappings.value = saved.value.mappings.map(row => ({ ...row }))
   }
 
-  function numericModel(key: 'refreshMarginSeconds' | 'refreshConcurrency' | 'maxConcurrentPerAccount' | 'requestIntervalMs' | 'maxWaitingPerKey' | 'maxWaitingPerAccount' | 'concurrencyWaitTimeoutSeconds' | 'responsesMaxDecompressedBodyMiB' | 'accountAutoFreezeThreshold' | 'accountAutoFreezeWindowSeconds' | 'accountAutoFreezeDurationSeconds') {
+  function numericModel(key: 'refreshMarginSeconds' | 'refreshConcurrency' | 'maxConcurrentPerAccount' | 'requestIntervalMs' | 'maxWaitingPerKey' | 'maxWaitingPerAccount' | 'concurrencyWaitTimeoutSeconds' | 'responsesMaxDecompressedBodyMiB' | 'accountAutoFreezeThreshold' | 'accountAutoFreezeWindowSeconds' | 'accountAutoFreezeDurationSeconds' | 'accountModelDowngradeThreshold' | 'accountModelDowngradeWindowSeconds' | 'accountModelDowngradeProbeIntervalSeconds') {
     return computed({
       get: () => (form[key] === null ? '' : String(form[key])),
       set: (value: string) => {
@@ -94,6 +102,9 @@ export function useSettingsForm() {
   const accountAutoFreezeThresholdValue = numericModel('accountAutoFreezeThreshold')
   const accountAutoFreezeWindowSecondsValue = numericModel('accountAutoFreezeWindowSeconds')
   const accountAutoFreezeDurationSecondsValue = numericModel('accountAutoFreezeDurationSeconds')
+  const accountModelDowngradeThresholdValue = numericModel('accountModelDowngradeThreshold')
+  const accountModelDowngradeWindowSecondsValue = numericModel('accountModelDowngradeWindowSeconds')
+  const accountModelDowngradeProbeIntervalSecondsValue = numericModel('accountModelDowngradeProbeIntervalSeconds')
 
   const minCodexDesktopVersionError = computed(() => versionError(form.minCodexDesktopVersion))
   const minCodexCliVersionError = computed(() => versionError(form.minCodexCliVersion))
@@ -131,6 +142,12 @@ export function useSettingsForm() {
     form.accountAutoFreezeProbeEnabled = data.accountAutoFreezeProbeEnabled
     form.accountAutoFreezeProbeModel = data.accountAutoFreezeProbeModel ?? ''
     form.accountAutoFreezeAdaptiveConcurrency = data.accountAutoFreezeAdaptiveConcurrency
+    form.accountModelDowngradeEnabled = data.accountModelDowngradeEnabled
+    form.accountModelDowngradeThreshold = data.accountModelDowngradeThreshold
+    form.accountModelDowngradeWindowSeconds = data.accountModelDowngradeWindowSeconds
+    form.accountModelDowngradeProbeIntervalSeconds = data.accountModelDowngradeProbeIntervalSeconds
+    form.accountModelDowngradeLadder = (data.accountModelDowngradeLadder ?? []).join(', ')
+    form.accountModelDowngradeProbeModel = data.accountModelDowngradeProbeModel ?? ''
     mappings.value = Object.entries(data.modelMappings || {}).map(([requestedModel, upstreamModel]) => ({
       requestedModel,
       upstreamModel: String(upstreamModel),
@@ -234,6 +251,38 @@ export function useSettingsForm() {
       toast.warning('探测模型名称不能超过 128 个字符')
       return
     }
+    const { accountModelDowngradeThreshold, accountModelDowngradeWindowSeconds, accountModelDowngradeProbeIntervalSeconds } = form
+    if (accountModelDowngradeThreshold === null || accountModelDowngradeWindowSeconds === null || accountModelDowngradeProbeIntervalSeconds === null) {
+      toast.warning('请完整填写降智下线参数')
+      return
+    }
+    if (!Number.isInteger(accountModelDowngradeThreshold) || accountModelDowngradeThreshold < 1 || accountModelDowngradeThreshold > 1000
+      || !Number.isInteger(accountModelDowngradeWindowSeconds) || accountModelDowngradeWindowSeconds < 60 || accountModelDowngradeWindowSeconds > 3600
+      || !Number.isInteger(accountModelDowngradeProbeIntervalSeconds) || accountModelDowngradeProbeIntervalSeconds < 300 || accountModelDowngradeProbeIntervalSeconds > 604800) {
+      toast.warning('降智次数阈值应为 1～1000，统计窗口为 60～3600 秒，探测间隔为 300～604800 秒')
+      return
+    }
+    const downgradeLadder = form.accountModelDowngradeLadder
+      .split(',')
+      .map(model => model.trim())
+      .filter(Boolean)
+    if (downgradeLadder.length > 64 || downgradeLadder.some(model => model.length > 128)) {
+      toast.warning('模型档位表最多 64 项，单个模型名不超过 128 个字符')
+      return
+    }
+    if (new Set(downgradeLadder).size !== downgradeLadder.length) {
+      toast.warning('模型档位表存在重复项')
+      return
+    }
+    if (form.accountModelDowngradeEnabled && downgradeLadder.length === 0) {
+      toast.warning('启用降智下线时必须填写模型档位表')
+      return
+    }
+    const downgradeProbeModel = form.accountModelDowngradeProbeModel.trim()
+    if (downgradeProbeModel.length > 128) {
+      toast.warning('降智探测模型名称不能超过 128 个字符')
+      return
+    }
     const xaiClientProfile = form.xaiClientProfile
     const openaiClientProfile = form.openaiClientProfile
     await saveAction.run(async () => {
@@ -264,6 +313,12 @@ export function useSettingsForm() {
         accountAutoFreezeProbeEnabled: form.accountAutoFreezeProbeEnabled,
         accountAutoFreezeProbeModel: probeModel || null,
         accountAutoFreezeAdaptiveConcurrency: form.accountAutoFreezeAdaptiveConcurrency,
+        accountModelDowngradeEnabled: form.accountModelDowngradeEnabled,
+        accountModelDowngradeThreshold,
+        accountModelDowngradeWindowSeconds,
+        accountModelDowngradeProbeIntervalSeconds,
+        accountModelDowngradeLadder: downgradeLadder,
+        accountModelDowngradeProbeModel: downgradeProbeModel || null,
       })
       applySettings(result)
       toast.success('设置已保存')
@@ -297,6 +352,9 @@ export function useSettingsForm() {
     accountAutoFreezeThresholdValue,
     accountAutoFreezeWindowSecondsValue,
     accountAutoFreezeDurationSecondsValue,
+    accountModelDowngradeThresholdValue,
+    accountModelDowngradeWindowSecondsValue,
+    accountModelDowngradeProbeIntervalSecondsValue,
     minCodexDesktopVersionError,
     minCodexCliVersionError,
     saveSettings,

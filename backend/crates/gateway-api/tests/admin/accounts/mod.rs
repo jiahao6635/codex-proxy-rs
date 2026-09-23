@@ -827,7 +827,9 @@ mod actions {
             DomainConnectionTestEvent::Content {
                 text: "OK".to_owned(),
             },
-            DomainConnectionTestEvent::Completed {},
+            DomainConnectionTestEvent::Completed {
+                reported_model: None,
+            },
             DomainConnectionTestEvent::Failed {
                 source: AccountProbeErrorSource::Upstream,
                 gateway_error_code: GatewayErrorKind::RateLimited,
@@ -862,7 +864,7 @@ mod actions {
                     }
                 }),
                 json!({ "type": "content", "text": "OK" }),
-                json!({ "type": "test_complete", "success": true }),
+                json!({ "type": "test_complete", "success": true, "reportedModel": null }),
                 json!({
                     "type": "error",
                     "source": "upstream",

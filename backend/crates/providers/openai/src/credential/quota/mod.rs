@@ -25,8 +25,8 @@ use gateway_core::account::{
     QuotaState, QuotaWriteOutcome,
 };
 use gateway_core::provider_ports::{
-    ProviderCooldown, ProviderCooldownKind, ProviderCooldownPort, ProviderFreezePolicy,
-    ProviderLeasePort, ProviderRuntimePolicyPort,
+    ModelDowngradePolicy, ModelDowngradeVerdict, ProviderCooldown, ProviderCooldownKind,
+    ProviderCooldownPort, ProviderFreezePolicy, ProviderLeasePort, ProviderRuntimePolicyPort,
 };
 use gateway_protocol::openai::events::{
     ParsedRateLimits, RateLimitDetails, RateLimitWindow, parse_rate_limit_headers,
@@ -191,6 +191,8 @@ pub struct CodexCredentialQuotaService {
     runtime_policy: Arc<dyn ProviderRuntimePolicyPort>,
     /// 冻结策略的短 TTL 缓存：失败路径热读，避免每个容量错误都查询设置。
     freeze_policy_cache: Mutex<Option<(ProviderFreezePolicy, Instant)>>,
+    /// 降智策略的短 TTL 缓存：成功路径每次响应都要读，必须避免打到设置存储。
+    model_downgrade_policy_cache: Mutex<Option<(ModelDowngradePolicy, Instant)>>,
     scheduling: CodexQuotaSchedulingProjection,
     reset_consume_locks: Mutex<HashMap<ProviderAccountId, Arc<Mutex<()>>>>,
 }
@@ -528,6 +530,7 @@ impl CodexCredentialQuotaService {
             leases,
             runtime_policy,
             freeze_policy_cache: Mutex::new(None),
+            model_downgrade_policy_cache: Mutex::new(None),
             scheduling: CodexQuotaSchedulingProjection::default(),
             reset_consume_locks: Mutex::new(HashMap::new()),
         }
@@ -553,6 +556,85 @@ impl CodexCredentialQuotaService {
             .as_ref()
             .filter(|(_, loaded_at)| loaded_at.elapsed() < FREEZE_POLICY_CACHE_TTL)
             .map_or_else(ProviderFreezePolicy::disabled, |(policy, _)| policy.clone())
+    }
+
+    /// 读取降智下线策略（带短 TTL 缓存）；读取失败退化为关闭，判定不得放大失败。
+    async fn model_downgrade_policy(&self) -> ModelDowngradePolicy {
+        {
+            let cache = self.model_downgrade_policy_cache.lock().await;
+            if let Some((policy, loaded_at)) = cache.as_ref()
+                && loaded_at.elapsed() < FREEZE_POLICY_CACHE_TTL
+            {
+                return policy.clone();
+            }
+        }
+        let loaded = self.runtime_policy.load_model_downgrade_policy().await.ok();
+        let mut cache = self.model_downgrade_policy_cache.lock().await;
+        if let Some(policy) = loaded {
+            *cache = Some((policy.clone(), Instant::now()));
+            return policy;
+        }
+        cache
+            .as_ref()
+            .filter(|(_, loaded_at)| loaded_at.elapsed() < FREEZE_POLICY_CACHE_TTL)
+            .map_or_else(ModelDowngradePolicy::disabled, |(policy, _)| policy.clone())
+    }
+
+    /// 模型降智入口：上游成功返回但声明的模型档位低于请求模型时，在滑动窗口内
+    /// 累计观测次数，达到阈值即写入 `ModelDowngradeFreeze` 账号级冷却。
+    ///
+    /// 该冷却不会自行到期，只能由恢复探测确认模型回升后解除；返回模型未降级时
+    /// 清空窗口计数，避免跨越长时间的零散观测累计成误判。上游未声明模型则跳过。
+    pub async fn apply_model_downgrade(
+        &self,
+        account: &ProviderAccount,
+        requested_model: &str,
+        reported_model: Option<&str>,
+        observed_at: SystemTime,
+    ) {
+        let policy = self.model_downgrade_policy().await;
+        if !policy.enabled() {
+            return;
+        }
+        let Some(reported_model) = reported_model else {
+            return;
+        };
+        let downgraded = match policy.classify(requested_model, reported_model) {
+            ModelDowngradeVerdict::Downgraded => true,
+            ModelDowngradeVerdict::Healthy => false,
+            // 档位表外的模型无法比较，既不累计也不清空既有证据。
+            ModelDowngradeVerdict::Unknown => return,
+        };
+        let Ok(count) = self
+            .cooldowns
+            .observe_model_downgrade(account.id(), policy.window(), downgraded)
+            .await
+        else {
+            return;
+        };
+        if !downgraded || count < policy.threshold() {
+            return;
+        }
+        let Some(until) = observed_at.checked_add(policy.freeze_duration()) else {
+            return;
+        };
+        let cooldown = ProviderCooldown::new_with_kind(
+            account.id().clone(),
+            account.revision(),
+            until,
+            ProviderCooldownKind::ModelDowngradeFreeze,
+        );
+        if self.cooldowns.put_if_later(cooldown).await.is_ok() {
+            tracing::warn!(
+                account_id = account.id().as_str(),
+                requested_model,
+                reported_model,
+                threshold = policy.threshold(),
+                window_seconds = policy.window().as_secs(),
+                probe_interval_seconds = policy.freeze_duration().as_secs(),
+                "账号模型降智触发：账号已下线，等待恢复探测确认模型回升",
+            );
+        }
     }
 
     /// 容量熔断入口：滑动窗口内累计容量类失败，达到阈值即写入带

@@ -633,6 +633,11 @@ pub enum AccountCooldownKind {
     CapacityFreeze,
     /// 到期后仍阻止调度，必须由恢复探测成功或管理员恢复解除。
     CapacityFreezeProbe,
+    /// 上游静默返回低档位模型（降智）达到阈值后写入的自动下线。
+    ///
+    /// 恢复只能由探测确认返回模型不再降级，因此始终需要探测，
+    /// `until` 表示下次探测时间而不是自动放行时间。
+    ModelDowngradeFreeze,
 }
 
 impl AccountCooldownKind {
@@ -642,7 +647,14 @@ impl AccountCooldownKind {
             Self::RateLimit => "rate_limit",
             Self::CapacityFreeze => "capacity_freeze",
             Self::CapacityFreezeProbe => "capacity_freeze_probe",
+            Self::ModelDowngradeFreeze => "model_downgrade_freeze",
         }
+    }
+
+    /// 是否属于由策略写入、需要恢复编排处理的自动冻结（区别于 429 临时限流）。
+    #[must_use]
+    pub const fn is_freeze(self) -> bool {
+        !matches!(self, Self::RateLimit)
     }
 
     #[must_use]
@@ -651,8 +663,13 @@ impl AccountCooldownKind {
     }
 
     #[must_use]
+    pub const fn is_model_downgrade(self) -> bool {
+        matches!(self, Self::ModelDowngradeFreeze)
+    }
+
+    #[must_use]
     pub const fn requires_probe(self) -> bool {
-        matches!(self, Self::CapacityFreezeProbe)
+        matches!(self, Self::CapacityFreezeProbe | Self::ModelDowngradeFreeze)
     }
 
     #[must_use]
@@ -661,6 +678,7 @@ impl AccountCooldownKind {
             "rate_limit" => Some(Self::RateLimit),
             "capacity_freeze" => Some(Self::CapacityFreeze),
             "capacity_freeze_probe" => Some(Self::CapacityFreezeProbe),
+            "model_downgrade_freeze" => Some(Self::ModelDowngradeFreeze),
             _ => None,
         }
     }
