@@ -3,6 +3,7 @@
 pub mod extensions;
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as SyncMutex, RwLock};
 use std::time::Duration;
@@ -226,6 +227,78 @@ impl Drop for DeferredScheduleGuard {
     }
 }
 
+#[derive(Default)]
+struct RefreshPriorityState {
+    pending_commits: usize,
+    active_background: Option<CancellationToken>,
+}
+
+struct CommittedRefreshGuard {
+    priority: Arc<SyncMutex<RefreshPriorityState>>,
+}
+
+impl CommittedRefreshGuard {
+    fn begin(priority: Arc<SyncMutex<RefreshPriorityState>>) -> Self {
+        let active = {
+            let mut state = lock_unpoisoned(&priority);
+            state.pending_commits += 1;
+            state.active_background.clone()
+        };
+        // 先登记待发布提交，再取消正在等待目录的后台刷新，避免后者抢先重入。
+        if let Some(active) = active {
+            active.cancel();
+        }
+        Self { priority }
+    }
+}
+
+impl Drop for CommittedRefreshGuard {
+    fn drop(&mut self) {
+        lock_unpoisoned(&self.priority).pending_commits -= 1;
+    }
+}
+
+struct BackgroundRefreshGuard {
+    priority: Arc<SyncMutex<RefreshPriorityState>>,
+    cancellation: CancellationToken,
+}
+
+impl BackgroundRefreshGuard {
+    fn begin(priority: Arc<SyncMutex<RefreshPriorityState>>) -> Option<Self> {
+        let mut state = lock_unpoisoned(&priority);
+        if state.pending_commits != 0 {
+            return None;
+        }
+        let cancellation = CancellationToken::new();
+        state.active_background = Some(cancellation.clone());
+        drop(state);
+        Some(Self {
+            priority,
+            cancellation,
+        })
+    }
+}
+
+impl Drop for BackgroundRefreshGuard {
+    fn drop(&mut self) {
+        lock_unpoisoned(&self.priority).active_background = None;
+    }
+}
+
+// 仅中断未完成的读取/编译；发布及延迟通知仍在刷新锁内完成，避免丢失提交。
+async fn preempt_for_committed_refresh<T>(
+    cancellation: &CancellationToken,
+    operation: impl Future<Output = T>,
+) -> Result<T, RuntimeSnapshotCompileError> {
+    let cancelled = cancellation.cancelled().fuse();
+    let operation = operation.fuse();
+    pin_mut!(cancelled, operation);
+    select_biased! {
+        _ = cancelled => Err(RuntimeSnapshotCompileError::RevisionChanged),
+        result = operation => Ok(result),
+    }
+}
+
 /// 配置提交后的本进程快照发布与跨进程失效通知。
 #[derive(Clone)]
 pub struct RuntimeSnapshotPublisher {
@@ -234,6 +307,7 @@ pub struct RuntimeSnapshotPublisher {
     subscriptions: Arc<dyn SnapshotSubscriptionPort>,
     refresh_lock: Arc<Mutex<()>>,
     deferred: Arc<SyncMutex<DeferredPublicationState>>,
+    refresh_priority: Arc<SyncMutex<RefreshPriorityState>>,
 }
 
 enum RefreshMode {
@@ -255,6 +329,7 @@ impl RuntimeSnapshotPublisher {
             subscriptions,
             refresh_lock: Arc::new(Mutex::new(())),
             deferred: Arc::new(SyncMutex::new(DeferredPublicationState::default())),
+            refresh_priority: Arc::new(SyncMutex::new(RefreshPriorityState::default())),
         }
     }
 
@@ -267,27 +342,42 @@ impl RuntimeSnapshotPublisher {
         &self,
         mode: RefreshMode,
     ) -> Result<ConfigRevision, RuntimeSnapshotCompileError> {
-        // 所有入口共享从读取事实到发布或暂停的完整临界区；只锁最后的替换会让
-        // 旧编译覆盖新授权，或让晚到的失败暂停新快照。请求读取不等待此锁。
+        // 提交先登记并中断慢后台读取；发布/暂停仍在完整临界区内串行执行。
+        let _committed = matches!(mode, RefreshMode::Committed)
+            .then(|| CommittedRefreshGuard::begin(Arc::clone(&self.refresh_priority)));
         let _refresh = self.refresh_lock.lock().await;
-        self.refresh_locked(mode).await
+        self.refresh_locked_with_priority(mode).await
+    }
+
+    async fn refresh_locked_with_priority(
+        &self,
+        mode: RefreshMode,
+    ) -> Result<ConfigRevision, RuntimeSnapshotCompileError> {
+        if matches!(mode, RefreshMode::Committed) {
+            return self.refresh_locked(mode, None).await;
+        }
+        let background = BackgroundRefreshGuard::begin(Arc::clone(&self.refresh_priority))
+            .ok_or(RuntimeSnapshotCompileError::RevisionChanged)?;
+        self.refresh_locked(mode, Some(&background.cancellation))
+            .await
     }
 
     async fn refresh_locked(
         &self,
         mode: RefreshMode,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<ConfigRevision, RuntimeSnapshotCompileError> {
         let mut active = ActiveRefreshGuard::begin(Arc::clone(&self.deferred));
         let configuration_changed = if matches!(mode, RefreshMode::Reconcile) {
-            let persisted_revision = self
-                .compiler
-                .store()
-                .current_config_revision()
-                .await
-                .map_err(|_| {
-                    self.snapshots.suspend();
-                    RuntimeSnapshotCompileError::StoreUnavailable
-                })?;
+            let persisted_revision = preempt_for_committed_refresh(
+                cancellation.expect("background refresh cancellation"),
+                self.compiler.store().current_config_revision(),
+            )
+            .await?
+            .map_err(|_| {
+                self.snapshots.suspend();
+                RuntimeSnapshotCompileError::StoreUnavailable
+            })?;
             let changed = runtime_revision_needs_refresh(
                 self.published_revision().map(ConfigRevision::get),
                 persisted_revision.get(),
@@ -314,7 +404,11 @@ impl RuntimeSnapshotPublisher {
                     None => self.compiler.compile().await,
                 }
             } else {
-                self.compiler.compile().await
+                preempt_for_committed_refresh(
+                    cancellation.expect("background refresh cancellation"),
+                    self.compiler.compile(),
+                )
+                .await?
             };
             let snapshot = match compiled {
                 Ok(snapshot) => snapshot,
@@ -398,7 +492,10 @@ impl RuntimeSnapshotPublisher {
         if !has_pending {
             return;
         }
-        if let Err(error) = self.refresh_locked(RefreshMode::Required).await {
+        if let Err(error) = self
+            .refresh_locked_with_priority(RefreshMode::Required)
+            .await
+        {
             tracing::warn!(?error, "deferred runtime snapshot publication failed");
         }
     }
