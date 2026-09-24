@@ -1,14 +1,14 @@
 import type { Ref } from 'vue'
 import type { AccountModelAccess, ApiKeyConfiguration, getAccounts } from '@/api'
 
+import { toast } from '@codex-proxy/ui'
 import { computed, ref, shallowRef, watch } from 'vue'
-import { getAccountDetail, updateAccount, updateAccountApiKey } from '@/api'
-import { toast } from '@/components/base/BaseToast'
+import { getAccountDetail, updateAccount } from '@/api'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useRequestState } from '@/composables/useRequestState'
 import { accountModelAccessError } from '../utils/modelAccess'
 import { concurrencyLimitInput, parseAccountSchedulingForm } from '../utils/schedulingForm'
-import { apiKeyAccountError, emptyApiKeyAccountForm } from '../utils/upstreamApiKey'
+import { apiKeyAccountError, emptyApiKeyAccountForm, isOpenAiApiKeyAccount, parseApiKeyConfiguration } from '../utils/upstreamApiKey'
 
 type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
 
@@ -41,10 +41,11 @@ export function useAccountEditor(options: {
       const detail = await getAccountDetail({ accountId }, { signal: configurationRequest.signal })
       if (!configurationRequest.isCurrent(requestId))
         return
-      if (!detail.credentialConfiguration)
+      const configuration = parseApiKeyConfiguration(detail.credentialConfiguration)
+      if (!configuration)
         throw new Error('该账号没有 API Key 上游设置')
-      apiKey.value = { ...emptyApiKeyAccountForm(), ...detail.credentialConfiguration }
-      savedConfiguration.value = detail.credentialConfiguration
+      apiKey.value = { ...emptyApiKeyAccountForm(), ...configuration }
+      savedConfiguration.value = configuration
       configurationReady.value = true
     }
     catch (error) {
@@ -77,7 +78,7 @@ export function useAccountEditor(options: {
     savedConfiguration.value = undefined
     configurationReady.value = false
     showEditModal.value = true
-    if (account.authenticationKind === 'api_key')
+    if (isOpenAiApiKeyAccount(account))
       void loadConfiguration(account.id)
   }
 
@@ -85,7 +86,7 @@ export function useAccountEditor(options: {
     const accountId = editingAccountId.value
     if (!accountId || saving.value)
       return
-    const isApiKey = editingAccount.value?.authenticationKind === 'api_key'
+    const isApiKey = isOpenAiApiKeyAccount(editingAccount.value)
     if (isApiKey) {
       if (!configurationReady.value)
         return
@@ -126,12 +127,12 @@ export function useAccountEditor(options: {
         || apiKey.value.base_url.trim() !== savedConfiguration.value?.base_url
         || apiKey.value.transport !== savedConfiguration.value?.transport
       )
-      if (connectionChanged) {
-        await updateAccountApiKey({ accountId, baseUrl: apiKey.value.base_url.trim(), transport: apiKey.value.transport, apiKey: apiKey.value.apiKey || undefined, settings })
-      }
-      else {
-        await updateAccount(settings)
-      }
+      await updateAccount({
+        ...settings,
+        connection: connectionChanged
+          ? { baseUrl: apiKey.value.base_url.trim(), transport: apiKey.value.transport, apiKey: apiKey.value.apiKey || undefined }
+          : undefined,
+      })
       showEditModal.value = false
       toast.success('账号已更新')
       void Promise.allSettled([options.reloadAccounts(), options.reloadGroups()])

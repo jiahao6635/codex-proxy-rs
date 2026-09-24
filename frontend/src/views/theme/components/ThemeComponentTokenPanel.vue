@@ -1,10 +1,10 @@
 <script setup lang="ts">
+import type { ResolvedTheme, ThemeComponentOverrides, ThemeTokenName } from '@codex-proxy/ui/theme'
 import type { Component } from 'vue'
 import type {
   ThemeEditorComponent,
   ThemeEditorDraft,
 } from '../composables/useThemeEditor'
-import type { ResolvedTheme, ThemeComponentOverrides, ThemeTokenName } from '@/theme'
 
 import {
   AppWindow,

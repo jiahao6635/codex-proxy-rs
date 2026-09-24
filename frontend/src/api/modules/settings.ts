@@ -1,13 +1,14 @@
 import type { RequestOptions } from '../request'
 import type { RequestLocation } from '../types/request-location'
-import type { ClientProfileSelection, XaiClientProfileSelection } from './client-profiles'
+import type { ClientProfileSelection, ProviderRequestProfiles, ProviderRequestProfileUpdates, XaiClientProfileSelection } from './client-profiles'
 import request from '../request'
 
 export type RotationStrategy = 'smart' | 'quota_reset_priority' | 'round_robin' | 'sticky'
 
 export interface RuntimeSettings {
-  openaiClientProfile: ClientProfileSelection
-  xaiClientProfile: XaiClientProfileSelection
+  providerRequestProfiles: ProviderRequestProfiles
+  openaiClientProfile: ClientProfileSelection | null
+  xaiClientProfile: XaiClientProfileSelection | null
 
   requestLocationEnabled: boolean
   requestLocation: RequestLocation
@@ -76,7 +77,9 @@ export function getSettings(options: RequestOptions = {}) {
   })
 }
 
-type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt'>
+type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt' | 'openaiClientProfile' | 'xaiClientProfile' | 'providerRequestProfiles'> & {
+  providerRequestProfiles: ProviderRequestProfileUpdates
+}
 
 export function updateSettings(data: UpdateSettingsParam) {
   return request<RuntimeSettings>({

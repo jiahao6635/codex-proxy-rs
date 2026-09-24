@@ -101,7 +101,8 @@ impl From<ClientAuthenticationError> for LoginError {
     fn from(error: ClientAuthenticationError) -> Self {
         match error {
             ClientAuthenticationError::InvalidKey => Self::InvalidCredentials,
-            ClientAuthenticationError::SnapshotUnavailable => Self::Unavailable,
+            ClientAuthenticationError::SnapshotUnavailable
+            | ClientAuthenticationError::ProviderUnavailable => Self::Unavailable,
         }
     }
 }

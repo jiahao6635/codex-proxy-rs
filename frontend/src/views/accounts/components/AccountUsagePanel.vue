@@ -1,11 +1,9 @@
 <script setup lang="ts">
 import type { AccountRow } from '../constants'
 
+import { BaseIconButton, BaseTable, defineTableColumns } from '@codex-proxy/ui'
 import { ChartNoAxesCombined, Sigma } from '@lucide/vue'
 import { computed, ref } from 'vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import { defineTableColumns } from '@/components/base/BaseTable/columns'
-import BaseTable from '@/components/base/BaseTable/index.vue'
 import { modelSuccessRateTextClass } from '../constants'
 import AccountQuotaForecastModal from './AccountQuotaForecastModal/index.vue'
 

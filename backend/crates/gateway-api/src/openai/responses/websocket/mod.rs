@@ -18,14 +18,23 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use gateway_core::{
     diagnostics::{TraceContext, diagnostic_json},
-    engine::execution::{AuthenticatedClient, ClientTransport},
+    engine::{
+        execution::{AuthenticatedClient, ClientTransport},
+        middleware::MiddlewareError,
+    },
     lifecycle::{ConnectionGuard, ConnectionLifecycle},
+    operation::OperationKind,
 };
 
 use crate::{
     ApiState,
+    openai::middleware::{
+        HttpMiddlewareInput, invoke_http_middleware, request_headers as middleware_request_headers,
+        request_parts,
+    },
     openai::{
         auth::{authenticate_client, client_access_error_response},
         error::runtime_unavailable_response,
@@ -33,11 +42,14 @@ use crate::{
     },
 };
 
-use super::{http::request_client_context, request::OpenAiRequestHeaders};
+use super::{
+    http::request_client_context, request::OpenAiRequestHeaders,
+    validation::ResponseValidationFacts,
+};
 use connection::{ConnectionEvent, FramePhase, ResponsesWebSocketConnection, WriteContext};
 use forward::{
-    ConnectionReplaySnapshot, ForwardOutcome, forward_execution, send_gateway_error,
-    send_protocol_error,
+    ConnectionReplaySnapshot, ForwardOutcome, execution_response, forward_response,
+    new_replay_capture, send_gateway_error, send_middleware_error, send_protocol_error,
 };
 use protocol::connection_limit_event;
 pub use protocol::{ResponseCreateFrameError, decode_response_create_with_context};
@@ -53,7 +65,7 @@ pub(crate) async fn responses_websocket(
     websocket: WebSocketUpgrade,
 ) -> Response {
     let service = state.openai().clone();
-    let client = match authenticate_client(&service, &headers) {
+    let client = match authenticate_client(&service, &headers).await {
         Ok(client) => client,
         Err(error) => return client_access_error_response(error),
     };
@@ -101,7 +113,7 @@ impl ResponsesWebSocketAdapter {
         let connection_id = self.service.next_request_id().replacen("req_", "ws_", 1);
         TraceContext::new(&connection_id).headers(
             "client.connection.headers",
-            serde_json::json!({"transport": "websocket", "method": "GET", "path": "/v1/responses"}),
+            serde_json::json!({"transport": "websocket", "method": "GET", "path": crate::openai::router::RESPONSES_PATH}),
             raw_headers
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_bytes())),
@@ -113,6 +125,7 @@ impl ResponsesWebSocketAdapter {
             client_ip,
             user_agent,
             request_headers,
+            raw_headers,
             lifecycle: self.service.lifecycle(),
             connection_guard,
         };
@@ -134,6 +147,7 @@ struct ResponsesWebSocketSession {
     client_ip: Option<IpAddr>,
     user_agent: Option<String>,
     request_headers: OpenAiRequestHeaders,
+    raw_headers: HeaderMap,
     lifecycle: Arc<dyn ConnectionLifecycle>,
     connection_guard: Box<dyn ConnectionGuard>,
 }
@@ -146,6 +160,7 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
         client_ip,
         user_agent,
         request_headers,
+        raw_headers,
         lifecycle,
         connection_guard,
     } = session;
@@ -184,7 +199,7 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
         request_count = request_count.saturating_add(1);
         let correlation_id = Arc::<str>::from(service.next_request_id());
         let decoded = match decode_response_create_with_context(&payload, &request_headers) {
-            Ok(decoded) => decoded.with_client_context(client_ip, user_agent.clone()),
+            Ok(decoded) => decoded,
             Err(error) => {
                 trace_rejected_request(
                     &correlation_id,
@@ -207,7 +222,6 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
                 continue;
             }
         };
-        let decoded = replay.prepare(decoded);
         // deadline 与 Text 可能同时就绪；在任何上游执行开始前再次封住该竞争窗口。
         if connection.is_expired() {
             trace_rejected_request(
@@ -220,16 +234,9 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
             expire_connection(&mut connection).await;
             break;
         }
-        let started = match service
-            .start_response(
-                client.clone(),
-                decoded,
-                ClientTransport::WebSocket,
-                "/v1/responses",
-            )
-            .await
-        {
-            Ok(started) => started,
+        let execution = service.execution();
+        let prepared = match execution.prepare_execution(client.clone()).await {
+            Ok(prepared) => prepared,
             Err(error) => {
                 trace_rejected_request(
                     &correlation_id,
@@ -246,16 +253,96 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
                 continue;
             }
         };
-        started.session.trace().record("client.connection", serde_json::json!({
-            "transport": "websocket", "connectionId": connection.id(), "correlationId": correlation_id.as_ref(),
-            "requestIndex": request_count,
-        }));
-        started
-            .session
-            .trace()
-            .capture("client.request.body", payload.as_bytes());
-
-        if forward_execution(&mut connection, started, &mut replay).await
+        let request_id = Arc::<str>::from(prepared.request_id().to_string());
+        let capture = new_replay_capture();
+        let validation = ResponseValidationFacts::default();
+        let input = HttpMiddlewareInput {
+            endpoint: crate::openai::router::RESPONSES_PATH.to_owned(),
+            protocol: "openai".to_owned(),
+            operation: Some(OperationKind::Generate),
+            transport: ClientTransport::WebSocket,
+            model_hint: Some(decoded.metadata().requested_model().to_owned()),
+            headers: middleware_request_headers(&raw_headers),
+            body: Bytes::from(payload.clone()),
+        };
+        let service_for_terminal = service.clone();
+        let replay_for_terminal = replay.clone();
+        let connection_id_for_terminal = connection.id().to_owned();
+        let user_agent_for_terminal = user_agent.clone();
+        let request_id_for_terminal = Arc::clone(&request_id);
+        let capture_for_terminal = Arc::clone(&capture);
+        let validation_for_terminal = validation.clone();
+        let invoke = invoke_http_middleware(
+            execution,
+            prepared,
+            input,
+            Box::new(move |prepared, request| {
+                Box::pin(async move {
+                    let (protocol, headers, body) = request_parts(request)?;
+                    if protocol != "openai" {
+                        return Err(MiddlewareError::Rejected);
+                    }
+                    let payload =
+                        std::str::from_utf8(&body).map_err(|_| MiddlewareError::Rejected)?;
+                    let request_headers = OpenAiRequestHeaders::from_headers(&headers)
+                        .with_downstream_websocket_connection_id(
+                            connection_id_for_terminal.clone(),
+                        );
+                    let decoded = decode_response_create_with_context(payload, &request_headers)
+                        .map_err(|_| MiddlewareError::Rejected)?
+                        .with_client_context(client_ip, user_agent_for_terminal);
+                    let decoded = replay_for_terminal.prepare(decoded);
+                    let started = service_for_terminal
+                        .start_prepared_response(
+                            prepared,
+                            decoded,
+                            ClientTransport::WebSocket,
+                            crate::openai::router::RESPONSES_PATH,
+                        )
+                        .await
+                        .map_err(MiddlewareError::Gateway)?;
+                    started.session.trace().record(
+                        "client.connection",
+                        serde_json::json!({
+                            "transport": "websocket",
+                            "connectionId": connection_id_for_terminal,
+                            "correlationId": request_id_for_terminal.as_ref(),
+                            "requestIndex": request_count,
+                        }),
+                    );
+                    started
+                        .session
+                        .trace()
+                        .capture("client.request.body", &body);
+                    execution_response(started, capture_for_terminal, validation_for_terminal).await
+                })
+            }),
+        );
+        let response = tokio::select! {
+            biased;
+            _ = connection.wait_for_exit() => break,
+            response = invoke => response,
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if send_middleware_error(&mut connection, error, &request_id).await
+                    == ForwardOutcome::Disconnect
+                {
+                    break;
+                }
+                continue;
+            }
+        };
+        if forward_response(
+            &mut connection,
+            response,
+            request_id,
+            &mut replay,
+            capture,
+            validation,
+        )
+        .await
             == ForwardOutcome::Disconnect
         {
             break;

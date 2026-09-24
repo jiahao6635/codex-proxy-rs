@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+mod extensions;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -242,6 +243,72 @@ fn publisher_should_suspend_but_still_notify_after_committed_refresh_failure() {
             .as_slice(),
         &[revision(2)],
     );
+}
+
+#[test]
+fn deferred_commit_during_refresh_should_retry_the_latest_revision_without_reentry() {
+    block_on(async {
+        let (release, gate) = oneshot::channel();
+        let store = Arc::new(TestSnapshotStore::new(Ok(facts(1, 1))));
+        *store.next_load.lock().expect("load gate lock") = Some(gate);
+        let handle = RuntimeSnapshotHandle::default();
+        let subscriptions = Arc::new(TestSnapshotSubscriptions::default());
+        let publisher = RuntimeSnapshotPublisher::new(
+            Arc::new(compiler(store.clone())),
+            handle.clone(),
+            subscriptions.clone(),
+        );
+
+        let mut refresh = Box::pin(publisher.refresh());
+        assert!(futures::poll!(refresh.as_mut()).is_pending());
+        *store.facts.lock().expect("facts lock") = Ok(facts(2, 2));
+        *store.current_revision.lock().expect("revision lock") = Ok(revision(2));
+        publisher.publish_committed_deferred(revision(2)).await;
+        release
+            .send(Ok(facts(1, 1)))
+            .expect("release initial facts read");
+
+        assert_eq!(refresh.await.expect("coalesced refresh"), revision(2));
+        assert_eq!(store.loads.load(Ordering::SeqCst), 2);
+        assert_eq!(handle.revision(), Some(revision(2)));
+        assert_eq!(
+            *subscriptions.published.lock().expect("published lock"),
+            vec![revision(2)],
+        );
+    });
+}
+
+#[test]
+fn deferred_commit_at_refresh_completion_should_not_lose_the_next_publication() {
+    block_on(async {
+        let (release, gate) = oneshot::channel();
+        let store = Arc::new(TestSnapshotStore::new(Ok(facts(2, 2))));
+        let handle = RuntimeSnapshotHandle::default();
+        let subscriptions = Arc::new(TestSnapshotSubscriptions {
+            next_publish: Mutex::new(Some(gate)),
+            ..TestSnapshotSubscriptions::default()
+        });
+        let publisher = RuntimeSnapshotPublisher::new(
+            Arc::new(compiler(store.clone())),
+            handle.clone(),
+            subscriptions.clone(),
+        );
+
+        let mut first = publisher.publish_committed_deferred(revision(2));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert_eq!(handle.revision(), Some(revision(2)));
+        *store.facts.lock().expect("facts lock") = Ok(facts(3, 3));
+        *store.current_revision.lock().expect("revision lock") = Ok(revision(3));
+        publisher.publish_committed_deferred(revision(3)).await;
+        release.send(()).expect("release revision notification");
+        first.await;
+
+        assert_eq!(handle.revision(), Some(revision(3)));
+        assert_eq!(
+            *subscriptions.published.lock().expect("published lock"),
+            vec![revision(2), revision(3)],
+        );
+    });
 }
 
 #[test]

@@ -163,6 +163,23 @@ impl OpenAiAdminProvider {
 
 #[async_trait]
 impl ProviderAdmin for OpenAiAdminProvider {
+    fn account_capabilities(
+        &self,
+        _account_id: &ProviderAccountId,
+        authentication_kind: &str,
+    ) -> gateway_admin::model::provider_capabilities::ProviderAccountCapabilities {
+        let oauth = authentication_kind == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH;
+        gateway_admin::model::provider_capabilities::ProviderAccountCapabilities {
+            quota: oauth,
+            quota_refresh: oauth,
+            profile: oauth,
+            subscription: oauth,
+            avatar: oauth,
+            reset_credits: oauth,
+            consume_reset_credit: oauth,
+        }
+    }
+
     fn pricing_catalog(&self) -> gateway_admin::model::pricing::ProviderPricingCatalog {
         crate::transport::usage::pricing_catalog()
     }
@@ -182,6 +199,23 @@ impl ProviderAdmin for OpenAiAdminProvider {
         self.profile
             .preview_selection(configuration)
             .map_err(map_client_profile_error)
+    }
+
+    fn credential_capabilities(
+        &self,
+    ) -> gateway_admin::model::provider_capabilities::ProviderCredentialCapabilities {
+        use gateway_admin::model::provider_capabilities::{
+            AuthorizationCompletion, ProviderCredentialCapabilities, ProviderLoginCapability,
+        };
+        ProviderCredentialCapabilities {
+            import: Some(serde_json::json!({"type":"object"})),
+            login: Some(ProviderLoginCapability {
+                input_schema: serde_json::json!({"type":"object", "additionalProperties":false}),
+                completion: AuthorizationCompletion::Callback,
+            }),
+            refresh: true,
+            export: true,
+        }
     }
 
     fn provider_kind(&self) -> &ProviderKind {
@@ -230,7 +264,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
         }
     }
 
-    fn connection_test_operation(
+    async fn connection_test_operation(
         &self,
         upstream_model: &UpstreamModelId,
         input_text: &str,
@@ -429,8 +463,17 @@ impl ProviderAdmin for OpenAiAdminProvider {
 
     async fn start_authorization(
         &self,
-        pending: PendingAuthorizationMutation,
+        command: gateway_admin::model::provider_credentials::PrepareAuthorization,
     ) -> Result<AuthorizationStarted, ProviderAdminError> {
+        if !command
+            .input
+            .expose_to_provider()
+            .expose_to_provider()
+            .is_empty()
+        {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+        }
+        let pending = command.pending;
         if pending.provider_kind() != &self.provider_kind {
             return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
         }
@@ -474,20 +517,21 @@ impl ProviderAdmin for OpenAiAdminProvider {
             })
             .map_err(map_oauth_error)?;
         let (mutation, completed_credential, authorization_guard) = completed.into_parts();
-        let credential = match (mutation.target(), completed_credential) {
-            (
-                AuthorizationMutationTarget::Create { .. },
-                CompletedCodexOAuthCredential::Create(credential),
-            ) => {
-                prepared_create(credential, Utc::now()).map(PreparedAuthorizationCredential::Create)
-            }
-            (
-                AuthorizationMutationTarget::Reauthorize { .. },
-                CompletedCodexOAuthCredential::Reauthorize(credential),
-            ) => prepared_rotation(credential, mutation.provider_kind().clone())
-                .map(PreparedAuthorizationCredential::Reauthorize),
-            _ => Err(provider_admin_error(ProviderAdminErrorKind::Internal)),
-        };
+        let credential =
+            match (mutation.target(), completed_credential) {
+                (
+                    AuthorizationMutationTarget::Create { .. },
+                    CompletedCodexOAuthCredential::Create(credential),
+                ) => prepared_create(credential, Utc::now())
+                    .map(|credential| PreparedAuthorizationCredential::Create(vec![credential])),
+                (
+                    AuthorizationMutationTarget::Reauthorize { .. },
+                    CompletedCodexOAuthCredential::Reauthorize(credential),
+                ) => prepared_rotation(credential, mutation.provider_kind().clone()).map(
+                    |credential| PreparedAuthorizationCredential::Reauthorize(Box::new(credential)),
+                ),
+                _ => Err(provider_admin_error(ProviderAdminErrorKind::Internal)),
+            };
         let credential = match credential {
             Ok(credential) => credential,
             Err(error) => {

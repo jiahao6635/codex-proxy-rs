@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { rotationOptions } from '../constants'
-import BaseCard from '@/components/base/BaseCard.vue'
+import { BaseCard } from '@codex-proxy/ui'
 
 type RotationOption = (typeof rotationOptions)[number]
 type RotationStrategy = RotationOption['value']

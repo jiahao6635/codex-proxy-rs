@@ -1,9 +1,14 @@
 //! 网关进程与操作系统能力：配置发现、日志、任务、自更新与 serve/drain。
 
 pub mod client_distribution;
+mod command_line;
 pub mod config;
 mod logging;
+pub mod official_plugins;
+pub mod outbound;
+pub mod plugin_distribution;
 pub mod pricing;
+pub mod process;
 pub mod proxy_probe;
 pub mod serve;
 pub mod system_update;
@@ -13,7 +18,8 @@ use std::sync::Arc;
 
 use axum::Router;
 use gateway_admin::ports::{
-    client_distribution::ClientDistributionResolver, system::SystemOperations,
+    client_distribution::ClientDistributionResolver, plugin_release::OfficialPluginReleaseFiles,
+    system::SystemOperations,
 };
 use gateway_core::health::{HealthProbe, WorkerHealthSource};
 use gateway_core::lifecycle::CancellationToken;
@@ -37,10 +43,18 @@ pub struct HostBundle {
     workers: WorkerSupervisor,
     system: Arc<ProcessSystemOperations>,
     client_distribution: Arc<RgAdguardClientDistribution>,
+    official_plugins: Arc<official_plugins::FileOfficialPluginRelease>,
+    command_signal: Option<command_line::SignalGuard>,
 }
 
 /// 在启动其他包之前初始化进程级能力。
 pub async fn initialize(config: HostConfig) -> Result<HostBundle, HostError> {
+    let official_plugins = Arc::new(official_plugins::FileOfficialPluginRelease::new(
+        config
+            .system_update
+            .official_plugins_dir()
+            .map_err(|_| HostError::OfficialPluginRelease)?,
+    ));
     let log_guard = initialize_logging(&config.logging)?;
     let cancellation = CancellationToken::new();
     let connections = Arc::new(ConnectionTracker::new(cancellation.clone()));
@@ -58,7 +72,17 @@ pub async fn initialize(config: HostConfig) -> Result<HostBundle, HostError> {
         workers,
         system,
         client_distribution,
+        official_plugins,
+        command_signal: None,
     })
+}
+
+/// CLI 的 stdout/stderr 属于命令结果；宿主诊断只保留已配置的文件日志。
+pub async fn initialize_command_line(mut config: HostConfig) -> Result<HostBundle, HostError> {
+    config.logging.stdout = false;
+    let mut host = initialize(config).await?;
+    host.command_signal = Some(command_line::SignalGuard::start(host.cancellation()));
+    Ok(host)
 }
 
 impl HostBundle {
@@ -81,6 +105,23 @@ impl HostBundle {
     /// 返回惰性下载解析能力；网络请求只会在管理 API 调用时发生。
     pub fn client_distribution_resolver(&self) -> Arc<dyn ClientDistributionResolver> {
         self.client_distribution.clone()
+    }
+
+    /// 返回与当前可执行文件一同部署的只读官方插件发行目录。
+    #[must_use]
+    pub fn official_plugin_release_files(&self) -> Arc<dyn OfficialPluginReleaseFiles> {
+        self.official_plugins.clone()
+    }
+
+    /// 身份来自构建脚本写入二进制的常量，不采信运行时配置或环境覆盖。
+    #[must_use]
+    pub fn official_plugin_release_identity(
+        &self,
+    ) -> gateway_admin::model::plugins::official::OfficialPluginReleaseIdentity {
+        gateway_admin::model::plugins::official::OfficialPluginReleaseIdentity {
+            gateway_version: env!("CPR_VERSION").to_owned(),
+            gateway_git_sha: env!("CPR_GIT_SHA").to_owned(),
+        }
     }
 
     #[must_use]
@@ -134,6 +175,14 @@ impl HostBundle {
         self.workers
             .shutdown(self.config.worker_shutdown_timeout())
             .await;
+        match &result {
+            Ok(()) => {
+                tracing::info!(target: "gateway_shutdown", pid = std::process::id(), "HTTP 服务与后台任务已停止")
+            }
+            Err(error) => {
+                tracing::error!(target: "gateway_shutdown", pid = std::process::id(), %error, "HTTP 服务异常停止，后台任务已清理")
+            }
+        }
         result?;
         Ok(())
     }
@@ -147,4 +196,6 @@ pub enum HostError {
     Workers(#[from] workers::WorkerStartError),
     #[error(transparent)]
     Serve(#[from] serve::ServeError),
+    #[error("官方插件发行目录不可用")]
+    OfficialPluginRelease,
 }

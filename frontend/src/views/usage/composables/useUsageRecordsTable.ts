@@ -5,11 +5,13 @@ import { watchDebounced } from '@vueuse/core'
 
 import { computed, onMounted, onScopeDispose, shallowRef, watch } from 'vue'
 import {
+  getUsageProviders,
   getUsageRecordInsightsDiagnostics,
   getUsageRecordInsightsOverview,
   getUsageRecords,
   getUsageRecordSummary,
 } from '@/api'
+import { useRequestState } from '@/composables/useRequestState'
 import { withMinimumDuration } from '@/utils/async'
 
 interface UseUsageRecordsTableOptions {
@@ -37,6 +39,8 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
   const searchQuery = shallowRef('')
   const search = computed(() => searchQuery.value.trim() || undefined)
   const providerQuery = shallowRef('')
+  const providers = shallowRef<string[]>([])
+  const providerRequest = useRequestState()
   let tableParams = snapshot()
   const refreshingList = shallowRef(false)
   const diagnosticDimension = shallowRef('model')
@@ -79,9 +83,27 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
     }
 
     await Promise.all([
+      ...(scope === 'all' ? [loadProviders(globalParams)] : []),
       ...(options.active.value ? [loadUsagePage(background)] : []),
       ...(scope === 'all' ? [loadUsageAnalytics(globalParams, background)] : []),
     ])
+  }
+
+  async function loadProviders(range = options.latestTimeRangeParams()) {
+    const requestId = providerRequest.start()
+    try {
+      const result = await getUsageProviders({ startTime: range.startTime, endTime: range.endTime }, { signal: providerRequest.signal, silent: true })
+      if (providerRequest.isCurrent(requestId))
+        providers.value = result
+    }
+    catch (cause) {
+      if (providerRequest.isCurrent(requestId))
+        providers.value = []
+      providerRequest.fail(requestId, cause)
+    }
+    finally {
+      providerRequest.finish(requestId)
+    }
   }
 
   async function loadUsagePage(background: boolean) {
@@ -175,7 +197,7 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
       return
     refreshingList.value = true
     try {
-      await withMinimumDuration(reloadLatestTable)
+      await withMinimumDuration(() => Promise.all([reloadLatestTable(), loadProviders()]))
     }
     finally {
       refreshingList.value = false
@@ -253,6 +275,10 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
     pageSize,
     searchQuery,
     providerQuery,
+    providers,
+    providersLoading: providerRequest.loading,
+    providersError: providerRequest.error,
+    loadProviders,
     usagePagination,
     loading,
     analyticsLoading,

@@ -1,21 +1,12 @@
 <script setup lang="ts">
 import type { ApiKeyFormValue } from '../composables/useApiKeyMutations'
 import type { AccountGroup } from '@/api'
-import { Openai, Xai } from '@boxicons/vue'
-import { Copy, DollarSign, KeyRound, Upload } from '@lucide/vue'
-import { computed, shallowRef } from 'vue'
+import { BaseButton, BaseForm, BaseFormItem, BaseIconButton, BaseInput, BaseModal } from '@codex-proxy/ui'
 
+import { Copy, DollarSign, KeyRound, Upload } from '@lucide/vue'
+import { computed } from 'vue'
 import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseForm from '@/components/base/BaseForm/index.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import ClientProfileEditor from '@/components/client-profile/ClientProfileEditor.vue'
-import XaiClientProfileEditor from '@/components/client-profile/XaiClientProfileEditor.vue'
-import { PROVIDER_DISPLAY_NAMES } from '@/utils/providers'
+import ProviderRequestProfilesEditor from '@/components/client-profile/ProviderRequestProfilesEditor.vue'
 
 const props = defineProps<{
   groups: AccountGroup[]
@@ -33,11 +24,6 @@ const open = defineModel<boolean>({ default: false })
 const createdOpen = defineModel<boolean>('createdOpen', { default: false })
 const form = defineModel<ApiKeyFormValue>('form', { required: true })
 const title = computed(() => props.editing ? '编辑密钥' : '创建 API Key')
-const profileProvider = shallowRef('openai')
-const profileProviderOptions = [
-  { label: PROVIDER_DISPLAY_NAMES.openai, value: 'openai', icon: Openai },
-  { label: PROVIDER_DISPLAY_NAMES.xai, value: 'xai', icon: Xai },
-]
 </script>
 
 <template>
@@ -97,44 +83,13 @@ const profileProviderOptions = [
       </BaseFormItem>
 
       <BaseFormItem label="上游身份">
-        <ClientProfileEditor
+        <ProviderRequestProfilesEditor
           v-if="open"
-          v-show="profileProvider === 'openai'"
-          v-model="form.openaiClientProfileOverride"
+          v-model="form.providerRequestProfileOverrides"
           allow-inherit
-          :active="profileProvider === 'openai'"
+          :active="open"
           :disabled="saving"
-        >
-          <template #source-extra>
-            <BaseSegmented
-              v-model="profileProvider"
-              label="上游身份平台"
-              class="w-20 shrink-0"
-              display="icon"
-              :options="profileProviderOptions"
-              :disabled="saving"
-            />
-          </template>
-        </ClientProfileEditor>
-        <XaiClientProfileEditor
-          v-if="open"
-          v-show="profileProvider === 'xai'"
-          v-model="form.xaiClientProfileOverride"
-          allow-inherit
-          :active="profileProvider === 'xai'"
-          :disabled="saving"
-        >
-          <template #source-extra>
-            <BaseSegmented
-              v-model="profileProvider"
-              label="上游身份平台"
-              class="w-20 shrink-0"
-              display="icon"
-              :options="profileProviderOptions"
-              :disabled="saving"
-            />
-          </template>
-        </XaiClientProfileEditor>
+        />
       </BaseFormItem>
 
       <div class="grid gap-6 sm:grid-cols-2">

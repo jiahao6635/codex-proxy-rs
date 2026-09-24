@@ -1,12 +1,8 @@
 <script setup lang="ts">
 import type { ClientProfilePreset, ClientProfilePreview, ClientProfileSelection } from '@/api/modules/client-profiles'
+import { BaseButton, BaseFormItem, BaseInput, BaseSegmented, BaseSelect } from '@codex-proxy/ui'
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { getClientProfileOptions, previewClientProfile } from '@/api/modules/client-profiles'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
 import { errorMessage } from '@/utils/async'
 import ClientProfilePreviewPanel from './ClientProfilePreviewPanel.vue'
 

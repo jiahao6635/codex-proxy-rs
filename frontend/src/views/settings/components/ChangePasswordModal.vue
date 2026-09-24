@@ -1,12 +1,8 @@
 <script setup lang="ts">
+import { BaseButton, BaseInput, BaseModal, BaseFormItem as FormItem, toast } from '@codex-proxy/ui'
 import { computed, reactive, shallowRef, useId, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { changeAdminPassword } from '@/api'
-import BaseButton from '@/components/base/BaseButton.vue'
-import FormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useAuthStore } from '@/stores/modules/auth'
 

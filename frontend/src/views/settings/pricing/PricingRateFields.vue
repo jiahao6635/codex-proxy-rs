@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import type { TokenPrices } from '@/api'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
+import { BaseFormItem, BaseInput } from '@codex-proxy/ui'
 import { effectivePrice, priceFields, validPrice } from './model'
 
 const props = defineProps<{

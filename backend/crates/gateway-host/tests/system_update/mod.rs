@@ -1,16 +1,25 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use filetime::FileTime;
 use flate2::{Compression, write::GzEncoder};
 use futures::StreamExt as _;
-use gateway_admin::model::system::{
-    SystemOperationAccepted, SystemOperationKind, SystemOperationStatus, SystemUpdateEventLevel,
-    SystemUpdateStatus,
+use gateway_admin::model::{
+    Revision,
+    system::{
+        SystemOperationAccepted, SystemOperationKind, SystemOperationStatus,
+        SystemUpdateEventLevel, SystemUpdateStatus,
+    },
 };
-use gateway_admin::ports::system::{SystemOperationErrorKind, SystemOperations};
+use gateway_admin::ports::system::{
+    SystemOperationError, SystemOperationErrorKind, SystemOperations, SystemUpdateCandidate,
+    SystemUpdatePreflight,
+};
 use gateway_core::lifecycle::CancellationToken;
 use gateway_host::system_update::{
     ProcessSystemOperations, SystemUpdateConfig, validate_download_url,
@@ -22,6 +31,118 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TARGET_VERSION: &str = "1.9.9";
 const CROSS_MAJOR_VERSION: &str = "2.0.0";
+
+struct AllowingUpdatePreflight;
+
+#[async_trait::async_trait]
+impl SystemUpdatePreflight for AllowingUpdatePreflight {
+    async fn validate(&self, _: SystemUpdateCandidate) -> Result<Revision, SystemOperationError> {
+        Revision::new(1).map_err(|_| {
+            SystemOperationError::new(SystemOperationErrorKind::Internal, "invalid test revision")
+        })
+    }
+
+    async fn confirm_revision(&self, _: Revision) -> Result<(), SystemOperationError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+trait TestSystemUpdate {
+    async fn perform_test_update(
+        &self,
+        target: Option<String>,
+    ) -> Result<SystemOperationAccepted, SystemOperationError>;
+}
+
+#[async_trait::async_trait]
+impl TestSystemUpdate for ProcessSystemOperations {
+    async fn perform_test_update(
+        &self,
+        target: Option<String>,
+    ) -> Result<SystemOperationAccepted, SystemOperationError> {
+        SystemOperations::perform_update(self, target, Arc::new(AllowingUpdatePreflight)).await
+    }
+}
+
+struct ChangingRevisionPreflight {
+    confirmations: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SystemUpdatePreflight for ChangingRevisionPreflight {
+    async fn validate(
+        &self,
+        candidate: SystemUpdateCandidate,
+    ) -> Result<Revision, SystemOperationError> {
+        assert_eq!(candidate.target_version, TARGET_VERSION);
+        assert_eq!(candidate.release_manifest.as_ref(), b"new-manifest");
+        Ok(Revision::new(7).expect("revision"))
+    }
+
+    async fn confirm_revision(&self, _: Revision) -> Result<(), SystemOperationError> {
+        if self.confirmations.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(())
+        } else {
+            Err(SystemOperationError::new(
+                SystemOperationErrorKind::Conflict,
+                "fixture revision changed",
+            ))
+        }
+    }
+}
+
+struct ChangingRollbackRevisionPreflight {
+    confirmations: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SystemUpdatePreflight for ChangingRollbackRevisionPreflight {
+    async fn validate(
+        &self,
+        candidate: SystemUpdateCandidate,
+    ) -> Result<Revision, SystemOperationError> {
+        assert_eq!(candidate.target_version, "1.0.0");
+        assert_eq!(candidate.release_manifest.as_ref(), b"old-manifest");
+        Ok(Revision::new(11).expect("revision"))
+    }
+
+    async fn confirm_revision(&self, _: Revision) -> Result<(), SystemOperationError> {
+        if self.confirmations.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(())
+        } else {
+            Err(SystemOperationError::new(
+                SystemOperationErrorKind::Conflict,
+                "fixture revision changed",
+            ))
+        }
+    }
+}
+
+struct BlockingRollbackPreflight {
+    confirmations: AtomicUsize,
+    reached_after_swap: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl SystemUpdatePreflight for BlockingRollbackPreflight {
+    async fn validate(
+        &self,
+        candidate: SystemUpdateCandidate,
+    ) -> Result<Revision, SystemOperationError> {
+        assert_eq!(candidate.target_version, "1.0.0");
+        assert_eq!(candidate.release_manifest.as_ref(), b"old-manifest");
+        Ok(Revision::new(13).expect("revision"))
+    }
+
+    async fn confirm_revision(&self, _: Revision) -> Result<(), SystemOperationError> {
+        if self.confirmations.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+        self.reached_after_swap.notify_one();
+        std::future::pending().await
+    }
+}
 
 #[tokio::test]
 async fn restart_should_not_shutdown_when_replacement_spawn_fails() {
@@ -106,7 +227,7 @@ async fn restart_should_conflict_while_another_system_operation_is_running() {
         let service = Arc::clone(&service);
         async move {
             service
-                .perform_update(Some(TARGET_VERSION.to_owned()))
+                .perform_test_update(Some(TARGET_VERSION.to_owned()))
                 .await
         }
     });
@@ -142,14 +263,35 @@ async fn rollback_should_restore_binary_web_and_version_state() {
         )
         .await;
     let service = fixture.service(&server);
+    let updated = complete_update(&service, TARGET_VERSION).await;
     assert_eq!(
-        complete_update(&service, TARGET_VERSION)
-            .await
-            .operation
-            .status,
-        SystemOperationStatus::Succeeded
+        updated.operation.status,
+        SystemOperationStatus::Succeeded,
+        "{updated:?}"
     );
-    service.rollback().await.expect("rollback");
+    assert_eq!(
+        fs::read(fixture.official().join("plugin-release-manifest.json")).expect("manifest"),
+        b"new-manifest"
+    );
+    assert!(fixture.official().join("new-plugin.tar.gz").is_file());
+    assert!(!fixture.official().join("old-plugin.tar.gz").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        assert_eq!(
+            fs::metadata(fixture.official())
+                .expect("official directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+    }
+    service
+        .rollback(Arc::new(AllowingUpdatePreflight))
+        .await
+        .expect("rollback");
 
     assert_eq!(
         fs::read(fixture.executable()).expect("binary"),
@@ -160,6 +302,15 @@ async fn rollback_should_restore_binary_web_and_version_state() {
         b"old-web"
     );
     assert_eq!(
+        fs::read(fixture.official().join("plugin-release-manifest.json")).expect("manifest"),
+        b"old-manifest"
+    );
+    assert_eq!(
+        fs::read(fixture.official().join("old-plugin.tar.gz")).expect("old plugin"),
+        b"old-plugin"
+    );
+    assert!(!fixture.official().join("new-plugin.tar.gz").exists());
+    assert_eq!(
         service
             .update_status()
             .await
@@ -167,6 +318,175 @@ async fn rollback_should_restore_binary_web_and_version_state() {
             .operation
             .status,
         SystemOperationStatus::Succeeded
+    );
+    assert_eq!(
+        complete_update(&service, TARGET_VERSION)
+            .await
+            .operation
+            .status,
+        SystemOperationStatus::Succeeded,
+        "第二次更新必须能清理只读的官方目录备份"
+    );
+    assert_eq!(
+        fs::read(fixture.official().join("plugin-release-manifest.json")).expect("manifest"),
+        b"new-manifest"
+    );
+}
+
+#[tokio::test]
+async fn update_should_restore_all_files_when_plugin_revision_changes_during_swap() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    fixture
+        .mount_release(
+            &server,
+            TARGET_VERSION,
+            ArchiveKind::Safe,
+            ChecksumKind::Valid,
+        )
+        .await;
+    let service = fixture.service(&server);
+    SystemOperations::perform_update(
+        &service,
+        Some(TARGET_VERSION.to_owned()),
+        Arc::new(ChangingRevisionPreflight {
+            confirmations: AtomicUsize::new(0),
+        }),
+    )
+    .await
+    .expect("update accepted");
+
+    let status = wait_for_update(&service).await;
+    assert_eq!(status.operation.status, SystemOperationStatus::Failed);
+    assert_eq!(
+        fs::read(fixture.executable()).expect("binary"),
+        b"old-binary"
+    );
+    assert_eq!(
+        fs::read(fixture.web().join("index.html")).expect("web"),
+        b"old-web"
+    );
+    assert_eq!(
+        fs::read(fixture.official().join("plugin-release-manifest.json")).expect("manifest"),
+        b"old-manifest"
+    );
+    assert!(fixture.official().join("old-plugin.tar.gz").is_file());
+    assert!(!fixture.official().join("new-plugin.tar.gz").exists());
+}
+
+#[tokio::test]
+async fn rollback_should_restore_current_release_when_plugin_revision_changes_during_swap() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    fixture
+        .mount_release(
+            &server,
+            TARGET_VERSION,
+            ArchiveKind::Safe,
+            ChecksumKind::Valid,
+        )
+        .await;
+    let service = fixture.service(&server);
+    assert_eq!(
+        complete_update(&service, TARGET_VERSION)
+            .await
+            .operation
+            .status,
+        SystemOperationStatus::Succeeded
+    );
+
+    let error = service
+        .rollback(Arc::new(ChangingRollbackRevisionPreflight {
+            confirmations: AtomicUsize::new(0),
+        }))
+        .await
+        .expect_err("revision changed after rollback swap");
+
+    assert_eq!(error.kind(), SystemOperationErrorKind::Conflict);
+    assert_eq!(
+        fs::read(fixture.executable()).expect("binary"),
+        b"new-binary"
+    );
+    assert_eq!(
+        fs::read(fixture.web().join("index.html")).expect("web"),
+        b"new-web"
+    );
+    assert_eq!(
+        fs::read(fixture.official().join("plugin-release-manifest.json")).expect("manifest"),
+        b"new-manifest"
+    );
+    assert_eq!(
+        service
+            .update_status()
+            .await
+            .expect("status")
+            .operation
+            .status,
+        SystemOperationStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn cancelled_rollback_should_restore_current_release_after_the_swap() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    fixture
+        .mount_release(
+            &server,
+            TARGET_VERSION,
+            ArchiveKind::Safe,
+            ChecksumKind::Valid,
+        )
+        .await;
+    let service = fixture.service(&server);
+    assert_eq!(
+        complete_update(&service, TARGET_VERSION)
+            .await
+            .operation
+            .status,
+        SystemOperationStatus::Succeeded
+    );
+    let reached_after_swap = Arc::new(tokio::sync::Notify::new());
+    let task_service = service.clone();
+    let task_reached = Arc::clone(&reached_after_swap);
+    let task = tokio::spawn(async move {
+        task_service
+            .rollback(Arc::new(BlockingRollbackPreflight {
+                confirmations: AtomicUsize::new(0),
+                reached_after_swap: task_reached,
+            }))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), reached_after_swap.notified())
+        .await
+        .expect("post-swap confirmation reached");
+    task.abort();
+    assert!(
+        task.await
+            .expect_err("rollback task cancelled")
+            .is_cancelled()
+    );
+
+    assert_eq!(
+        fs::read(fixture.executable()).expect("binary"),
+        b"new-binary"
+    );
+    assert_eq!(
+        fs::read(fixture.web().join("index.html")).expect("web"),
+        b"new-web"
+    );
+    assert_eq!(
+        fs::read(fixture.official().join("plugin-release-manifest.json")).expect("manifest"),
+        b"new-manifest"
+    );
+    assert_eq!(
+        service
+            .update_status()
+            .await
+            .expect("recovered status")
+            .operation
+            .status,
+        SystemOperationStatus::Failed
     );
 }
 
@@ -413,7 +733,7 @@ async fn update_should_reject_cross_channel_targets_before_fetching_or_replacing
         let service = ProcessSystemOperations::new(CancellationToken::new(), config);
 
         let error = service
-            .perform_update(Some(target.to_owned()))
+            .perform_test_update(Some(target.to_owned()))
             .await
             .expect_err("cross-channel update");
         assert_eq!(error.kind(), SystemOperationErrorKind::Conflict);
@@ -529,7 +849,7 @@ async fn update_detail_should_keep_current_release_notes_without_allowing_reinst
         assert!(!service.version().await.expect("version").has_update);
 
         let error = service
-            .perform_update(Some(current.to_owned()))
+            .perform_test_update(Some(current.to_owned()))
             .await
             .expect_err("current release must not be installed again");
         assert_eq!(error.kind(), SystemOperationErrorKind::Conflict);
@@ -809,7 +1129,7 @@ async fn update_should_reject_cross_major_target_before_fetching_release() {
     );
 
     let error = service
-        .perform_update(Some(CROSS_MAJOR_VERSION.to_owned()))
+        .perform_test_update(Some(CROSS_MAJOR_VERSION.to_owned()))
         .await
         .expect_err("cross-major target must be rejected");
     assert_eq!(error.kind(), SystemOperationErrorKind::Conflict);
@@ -827,7 +1147,7 @@ async fn update_events_should_close_after_terminal_update_log() {
     let service = ProcessSystemOperations::new(CancellationToken::new(), config);
     let mut events = service.update_events();
     let _ = service
-        .perform_update(Some(TARGET_VERSION.to_owned()))
+        .perform_test_update(Some(TARGET_VERSION.to_owned()))
         .await;
     let first = events.next().await.expect("terminal event");
 
@@ -843,7 +1163,7 @@ async fn update_events_should_open_authenticated_sse_stream() {
     let service = ProcessSystemOperations::new(CancellationToken::new(), config);
     let mut stream = service.update_events();
     let _ = service
-        .perform_update(Some(TARGET_VERSION.to_owned()))
+        .perform_test_update(Some(TARGET_VERSION.to_owned()))
         .await;
 
     assert!(stream.next().await.is_some());
@@ -878,8 +1198,24 @@ async fn update_events_should_preserve_complete_release_stage_sequence() {
     assert_eq!(
         steps,
         [
-            "release", "prepare", "asset", "asset", "verify", "prepare", "download", "download",
-            "download", "checksum", "checksum", "extract", "extract", "replace", "replace", "done",
+            "release",
+            "prepare",
+            "asset",
+            "asset",
+            "verify",
+            "prepare",
+            "download",
+            "download",
+            "download",
+            "checksum",
+            "checksum",
+            "extract",
+            "extract",
+            "preflight",
+            "preflight",
+            "replace",
+            "replace",
+            "done",
         ]
     );
 }
@@ -1029,6 +1365,29 @@ async fn update_should_reject_release_archive_with_unsafe_path() {
 }
 
 #[tokio::test]
+async fn update_should_require_a_flat_regular_official_plugin_bundle() {
+    for archive_kind in [
+        ArchiveKind::MissingOfficialManifest,
+        ArchiveKind::NestedOfficialAsset,
+        ArchiveKind::OfficialSymlink,
+    ] {
+        let server = MockServer::start().await;
+        let fixture = Fixture::new();
+        fixture
+            .mount_release(&server, TARGET_VERSION, archive_kind, ChecksumKind::Valid)
+            .await;
+
+        assert_eq!(
+            complete_update(&fixture.service(&server), TARGET_VERSION)
+                .await
+                .operation
+                .status,
+            SystemOperationStatus::Failed,
+        );
+    }
+}
+
+#[tokio::test]
 async fn update_should_reject_untrusted_github_api_base() {
     let fixture = Fixture::new();
     let service = ProcessSystemOperations::new(
@@ -1036,7 +1395,7 @@ async fn update_should_reject_untrusted_github_api_base() {
         fixture.config("https://api.github.example/repos"),
     );
     let error = service
-        .perform_update(Some(TARGET_VERSION.to_owned()))
+        .perform_test_update(Some(TARGET_VERSION.to_owned()))
         .await
         .expect_err("untrusted API rejected");
 
@@ -1127,7 +1486,10 @@ async fn update_and_rollback_should_use_the_default_api_asset_directory() {
         b"new-web"
     );
 
-    service.rollback().await.expect("rollback");
+    service
+        .rollback(Arc::new(AllowingUpdatePreflight))
+        .await
+        .expect("rollback");
     assert_eq!(
         fs::read(fixture.executable()).expect("binary"),
         b"old-binary"
@@ -1198,6 +1560,12 @@ async fn update_should_restore_web_assets_when_binary_backup_fails() {
         fs::read(fixture.web().join("index.html")).expect("web"),
         b"old-web"
     );
+    assert_eq!(
+        fs::read(fixture.official().join("plugin-release-manifest.json")).expect("manifest"),
+        b"old-manifest"
+    );
+    assert!(fixture.official().join("old-plugin.tar.gz").is_file());
+    assert!(!fixture.official().join("new-plugin.tar.gz").exists());
 }
 
 #[tokio::test]
@@ -1273,7 +1641,7 @@ async fn accepted_update_should_survive_a_lost_http_response() {
             let accepted = Arc::clone(&handler_accepted);
             async move {
                 service
-                    .perform_update(Some(TARGET_VERSION.to_owned()))
+                    .perform_test_update(Some(TARGET_VERSION.to_owned()))
                     .await
                     .expect("accepted");
                 accepted.notify_one();
@@ -1311,7 +1679,7 @@ async fn accepted_update_should_survive_a_lost_http_response() {
     );
     assert_eq!(
         service
-            .perform_update(Some(TARGET_VERSION.to_owned()))
+            .perform_test_update(Some(TARGET_VERSION.to_owned()))
             .await
             .expect_err("duplicate update")
             .kind(),
@@ -1319,7 +1687,7 @@ async fn accepted_update_should_survive_a_lost_http_response() {
     );
     assert_eq!(
         service
-            .rollback()
+            .rollback(Arc::new(AllowingUpdatePreflight))
             .await
             .expect_err("rollback during update")
             .kind(),
@@ -1335,7 +1703,7 @@ async fn accepted_update_should_survive_a_lost_http_response() {
     assert!(!fixture.lock().exists());
     assert_eq!(
         service
-            .perform_update(Some(TARGET_VERSION.to_owned()))
+            .perform_test_update(Some(TARGET_VERSION.to_owned()))
             .await
             .expect_err("restart required")
             .kind(),
@@ -1373,7 +1741,7 @@ async fn host_shutdown_should_finish_an_accepted_update_and_release_its_lock() {
     );
     // 在后台任务第一次 poll 之前触发关闭，覆盖受理后的生命周期交接。
     service
-        .perform_update(Some(TARGET_VERSION.to_owned()))
+        .perform_test_update(Some(TARGET_VERSION.to_owned()))
         .await
         .expect("accepted");
     cancellation.cancel();
@@ -1396,7 +1764,7 @@ fn dropped_update_task_should_persist_failure_even_before_its_first_poll() {
         .build()
         .expect("runtime");
     runtime
-        .block_on(service.perform_update(Some(TARGET_VERSION.to_owned())))
+        .block_on(service.perform_test_update(Some(TARGET_VERSION.to_owned())))
         .expect("accepted");
     drop(runtime);
     let status: serde_json::Value =
@@ -1443,7 +1811,7 @@ async fn terminal_event_should_only_be_visible_after_status_is_persisted() {
     let service = fixture.service(&upstream);
     let mut events = service.update_events();
     let SystemOperationAccepted::Update { operation_id, .. } = service
-        .perform_update(Some(TARGET_VERSION.to_owned()))
+        .perform_test_update(Some(TARGET_VERSION.to_owned()))
         .await
         .expect("accepted")
     else {
@@ -1482,7 +1850,7 @@ async fn wait_for_update(service: &ProcessSystemOperations) -> SystemUpdateStatu
 
 async fn complete_update(service: &ProcessSystemOperations, target: &str) -> SystemUpdateStatus {
     let SystemOperationAccepted::Update { operation_id, .. } = service
-        .perform_update(Some(target.to_owned()))
+        .perform_test_update(Some(target.to_owned()))
         .await
         .expect("update accepted")
     else {
@@ -1507,6 +1875,13 @@ impl Fixture {
         fixture.write_executable("old-binary");
         fs::create_dir_all(fixture.web()).expect("web dir");
         fs::write(fixture.web().join("index.html"), "old-web").expect("web");
+        fs::create_dir_all(fixture.official()).expect("official plugin dir");
+        fs::write(
+            fixture.official().join("plugin-release-manifest.json"),
+            "old-manifest",
+        )
+        .expect("manifest");
+        fs::write(fixture.official().join("old-plugin.tar.gz"), "old-plugin").expect("plugin");
         fixture
     }
 
@@ -1516,6 +1891,10 @@ impl Fixture {
 
     fn web(&self) -> PathBuf {
         self.root.path().join("web/dist")
+    }
+
+    fn official(&self) -> PathBuf {
+        self.root.path().join("plugins/official")
     }
 
     fn state(&self) -> PathBuf {
@@ -1648,6 +2027,9 @@ impl Fixture {
 enum ArchiveKind {
     Safe,
     UnsafePath,
+    MissingOfficialManifest,
+    NestedOfficialAsset,
+    OfficialSymlink,
 }
 
 #[derive(Clone, Copy)]
@@ -1662,11 +2044,51 @@ fn release_archive(kind: ArchiveKind) -> Vec<u8> {
     let mut tar = Builder::new(encoder);
     append_file(&mut tar, "codex-proxy-rs", b"new-binary", false);
     append_file(&mut tar, "web/dist/index.html", b"new-web", false);
+    if !matches!(kind, ArchiveKind::MissingOfficialManifest) {
+        append_file(
+            &mut tar,
+            "plugins/official/plugin-release-manifest.json",
+            b"new-manifest",
+            false,
+        );
+    }
+    append_file(
+        &mut tar,
+        "plugins/official/new-plugin.tar.gz",
+        b"new-plugin",
+        false,
+    );
     if matches!(kind, ArchiveKind::UnsafePath) {
         append_file(&mut tar, "safe", b"escape", true);
     }
+    if matches!(kind, ArchiveKind::NestedOfficialAsset) {
+        append_file(
+            &mut tar,
+            "plugins/official/nested/plugin.tar.gz",
+            b"nested",
+            false,
+        );
+    }
+    if matches!(kind, ArchiveKind::OfficialSymlink) {
+        append_symlink(
+            &mut tar,
+            "plugins/official/linked.tar.gz",
+            "../outside.tar.gz",
+        );
+    }
     let encoder = tar.into_inner().expect("tar");
     encoder.finish().expect("gzip")
+}
+
+fn append_symlink(tar: &mut Builder<GzEncoder<Vec<u8>>>, name: &str, target: &str) {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::Symlink);
+    header.set_mode(0o777);
+    header.set_size(0);
+    header.set_path(name).expect("path");
+    header.set_link_name(target).expect("link target");
+    header.set_cksum();
+    tar.append(&header, std::io::empty()).expect("append link");
 }
 
 fn append_file(tar: &mut Builder<GzEncoder<Vec<u8>>>, name: &str, data: &[u8], unsafe_path: bool) {

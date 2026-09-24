@@ -1,10 +1,7 @@
 <script setup lang="ts">
-import { Gauge, Timer } from '@lucide/vue'
+import { BaseCard, BaseForm, BaseFormItem, BaseInput } from '@codex-proxy/ui'
 
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseForm from '@/components/base/BaseForm/index.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
+import { Gauge, Timer } from '@lucide/vue'
 
 const maxConcurrentPerAccount = defineModel<string>('maxConcurrentPerAccount', { required: true })
 const requestIntervalMs = defineModel<string>('requestIntervalMs', { required: true })

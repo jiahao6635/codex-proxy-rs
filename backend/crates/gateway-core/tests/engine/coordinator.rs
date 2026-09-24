@@ -294,6 +294,8 @@ enum Script {
 
 struct ScriptedProvider {
     profile_generation: AtomicUsize,
+    default_profile_calls: AtomicUsize,
+    default_profile: Mutex<Option<gateway_core::account::OpaqueProviderData>>,
     scripts: Mutex<VecDeque<Script>>,
     contexts: Mutex<Vec<AttemptContext>>,
     operations: Mutex<Vec<Operation>>,
@@ -312,6 +314,8 @@ impl ScriptedProvider {
     fn new(scripts: Vec<Script>) -> Self {
         Self {
             profile_generation: AtomicUsize::new(1),
+            default_profile_calls: AtomicUsize::new(0),
+            default_profile: Mutex::new(None),
             scripts: Mutex::new(scripts.into()),
             contexts: Mutex::new(Vec::new()),
             operations: Mutex::new(Vec::new()),
@@ -334,6 +338,13 @@ impl Provider for ScriptedProvider {
         Ok(gateway_core::account::OpaqueProviderData::new(fields))
     }
 
+    fn default_request_profile(
+        &self,
+    ) -> Result<Option<gateway_core::account::OpaqueProviderData>, ProviderError> {
+        self.default_profile_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.default_profile.lock().unwrap().clone())
+    }
+
     fn name(&self) -> &'static str {
         "openai"
     }
@@ -349,7 +360,7 @@ impl Provider for ScriptedProvider {
     }
 
     async fn execute(
-        &self,
+        self: Arc<Self>,
         request: ProviderRequest,
         context: AttemptContext,
     ) -> Result<ProviderStream, ProviderError> {
@@ -4678,5 +4689,49 @@ fn first_resolved_profile_is_frozen_across_account_retries() {
     assert_eq!(contexts.len(), 2);
     let first = contexts[0].request_profile().unwrap();
     assert_eq!(first.expose_to_provider()["generation"], 1);
+    assert_eq!(contexts[1].request_profile(), Some(first));
+}
+
+#[test]
+fn provider_default_profile_is_applied_once_and_frozen_across_account_retries() {
+    use gateway_core::account::OpaqueProviderData;
+    let operation = generate_operation();
+    let route_plan = plan(&operation);
+    let (coordinator, _, provider) = coordinator(vec![
+        Script::Stream {
+            account_id: "acct_first",
+            items: vec![Err(ProviderError::new(
+                ProviderErrorKind::RateLimited,
+                UpstreamSendState::Sent,
+            )
+            .with_status(429)
+            .with_replay_safe())],
+        },
+        Script::Stream {
+            account_id: "acct_second",
+            items: complete_stream(None),
+        },
+    ]);
+    *provider.default_profile.lock().unwrap() = Some(OpaqueProviderData::new(
+        json!({"selection":"plugin-default"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    ));
+    let mut session = block_on(coordinator.start(
+        model_request(&operation, SystemTime::now() + Duration::from_secs(30)),
+        operation,
+        route_plan,
+        None,
+        None,
+        CancellationToken::new(),
+    ))
+    .unwrap();
+    block_on(session.collect_uncommitted()).unwrap();
+    let contexts = provider.contexts.lock().unwrap();
+    assert_eq!(provider.default_profile_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(contexts.len(), 2);
+    let first = contexts[0].request_profile().unwrap();
+    assert_eq!(first.expose_to_provider()["selection"], "plugin-default");
     assert_eq!(contexts[1].request_profile(), Some(first));
 }

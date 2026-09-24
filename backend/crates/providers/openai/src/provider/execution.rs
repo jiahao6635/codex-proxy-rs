@@ -6,7 +6,7 @@ use super::*;
 
 impl CodexProvider {
     pub(super) async fn execute_image(
-        &self,
+        self: Arc<Self>,
         image: &ImageRequest,
         candidate: &ProviderCandidate,
         context: AttemptContext,
@@ -38,6 +38,7 @@ impl CodexProvider {
         self.execute_raw_json_endpoint(
             context,
             RawJsonEndpointRequest {
+                operation: Operation::GenerateImage(image.clone()),
                 response_origin,
                 endpoint_path,
                 body: image.payload().body().clone(),
@@ -50,7 +51,7 @@ impl CodexProvider {
     }
 
     pub(super) async fn execute_search(
-        &self,
+        self: Arc<Self>,
         search: &StandaloneSearchRequest,
         candidate: &ProviderCandidate,
         context: AttemptContext,
@@ -72,10 +73,12 @@ impl CodexProvider {
             context.client_api_key_ref(),
             "id",
         );
+        let response_origin = self.search_url.clone();
         self.execute_raw_json_endpoint(
             context,
             RawJsonEndpointRequest {
-                response_origin: self.search_url.clone(),
+                operation: Operation::Search(search.clone()),
+                response_origin,
                 endpoint_path: CODEX_ALPHA_SEARCH_PATH,
                 body: search.payload().body().clone(),
                 image_turn_id: None,
@@ -87,7 +90,7 @@ impl CodexProvider {
     }
 
     async fn execute_raw_json_endpoint(
-        &self,
+        self: Arc<Self>,
         context: AttemptContext,
         request: RawJsonEndpointRequest,
     ) -> Result<ProviderStream, ProviderError> {
@@ -104,6 +107,91 @@ impl CodexProvider {
         let account_selection_wait_ms =
             u64::try_from(selection_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let lease = Arc::new(lease);
+        let operation = request.operation.clone();
+        let provider_kind = ProviderKind::new(PROVIDER_NAME)
+            .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
+        let account_id = lease.account_id().clone();
+        let provider = Arc::clone(&self);
+        let terminal_context = context.clone();
+        context
+            .execute_middleware(
+                operation,
+                provider_kind,
+                None,
+                account_id,
+                Box::new(move |operation, middleware_headers| {
+                    Box::pin(async move {
+                        provider
+                            .execute_selected_raw_json_endpoint(
+                                terminal_context,
+                                operation,
+                                middleware_headers,
+                                request,
+                                lease,
+                                account_selection_wait_ms,
+                            )
+                            .await
+                    })
+                }),
+            )
+            .await
+    }
+
+    async fn execute_selected_raw_json_endpoint(
+        self: Arc<Self>,
+        context: AttemptContext,
+        operation: Operation,
+        middleware_headers: Vec<MiddlewareHeader>,
+        mut request: RawJsonEndpointRequest,
+        lease: Arc<CodexCredentialLease>,
+        account_selection_wait_ms: u64,
+    ) -> Result<ProviderStream, ProviderError> {
+        match operation {
+            Operation::GenerateImage(image) => {
+                let Operation::GenerateImage(original) = &request.operation else {
+                    return Err(provider_error(
+                        ProviderErrorKind::InvalidRequest,
+                        UpstreamSendState::NotSent,
+                    ));
+                };
+                if image.kind() != original.kind() || image.payload().protocol() != PROVIDER_NAME {
+                    return Err(provider_error(
+                        ProviderErrorKind::InvalidRequest,
+                        UpstreamSendState::NotSent,
+                    ));
+                }
+                request.body = image.payload().body().clone();
+                request.image_turn_id = image
+                    .payload()
+                    .context()
+                    .get("image_turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            Operation::Search(search) => {
+                if !matches!(&request.operation, Operation::Search(_))
+                    || search.payload().protocol() != PROVIDER_NAME
+                {
+                    return Err(provider_error(
+                        ProviderErrorKind::InvalidRequest,
+                        UpstreamSendState::NotSent,
+                    ));
+                }
+                request.body = search.payload().body().clone();
+                request.turn_metadata = search
+                    .payload()
+                    .context()
+                    .get("turn_metadata")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            _ => {
+                return Err(provider_error(
+                    ProviderErrorKind::InvalidRequest,
+                    UpstreamSendState::NotSent,
+                ));
+            }
+        }
         let allows_account_state_mutation = lease.allows_account_state_mutation();
         let provider_kind = ProviderKind::new(PROVIDER_NAME)
             .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
@@ -130,7 +218,8 @@ impl CodexProvider {
                 .map_err(|_| {
                     provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
                 })?
-                .with_authentication(lease.authentication()),
+                .with_authentication(lease.authentication())
+                .with_middleware_headers(middleware_headers),
             response_origin: request.response_origin,
             endpoint_path: request.endpoint_path,
             body: request.body,
@@ -156,6 +245,7 @@ impl CodexProvider {
 }
 
 struct RawJsonEndpointRequest {
+    operation: Operation,
     response_origin: Url,
     endpoint_path: &'static str,
     body: Bytes,

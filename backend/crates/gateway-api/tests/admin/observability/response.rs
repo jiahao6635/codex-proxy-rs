@@ -10,6 +10,67 @@ use gateway_api::admin::observability::{
 };
 use serde_json::json;
 
+#[tokio::test]
+async fn usage_provider_filters_require_admin_and_validate_the_range() {
+    use crate::admin::{AdminTestFixture, AdminTestState};
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use gateway_api::admin::observability;
+    use tower::ServiceExt as _;
+
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let app = observability::router::<AdminTestState>().with_state(fixture.state());
+    let anonymous = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/usage/providers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    for query in [
+        "startTime=invalid",
+        "startTime=2026-02-02T00:00:00Z&endTime=2026-02-01T00:00:00Z",
+        "startTime=2024-01-01T00:00:00Z&endTime=2026-01-01T00:00:00Z",
+        "provider=openai",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/admin/usage/providers?{query}"))
+                    .header(header::COOKIE, "cpr_session=valid-session")
+                    .header("x-request-id", "req_provider_filter_invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/usage/providers?startTime=2026-02-01T00:00:00Z&endTime=2026-02-02T00:00:00Z")
+                .header(header::COOKIE, "cpr_session=valid-session")
+                .header("x-request-id", "req_provider_filter_valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["data"], json!(["retired-provider"]));
+}
+
 #[test]
 fn usage_page_should_keep_terminal_camel_case_shape() {
     let data = PageData {

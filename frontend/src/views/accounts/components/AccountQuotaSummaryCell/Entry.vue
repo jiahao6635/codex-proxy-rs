@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import type { AccountQuotaWindow } from '../../constants'
 
-import { computed } from 'vue'
+import { BasePopover } from '@codex-proxy/ui'
 
-import BasePopover from '@/components/base/BasePopover.vue'
+import { computed } from 'vue'
 import { useUiClock } from '@/composables/useUiClock'
 import AccountRequestTimeline from '../AccountUsageWindow/AccountRequestTimeline.vue'
 import AccountUsageWindow from '../AccountUsageWindow/index.vue'

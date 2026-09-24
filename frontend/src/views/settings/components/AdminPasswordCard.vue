@@ -1,9 +1,7 @@
 <script setup lang="ts">
+import { BaseButton, BaseCard, BaseMotionIcon } from '@codex-proxy/ui'
 import { LockKeyhole } from '@lucide/vue'
 import { shallowRef } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseMotionIcon from '@/components/base/BaseMotionIcon.vue'
 import ChangePasswordModal from './ChangePasswordModal.vue'
 
 const open = shallowRef(false)

@@ -1,10 +1,10 @@
 import type { PricingCatalog, PricingChange, PricingSyncPreview } from '@/api'
+import { toast } from '@codex-proxy/ui'
 import { computed, onMounted, ref, shallowRef, watch } from 'vue'
 import { getPricing, previewPricingSync, syncPricing, updatePricing } from '@/api'
-import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { errorMessage } from '@/utils/async'
-import { pricingRows } from './model'
+import { pricingProviders, pricingRows } from './model'
 
 export function usePricing() {
   const catalog = shallowRef<PricingCatalog>({ defaults: {}, overrides: {}, synced: {}, syncedAt: null })
@@ -19,6 +19,7 @@ export function usePricing() {
   const writeAction = useAsyncAction()
   const previewAction = useAsyncAction()
   const preview = shallowRef<PricingSyncPreview>()
+  const providers = computed(() => pricingProviders(catalog.value))
   const rows = computed(() => pricingRows(catalog.value, provider.value))
   const filtered = computed(() => rows.value.filter(row => row.model.toLowerCase().includes(search.value.trim().toLowerCase())
     && (source.value === 'all' || row.source === source.value)))
@@ -35,6 +36,8 @@ export function usePricing() {
   async function load() {
     await loadAction.run(async () => {
       catalog.value = await getPricing()
+      if (!providers.value.includes(provider.value))
+        provider.value = providers.value[0] ?? ''
       error.value = ''
       page.value = Math.min(page.value, Math.max(1, Math.ceil(filtered.value.length / pageSize.value)))
     }, { onError: (cause) => { error.value = errorMessage(cause, '无法加载价目') } })
@@ -72,5 +75,5 @@ export function usePricing() {
     selected.value = checked ? [...new Set([...selected.value, ...ids])] : selected.value.filter(id => !ids.includes(id))
   }
   onMounted(load)
-  return { catalog, provider, search, source, page, pageSize, selected, error, rows, filtered, visible, pagination, loading: loadAction.loading, saving: writeAction.loading, syncing: previewAction.loading, preview, load, save, startSync, confirmSync, toggle, togglePage }
+  return { catalog, providers, provider, search, source, page, pageSize, selected, error, rows, filtered, visible, pagination, loading: loadAction.loading, saving: writeAction.loading, syncing: previewAction.loading, preview, load, save, startSync, confirmSync, toggle, togglePage }
 }

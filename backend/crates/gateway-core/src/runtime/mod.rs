@@ -1,8 +1,10 @@
 //! 运行时快照的原子发布、健康状态与跨进程版本收敛。
 
+pub mod extensions;
+
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as SyncMutex, RwLock};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -28,6 +30,7 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAXIMUM_BACKOFF: Duration = Duration::from_secs(30);
 const UNUSED_LEASE_TTL: Duration = Duration::from_secs(30);
 const UNUSED_LEASE_RENEWAL: Duration = Duration::from_secs(10);
+const MAXIMUM_DEFERRED_REFRESH_ATTEMPTS: usize = 2;
 
 /// 不泄漏订阅基础设施细节的通知错误。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -100,10 +103,17 @@ impl RuntimeSnapshotHandle {
             .map(|snapshot| snapshot.provider_catalog_generations().clone())
     }
 
+    /// 控制面只读诊断可观察尚未就绪的发布候选；数据面仍必须通过 [`Self::acquire`]。
+    #[must_use]
+    pub fn snapshot_for_diagnostics(&self) -> Option<Arc<RuntimeSnapshot>> {
+        read_unpoisoned(&self.current).clone()
+    }
+
     /// 冻结当前 Arc；后续发布不改变已经开始的请求。
     pub fn acquire(&self) -> Result<Arc<RuntimeSnapshot>, RuntimeSnapshotUnavailable> {
         read_unpoisoned(&self.current)
             .clone()
+            .filter(|snapshot| snapshot.extensions().is_none_or(|set| set.can_serve()))
             .ok_or(RuntimeSnapshotUnavailable)
     }
 }
@@ -115,7 +125,7 @@ impl HealthProbe for RuntimeSnapshotHandle {
 
     fn check(&self) -> BoxFuture<'_, HealthState> {
         Box::pin(async move {
-            if self.revision().is_some() {
+            if self.acquire().is_ok() {
                 HealthState::Healthy
             } else {
                 HealthState::Unhealthy("Runtime snapshot is unavailable".to_owned())
@@ -127,6 +137,93 @@ impl HealthProbe for RuntimeSnapshotHandle {
 /// Admin 提交配置后触发本进程刷新与跨进程通知的对象安全端口。
 pub trait SnapshotControl: Send + Sync {
     fn publish_committed(&self, committed_revision: ConfigRevision) -> BoxFuture<'_, ()>;
+
+    /// 目录发现回调可能发生在快照编译内部；该入口允许实现合并提交并在外层编译后刷新。
+    fn publish_committed_deferred(&self, committed_revision: ConfigRevision) -> BoxFuture<'_, ()> {
+        self.publish_committed(committed_revision)
+    }
+}
+
+#[derive(Default)]
+struct DeferredPublicationState {
+    active: bool,
+    scheduled: bool,
+    pending_revision: Option<ConfigRevision>,
+}
+
+struct ActiveRefreshGuard {
+    deferred: Arc<SyncMutex<DeferredPublicationState>>,
+    committed_revision: Option<ConfigRevision>,
+    armed: bool,
+}
+
+impl ActiveRefreshGuard {
+    fn begin(deferred: Arc<SyncMutex<DeferredPublicationState>>) -> Self {
+        let committed_revision = {
+            let mut state = lock_unpoisoned(&deferred);
+            state.active = true;
+            state.pending_revision.take()
+        };
+        Self {
+            deferred,
+            committed_revision,
+            armed: true,
+        }
+    }
+
+    fn merge(&mut self, revision: ConfigRevision) {
+        self.committed_revision = latest_revision(self.committed_revision, revision);
+    }
+
+    fn finish(&mut self) {
+        lock_unpoisoned(&self.deferred).active = false;
+        self.armed = false;
+    }
+}
+
+impl Drop for ActiveRefreshGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = lock_unpoisoned(&self.deferred);
+            if let Some(revision) = self.committed_revision {
+                state.pending_revision = latest_revision(state.pending_revision, revision);
+            }
+            state.active = false;
+        }
+    }
+}
+
+struct DeferredScheduleGuard {
+    deferred: Arc<SyncMutex<DeferredPublicationState>>,
+    armed: bool,
+}
+
+impl DeferredScheduleGuard {
+    fn new(deferred: Arc<SyncMutex<DeferredPublicationState>>) -> Self {
+        Self {
+            deferred,
+            armed: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        lock_unpoisoned(&self.deferred).scheduled = false;
+        self.armed = false;
+    }
+}
+
+impl Drop for DeferredScheduleGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = lock_unpoisoned(&self.deferred);
+            state.scheduled = false;
+            if state.pending_revision.is_some() {
+                tracing::warn!(
+                    "deferred runtime snapshot publication was cancelled; reconciliation will retry"
+                );
+            }
+        }
+    }
 }
 
 /// 配置提交后的本进程快照发布与跨进程失效通知。
@@ -136,6 +233,7 @@ pub struct RuntimeSnapshotPublisher {
     snapshots: RuntimeSnapshotHandle,
     subscriptions: Arc<dyn SnapshotSubscriptionPort>,
     refresh_lock: Arc<Mutex<()>>,
+    deferred: Arc<SyncMutex<DeferredPublicationState>>,
 }
 
 enum RefreshMode {
@@ -156,6 +254,7 @@ impl RuntimeSnapshotPublisher {
             snapshots,
             subscriptions,
             refresh_lock: Arc::new(Mutex::new(())),
+            deferred: Arc::new(SyncMutex::new(DeferredPublicationState::default())),
         }
     }
 
@@ -171,6 +270,14 @@ impl RuntimeSnapshotPublisher {
         // 所有入口共享从读取事实到发布或暂停的完整临界区；只锁最后的替换会让
         // 旧编译覆盖新授权，或让晚到的失败暂停新快照。请求读取不等待此锁。
         let _refresh = self.refresh_lock.lock().await;
+        self.refresh_locked(mode).await
+    }
+
+    async fn refresh_locked(
+        &self,
+        mode: RefreshMode,
+    ) -> Result<ConfigRevision, RuntimeSnapshotCompileError> {
+        let mut active = ActiveRefreshGuard::begin(Arc::clone(&self.deferred));
         let configuration_changed = if matches!(mode, RefreshMode::Reconcile) {
             let persisted_revision = self
                 .compiler
@@ -185,31 +292,115 @@ impl RuntimeSnapshotPublisher {
                 self.published_revision().map(ConfigRevision::get),
                 persisted_revision.get(),
             );
-            if !changed && !self.provider_catalogs_need_refresh() {
+            if !changed
+                && !self.provider_catalogs_need_refresh()
+                && active.committed_revision.is_none()
+                && self
+                    .snapshots
+                    .acquire()
+                    .is_ok_and(|snapshot| snapshot.extensions().is_none_or(|set| set.is_ready()))
+            {
+                active.finish();
                 return Ok(persisted_revision);
             }
             changed
         } else {
             true
         };
-        let compiled = if matches!(mode, RefreshMode::Committed) {
-            match self.snapshots.acquire() {
-                Ok(previous) => self.compiler.compile_with_cached_catalog(&previous).await,
-                Err(_) => self.compiler.compile().await,
+        for attempt in 0..MAXIMUM_DEFERRED_REFRESH_ATTEMPTS {
+            let compiled = if matches!(mode, RefreshMode::Committed) {
+                match self.snapshots.snapshot_for_diagnostics() {
+                    Some(previous) => self.compiler.compile_with_cached_catalog(&previous).await,
+                    None => self.compiler.compile().await,
+                }
+            } else {
+                self.compiler.compile().await
+            };
+            let snapshot = match compiled {
+                Ok(snapshot) => snapshot,
+                Err(RuntimeSnapshotCompileError::RevisionChanged)
+                    if attempt + 1 < MAXIMUM_DEFERRED_REFRESH_ATTEMPTS =>
+                {
+                    let pending = lock_unpoisoned(&self.deferred).pending_revision.take();
+                    if let Some(pending) = pending {
+                        active.merge(pending);
+                        continue;
+                    }
+                    if configuration_changed {
+                        self.snapshots.suspend();
+                    }
+                    return Err(RuntimeSnapshotCompileError::RevisionChanged);
+                }
+                Err(error) => {
+                    // 仅目录代次变化时保留旧快照，下一周期继续对账；配置缺失、变化
+                    // 或持久 revision 回退均须 fail closed，不按 revision 大小丢弃刷新。
+                    if configuration_changed {
+                        self.snapshots.suspend();
+                    }
+                    return Err(error);
+                }
+            };
+            let revision = snapshot.revision();
+            self.snapshots.publish(snapshot);
+            if let Some(committed_revision) = active.committed_revision.take() {
+                self.notify_committed_revision(committed_revision).await;
             }
-        } else {
-            self.compiler.compile().await
+            loop {
+                let pending = {
+                    let mut deferred = lock_unpoisoned(&self.deferred);
+                    match deferred.pending_revision.take() {
+                        Some(pending) => pending,
+                        None => {
+                            deferred.active = false;
+                            active.armed = false;
+                            return Ok(revision);
+                        }
+                    }
+                };
+                if pending <= revision {
+                    // 编译器自身可能因目录代次变化重读事实，已经包含该提交时
+                    // 只发送通知，不再做一次重复编译。通知期间的新提交仍回到同一单槽。
+                    self.notify_committed_revision(pending).await;
+                    continue;
+                }
+                active.merge(pending);
+                break;
+            }
+        }
+        self.snapshots.suspend();
+        tracing::warn!("deferred runtime snapshot refresh attempt limit reached");
+        Err(RuntimeSnapshotCompileError::RevisionChanged)
+    }
+
+    async fn publish_committed_deferred_inner(&self, committed_revision: ConfigRevision) {
+        let should_refresh = {
+            let mut deferred = lock_unpoisoned(&self.deferred);
+            deferred.pending_revision =
+                latest_revision(deferred.pending_revision, committed_revision);
+            if deferred.active || deferred.scheduled {
+                false
+            } else {
+                deferred.scheduled = true;
+                true
+            }
         };
-        let snapshot = compiled.inspect_err(|_| {
-            // 仅目录代次变化时保留旧快照，下一周期继续对账；配置缺失、变化
-            // 或持久 revision 回退均须 fail closed，不按 revision 大小丢弃刷新。
-            if configuration_changed {
-                self.snapshots.suspend();
-            }
-        })?;
-        let revision = snapshot.revision();
-        self.snapshots.publish(snapshot);
-        Ok(revision)
+        if !should_refresh {
+            return;
+        }
+
+        let mut schedule = DeferredScheduleGuard::new(Arc::clone(&self.deferred));
+        let _refresh = self.refresh_lock.lock().await;
+        schedule.finish();
+        let has_pending = {
+            let deferred = lock_unpoisoned(&self.deferred);
+            deferred.pending_revision.is_some()
+        };
+        if !has_pending {
+            return;
+        }
+        if let Err(error) = self.refresh_locked(RefreshMode::Required).await {
+            tracing::warn!(?error, "deferred runtime snapshot publication failed");
+        }
     }
 
     #[must_use]
@@ -219,17 +410,35 @@ impl RuntimeSnapshotPublisher {
 
     #[must_use]
     fn provider_catalogs_need_refresh(&self) -> bool {
-        self.snapshots.provider_catalog_generations().as_ref()
-            != Some(&self.compiler.provider_catalog_generations())
+        let Ok(snapshot) = self.snapshots.acquire() else {
+            return true;
+        };
+        self.compiler
+            .provider_catalog_generations(snapshot.extensions())
+            .as_ref()
+            != Ok(snapshot.provider_catalog_generations())
     }
 
     /// 数据库提交不能被目录或通知基础设施的暂时故障伪装成回滚。
     async fn publish_committed_inner(&self, committed_revision: ConfigRevision) {
-        let _ = self.refresh_with_mode(RefreshMode::Committed).await;
-        let _ = self
+        if let Err(error) = self.refresh_with_mode(RefreshMode::Committed).await {
+            tracing::warn!(?error, "committed runtime snapshot refresh failed");
+        }
+        self.notify_committed_revision(committed_revision).await;
+    }
+
+    async fn notify_committed_revision(&self, committed_revision: ConfigRevision) {
+        if let Err(error) = self
             .subscriptions
             .publish_snapshot_revision(committed_revision)
-            .await;
+            .await
+        {
+            tracing::warn!(
+                ?error,
+                revision = committed_revision.get(),
+                "runtime snapshot revision notification failed"
+            );
+        }
     }
 
     /// 交给 Host 的周期对账与长驻订阅任务。
@@ -279,6 +488,13 @@ impl SnapshotControl for RuntimeSnapshotPublisher {
     fn publish_committed(&self, committed_revision: ConfigRevision) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.publish_committed_inner(committed_revision).await;
+        })
+    }
+
+    fn publish_committed_deferred(&self, committed_revision: ConfigRevision) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.publish_committed_deferred_inner(committed_revision)
+                .await;
         })
     }
 }
@@ -374,4 +590,16 @@ fn read_unpoisoned<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
 fn write_unpoisoned<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     lock.write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_unpoisoned<T>(lock: &SyncMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn latest_revision(
+    current: Option<ConfigRevision>,
+    candidate: ConfigRevision,
+) -> Option<ConfigRevision> {
+    Some(current.map_or(candidate, |current| current.max(candidate)))
 }

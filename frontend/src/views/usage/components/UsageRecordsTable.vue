@@ -1,8 +1,8 @@
 <script setup lang="ts">
+import type { BaseTableColumn } from '@codex-proxy/ui'
 import type { UsageDisplayRecord } from '../utils/records'
-import type { BaseTableColumn } from '@/components/base/BaseTable/columns'
+import { BaseTable } from '@codex-proxy/ui'
 import { Minimize2 } from '@lucide/vue'
-import BaseTable from '@/components/base/BaseTable/index.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import {
   usageAccountText,

@@ -454,6 +454,7 @@ pub enum AccountSchedulingBlocker {
 pub enum PreferredAccountSelection {
     NotRequested,
     Hit,
+    OverriddenByPolicy,
     Missing,
     Blocked(AccountSchedulingBlocker),
 }
@@ -482,6 +483,52 @@ impl<'a> AccountSelection<'a> {
 pub struct AccountSelector;
 
 impl AccountSelector {
+    /// 返回调度策略可见的全部合格候选；权重层授权由调用策略的宿主适配器裁剪。
+    #[must_use]
+    pub(crate) fn policy_candidates<'a>(
+        &self,
+        candidates: &'a [AccountCandidate],
+        context: &AccountSelectionContext,
+    ) -> Vec<&'a AccountCandidate> {
+        candidates
+            .iter()
+            .filter(|candidate| self.scheduling_blocker(candidate, context).is_none())
+            .collect()
+    }
+
+    /// 对插件返回的 ID 再执行同一资格判断，并保留原有亲和遥测结果。
+    #[must_use]
+    pub(crate) fn select_policy_candidate<'a>(
+        &self,
+        candidates: &'a [AccountCandidate],
+        context: &AccountSelectionContext,
+        account_id: &ProviderAccountId,
+    ) -> Option<AccountSelection<'a>> {
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.account.id() == account_id)?;
+        if self.scheduling_blocker(candidate, context).is_some() {
+            return None;
+        }
+        let highest_weight = candidates
+            .iter()
+            .filter(|candidate| self.scheduling_blocker(candidate, context).is_none())
+            .map(|candidate| candidate.account.weight())
+            .max()?;
+        let (preferred, _) = self.preferred_decision(candidates, context, highest_weight);
+        let preferred = if preferred == PreferredAccountSelection::Hit
+            && context.preferred_account.as_ref() != Some(account_id)
+        {
+            PreferredAccountSelection::OverriddenByPolicy
+        } else {
+            preferred
+        };
+        Some(AccountSelection {
+            candidate,
+            preferred,
+        })
+    }
+
     /// 汇总与本次调度约束一致的并发容量，供请求级观测使用。
     #[must_use]
     pub fn capacity_snapshot(
@@ -538,30 +585,14 @@ impl AccountSelector {
             .iter()
             .map(|candidate| candidate.account.weight())
             .max()?;
-        let preferred = if let Some(preferred) = context.preferred_account.as_ref() {
-            match candidates
-                .iter()
-                .find(|candidate| candidate.account.id() == preferred)
-            {
-                Some(candidate) => match self.scheduling_blocker(candidate, context) {
-                    Some(blocker) => PreferredAccountSelection::Blocked(blocker),
-                    None if !context.preferred_account_overrides_weight
-                        && candidate.account.weight() < highest_weight =>
-                    {
-                        PreferredAccountSelection::Blocked(AccountSchedulingBlocker::LowerWeight)
-                    }
-                    None => {
-                        return Some(AccountSelection {
-                            candidate,
-                            preferred: PreferredAccountSelection::Hit,
-                        });
-                    }
-                },
-                None => PreferredAccountSelection::Missing,
-            }
-        } else {
-            PreferredAccountSelection::NotRequested
-        };
+        let (preferred, preferred_candidate) =
+            self.preferred_decision(candidates, context, highest_weight);
+        if let Some(candidate) = preferred_candidate {
+            return Some(AccountSelection {
+                candidate,
+                preferred: PreferredAccountSelection::Hit,
+            });
+        }
         eligible.retain(|candidate| candidate.account.weight() == highest_weight);
 
         let candidate = match context.policy.strategy() {
@@ -613,6 +644,35 @@ impl AccountSelector {
             candidate,
             preferred,
         })
+    }
+
+    fn preferred_decision<'a>(
+        &self,
+        candidates: &'a [AccountCandidate],
+        context: &AccountSelectionContext,
+        highest_weight: super::AccountWeight,
+    ) -> (PreferredAccountSelection, Option<&'a AccountCandidate>) {
+        let Some(preferred) = context.preferred_account.as_ref() else {
+            return (PreferredAccountSelection::NotRequested, None);
+        };
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.account.id() == preferred)
+        else {
+            return (PreferredAccountSelection::Missing, None);
+        };
+        match self.scheduling_blocker(candidate, context) {
+            Some(blocker) => (PreferredAccountSelection::Blocked(blocker), None),
+            None if !context.preferred_account_overrides_weight
+                && candidate.account.weight() < highest_weight =>
+            {
+                (
+                    PreferredAccountSelection::Blocked(AccountSchedulingBlocker::LowerWeight),
+                    None,
+                )
+            }
+            None => (PreferredAccountSelection::Hit, Some(candidate)),
+        }
     }
 
     /// 只有本地并发/调度间隔可等待；账号权限、失效、额度与上游冷却仍立即排除。

@@ -1,14 +1,8 @@
 <script setup lang="ts">
 import type { BackupRecord } from '@/api'
 
+import { BaseButton, BaseCard, BaseConfirmModal, BaseIconButton, BaseTable, BaseTablePagination, defineTableColumns } from '@codex-proxy/ui'
 import { Download, Play, RefreshCw, Trash2 } from '@lucide/vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
-import { defineTableColumns } from '@/components/base/BaseTable/columns'
-import BaseTable from '@/components/base/BaseTable/index.vue'
 import { formatDateTime } from '@/utils/date'
 
 import BackupStatusBadge from './BackupStatusBadge.vue'

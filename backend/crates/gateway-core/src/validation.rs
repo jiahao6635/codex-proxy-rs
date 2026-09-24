@@ -107,6 +107,14 @@ pub enum RoutingError {
         /// adapter 已绑定的 Provider。
         provider: String,
     },
+    /// 固定 Provider 可用，但未声明该原生端点操作所需能力。
+    #[error("provider endpoint `{provider}` does not support `{operation}`")]
+    UnsupportedProviderEndpoint {
+        /// adapter 已绑定的 Provider。
+        provider: String,
+        /// 请求的稳定操作名。
+        operation: &'static str,
+    },
 }
 
 /// 调用方策略不满足约束或拒绝请求。

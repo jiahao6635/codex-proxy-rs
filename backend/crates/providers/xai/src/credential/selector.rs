@@ -11,6 +11,7 @@ use gateway_core::account::{
     QuotaAccessState, QuotaEvidence, QuotaState,
 };
 use gateway_core::concurrency::{CapacityWait, ConcurrencyWaitQueue};
+use gateway_core::engine::policy::AccountPolicyError;
 use gateway_core::provider_ports::{
     ProviderCooldown, ProviderCooldownPort, ProviderCooldownScope, ProviderLeaseAcquisition,
     ProviderLeasePort, ProviderLeaseRequest, ProviderSchedulingLeaseRequest,
@@ -98,7 +99,7 @@ impl GrokAccountSessionSelector {
             request.deadline(),
             request.concurrency_wait_budget(),
         );
-        loop {
+        'refresh: loop {
             let diagnostic = request.eligibility() == AccountEligibilityPolicy::BypassForDiagnostic;
             // store 侧常规调度列表不包含停用账号；管理端诊断要对固定账号执行真实上游
             // 验证，这里把不在列表里的 required 账号显式补回候选。
@@ -243,7 +244,30 @@ impl GrokAccountSessionSelector {
             let mut retry_after = None;
             loop {
                 let capacity = AccountSelector.capacity_snapshot(&candidates, &capacity_context);
-                let Some(selection) = AccountSelector.select(&candidates, &context) else {
+                let selection = match request.request_policy() {
+                    Some(policy) => {
+                        policy
+                            .select_account(
+                                request.attempt_index(),
+                                &self.provider_kind,
+                                Some(request.upstream_model().as_str()),
+                                &candidates,
+                                &context,
+                            )
+                            .await
+                    }
+                    None => Ok(AccountSelector.select(&candidates, &context)),
+                };
+                let Some(selection) = (match selection {
+                    Ok(selection) => selection,
+                    Err(AccountPolicyError::StaleCandidate) => continue 'refresh,
+                    Err(AccountPolicyError::Rejected) => {
+                        return Err(GrokSessionSelectorError::PolicyRejected);
+                    }
+                    Err(AccountPolicyError::Fault) => {
+                        return Err(GrokSessionSelectorError::PolicyUnavailable);
+                    }
+                }) else {
                     break;
                 };
                 let selected = selection.candidate();

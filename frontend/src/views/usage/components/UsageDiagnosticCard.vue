@@ -1,13 +1,9 @@
 <script setup lang="ts">
 import type { getUsageRecordInsightsDiagnostics } from '@/api'
-import { CornerDownRight } from '@lucide/vue'
+import { BaseCard, BaseEmpty, BaseSegmented, BaseTable, defineTableColumns } from '@codex-proxy/ui'
 
+import { CornerDownRight } from '@lucide/vue'
 import { computed } from 'vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import { defineTableColumns } from '@/components/base/BaseTable/columns'
-import BaseTable from '@/components/base/BaseTable/index.vue'
 import { formatLocalizedCompactNumber as formatCompactNumber } from '@/utils/number'
 
 import { formatDuration, formatPercent, formatUsd } from '../utils/format'

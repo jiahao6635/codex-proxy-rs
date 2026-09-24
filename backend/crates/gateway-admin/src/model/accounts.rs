@@ -204,6 +204,8 @@ pub struct AccountPage {
     pub items: Vec<AccountPageItem>,
     pub total: u64,
     pub summary: AccountSummary,
+    /// 全部持久化账号的平台，不受筛选、分页和插件启停影响。
+    pub providers: Vec<String>,
 }
 
 /// 同一状态快照下的账号事实与唯一状态投影。

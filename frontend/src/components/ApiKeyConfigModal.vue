@@ -1,13 +1,8 @@
 <script setup lang="ts">
+import { BaseButton, BaseIconButton, BaseModal, BaseScrollbar, BaseSegmented, BaseSwitch } from '@codex-proxy/ui'
+
 import { Apple, Copy, Monitor, Upload } from '@lucide/vue'
 import { computed, shallowRef } from 'vue'
-
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import { buildCodexCcSwitchImportDeeplink } from '@/utils/ccswitchImport'
 import {
   buildCodexConfigFiles,

@@ -1,8 +1,13 @@
 mod client_distribution;
 mod config;
 mod logging;
+mod official_plugins;
+mod outbound;
+mod plugin_distribution;
 mod pricing;
+mod process;
 mod proxy_probe;
 mod serve;
+mod support;
 mod system_update;
 mod workers;

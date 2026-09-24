@@ -1,5 +1,5 @@
 import type { getApiKeys } from '@/api'
-import { defineTableColumns } from '@/components/base/BaseTable/columns'
+import { defineTableColumns } from '@codex-proxy/ui'
 
 type ApiKeyRow = Awaited<ReturnType<typeof getApiKeys>>['items'][number] & {
   createdAtDisplay: string

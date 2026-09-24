@@ -147,6 +147,7 @@ impl SystemOperations for ProgressSystem {
     async fn perform_update(
         &self,
         target: Option<String>,
+        _: Arc<dyn gateway_admin::ports::system::SystemUpdatePreflight>,
     ) -> Result<SystemOperationAccepted, SystemOperationError> {
         Ok(SystemOperationAccepted::Update {
             operation_id: "update-1".to_owned(),
@@ -174,7 +175,10 @@ impl SystemOperations for ProgressSystem {
         })
     }
 
-    async fn rollback(&self) -> Result<SystemOperationAccepted, SystemOperationError> {
+    async fn rollback(
+        &self,
+        _: Arc<dyn gateway_admin::ports::system::SystemUpdatePreflight>,
+    ) -> Result<SystemOperationAccepted, SystemOperationError> {
         Err(unavailable_system())
     }
 

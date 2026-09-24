@@ -318,6 +318,7 @@ jobs:
         env:
           VERSION: ${{ needs.release-info.outputs.version }}
           DOCKER_VERSION: ${{ needs.release-info.outputs.docker_version }}
+          GIT_SHA: ${{ needs.release-info.outputs.git_sha }}
         run: |
           set -euo pipefail
           ruby <<'RUBY' > release-platforms.json
@@ -364,6 +365,8 @@ jobs:
           compose = compose.replace(default_image, versioned_image)
           (release_dir / "compose.yaml").write_text(compose)
           assets = [release_dir / config_template.name, release_dir / "compose.yaml"]
+          shutil.rmtree(package_dir, ignore_errors=True)
+          release_packages = []
 
           for platform in platforms:
               platform_name = f"{platform['os']}-{platform['arch']}"
@@ -372,8 +375,7 @@ jobs:
               if not binary_src.is_file():
                   raise SystemExit(f"Missing binary artifact: {binary_src}")
 
-              shutil.rmtree(package_dir, ignore_errors=True)
-              package_root = package_dir / APP_NAME
+              package_root = package_dir / platform_name / APP_NAME
               web_dist = package_root / "web" / "dist"
               web_dist.mkdir(parents=True)
 
@@ -387,11 +389,37 @@ jobs:
 
               archive_name = f"{APP_NAME}_{version}_{platform['os']}_{platform['arch']}.{platform['archive']}"
               archive_path = release_dir / archive_name
-              if platform["archive"] == "tar.gz":
-                  with tarfile.open(archive_path, "w:gz") as archive:
-                      archive.add(package_root, arcname=APP_NAME)
-              else:
+              if platform["archive"] != "tar.gz":
                   raise SystemExit(f"Unsupported archive format: {platform['archive']}")
+              release_packages.append((platform, package_root, archive_path))
+
+          plugin_host_path = pathlib.Path("backend/crates/gateway-plugin/runtime/plugin-host-compatibility.json")
+          plugin_host = json.loads(plugin_host_path.read_text())
+          if plugin_host.get("schema_version") != 1:
+              raise SystemExit(f"Invalid plugin host compatibility declaration: {plugin_host_path}")
+
+          plugin_manifest_path = release_dir / "plugin-release-manifest.json"
+          plugin_manifest_path.write_text(json.dumps({
+              "schema_version": 1,
+              "sealed": True,
+              "gateway_version": version,
+              "gateway_git_sha": os.environ["GIT_SHA"],
+              "plugin_host": plugin_host,
+              # 示例独立发版；当前不内置插件，仍保留更新与回滚所需的封口清单。
+              "plugins": [],
+          }, indent=2, sort_keys=True) + "\n")
+          assets.append(plugin_manifest_path)
+
+          # 保留运行时清单目录合同，宿主包不再携带教学示例。
+          for platform, package_root, archive_path in release_packages:
+              official_dir = package_root / "plugins" / "official"
+              official_dir.mkdir(parents=True)
+              bundled_manifest = official_dir / plugin_manifest_path.name
+              shutil.copy2(plugin_manifest_path, bundled_manifest)
+              bundled_manifest.chmod(0o444)
+              official_dir.chmod(0o555)
+              with tarfile.open(archive_path, "w:gz") as archive:
+                  archive.add(package_root, arcname=APP_NAME)
               assets.append(archive_path)
 
           checksum_path = release_dir / "checksums.txt"
@@ -415,7 +443,7 @@ jobs:
 
   build-docker-image:
     name: build-docker-image (${{ matrix.dockerPlatform }})
-    needs: [release-info, quality, build-docker-binary]
+    needs: [release-info, quality, build-docker-binary, package-assets]
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.release-info.outputs.docker_matrix) }}
@@ -448,6 +476,12 @@ jobs:
           name: codex-proxy-rs-${{ matrix.os }}-${{ matrix.arch }}
           path: dist/docker-artifacts/codex-proxy-rs-${{ matrix.os }}-${{ matrix.arch }}
 
+      - name: Download sealed release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist/release-assets
+
       - name: Prepare Docker prebuilt assets
         shell: bash
         env:
@@ -457,6 +491,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import json
           import shutil
           import os
           import pathlib
@@ -472,6 +507,36 @@ jobs:
           binary_dest = target_dir / app_name
           shutil.copy2(binary_src, binary_dest)
           binary_dest.chmod(0o755)
+
+          release_dir = pathlib.Path("dist/release-assets")
+          manifest_path = release_dir / "plugin-release-manifest.json"
+          manifest = json.loads(manifest_path.read_text())
+          if manifest.get("schema_version") != 1 or manifest.get("sealed") is not True:
+              raise SystemExit("Invalid sealed plugin release manifest")
+          official_dir = target_dir / "plugins" / "official"
+          official_dir.mkdir(parents=True)
+          bundled_manifest = official_dir / manifest_path.name
+          shutil.copy2(manifest_path, bundled_manifest)
+          bundled_manifest.chmod(0o444)
+          selected = 0
+          for plugin in manifest.get("plugins", []):
+              artifacts = [
+                  artifact for artifact in plugin.get("artifacts", [])
+                  if artifact.get("release_os") == os.environ["MATRIX_OS"]
+                  and artifact.get("release_architecture") == os.environ["MATRIX_ARCH"]
+              ]
+              if len(artifacts) != 1:
+                  raise SystemExit(f"Official plugin platform selection is not unique: {plugin.get('id')}")
+              archive = release_dir / artifacts[0]["archive"]
+              if not archive.is_file():
+                  raise SystemExit(f"Missing official plugin archive: {archive.name}")
+              bundled_archive = official_dir / archive.name
+              shutil.copy2(archive, bundled_archive)
+              bundled_archive.chmod(0o444)
+              selected += 1
+          if selected != len(manifest.get("plugins", [])):
+              raise SystemExit("Official plugin release bundle is incomplete")
+          official_dir.chmod(0o555)
           PY
 
       - name: Setup Docker Buildx
@@ -683,6 +748,9 @@ jobs:
 
             **手动下载：**
             请从下方附件中下载适合当前平台的归档包。
+
+            附件包含与当前宿主版本及提交绑定的 `plugin-release-manifest.json`，当前没有默认内置插件。
+            教学示例由独立的 `codex-proxy-plugins` 仓库维护和发布，不随宿主发行物分发。
 
             发布归档提供 GitHub 构建产物证明。Docker 镜像附带软件物料清单（SBOM）、构建来源证明和 cosign 无密钥签名。
 

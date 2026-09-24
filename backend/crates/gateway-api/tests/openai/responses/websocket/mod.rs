@@ -1030,7 +1030,7 @@ impl Provider for ChargedWebSocketProvider {
     }
 
     async fn execute(
-        &self,
+        self: Arc<Self>,
         request: ProviderRequest,
         _: AttemptContext,
     ) -> Result<ProviderStream, ProviderError> {

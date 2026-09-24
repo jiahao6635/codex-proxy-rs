@@ -1,13 +1,7 @@
 <script setup lang="ts">
-import { CalendarClock, Save } from '@lucide/vue'
+import { BaseButton, BaseCard, BaseCheckbox, BaseForm, BaseFormItem, BaseInput, BaseSelect } from '@codex-proxy/ui'
 
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseForm from '@/components/base/BaseForm/index.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
+import { CalendarClock, Save } from '@lucide/vue'
 
 interface ScheduleForm {
   scheduleEnabled: boolean

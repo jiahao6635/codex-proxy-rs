@@ -21,6 +21,7 @@ mod execution;
 mod execution_buffer;
 mod observability;
 mod ops_events;
+mod plugins;
 mod pricing;
 mod provider_accounts;
 mod proxies;
@@ -39,6 +40,7 @@ pub use execution::*;
 pub use execution_buffer::*;
 pub use observability::*;
 pub use ops_events::*;
+pub use plugins::PgPluginStore;
 pub use provider_accounts::*;
 pub use proxies::PgProxyRepository;
 pub use retention::*;
@@ -81,6 +83,26 @@ pub async fn connect_and_migrate(
     }
     migration_pool.close().await;
 
+    connect_pool(connect_options, pool_config, false).await
+}
+
+/// 帮助查询不执行迁移，并用连接默认只读事务阻止意外业务写入。
+pub(crate) async fn connect_read_only(
+    database_url: &str,
+    pool_config: StorePoolConfig,
+) -> StoreResult<PgPool> {
+    pool_config.validate()?;
+    let options = database_url
+        .parse::<PgConnectOptions>()
+        .map_err(|_| postgres_unavailable("parse PostgreSQL connection options"))?;
+    connect_pool(options, pool_config, true).await
+}
+
+async fn connect_pool(
+    connect_options: PgConnectOptions,
+    pool_config: StorePoolConfig,
+    read_only: bool,
+) -> StoreResult<PgPool> {
     let statement_timeout = postgres_duration_setting(POSTGRES_STATEMENT_TIMEOUT);
     let lock_timeout = postgres_duration_setting(POSTGRES_LOCK_TIMEOUT);
     let idle_in_transaction_session_timeout =
@@ -98,11 +120,13 @@ pub async fn connect_and_migrate(
                 sqlx::query(
                     "select set_config('statement_timeout', $1, false),
                             set_config('lock_timeout', $2, false),
-                            set_config('idle_in_transaction_session_timeout', $3, false)",
+                            set_config('idle_in_transaction_session_timeout', $3, false),
+                            set_config('default_transaction_read_only', $4, false)",
                 )
                 .bind(statement_timeout)
                 .bind(lock_timeout)
                 .bind(idle_in_transaction_session_timeout)
+                .bind(if read_only { "on" } else { "off" })
                 .execute(connection)
                 .await?;
                 Ok(())

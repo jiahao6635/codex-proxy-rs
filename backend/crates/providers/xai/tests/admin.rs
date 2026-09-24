@@ -52,6 +52,25 @@ use crate::support::{
 };
 
 #[tokio::test]
+async fn account_capabilities_advertise_only_xai_oauth_quota_operations() {
+    let bundle = provider_xai::initialize(provider_ports()).await.unwrap();
+    let provider = bundle.admin_provider();
+    let id = ProviderAccountId::new("acct_capabilities").unwrap();
+    let oauth = provider.account_capabilities(&id, "oauth");
+    assert_eq!(
+        oauth,
+        gateway_admin::model::provider_capabilities::ProviderAccountCapabilities {
+            quota: true,
+            quota_refresh: true,
+            ..Default::default()
+        }
+    );
+    for kind in ["api_key", "unknown"] {
+        assert_eq!(provider.account_capabilities(&id, kind), Default::default());
+    }
+}
+
+#[tokio::test]
 async fn account_unavailable_clears_real_selector_cooldowns_only_for_deleted_account() {
     let store = MemoryProviderAccountStore::shared();
     let cooldowns = Arc::new(MemoryCooldownPort::default());
@@ -424,6 +443,7 @@ async fn xai_admin_provider_projects_cached_quota_models_and_canonical_export() 
             &UpstreamModelId::new("grok-4.5").expect("upstream model"),
             "Reply with exactly OK.",
         )
+        .await
         .expect("connection test operation");
     let Operation::Generate(request) = operation else {
         panic!("connection test must be a generate operation");
@@ -1262,4 +1282,46 @@ async fn client_profile_preview_and_dashboard_use_saved_configuration() {
     );
     assert!(dashboard.release.is_none());
     assert!(dashboard.verified_at.is_none());
+}
+
+#[tokio::test]
+async fn browser_authorization_declares_callback_and_rejects_extra_login_inputs() {
+    use gateway_admin::model::{
+        provider_capabilities::AuthorizationCompletion,
+        provider_credentials::{
+            AuthorizationMutationTarget, AuthorizationOwnerBinding, PendingAuthorizationMutation,
+            PrepareAuthorization,
+        },
+    };
+    let bundle = provider_xai::initialize(provider_ports()).await.unwrap();
+    let provider = bundle.admin_provider();
+    let login = provider.credential_capabilities().login.unwrap();
+    assert_eq!(login.completion, AuthorizationCompletion::Callback);
+    assert_eq!(
+        login.input_schema,
+        json!({"type":"object", "additionalProperties":false})
+    );
+    let error = provider
+        .start_authorization(PrepareAuthorization {
+            pending: PendingAuthorizationMutation::new(
+                ProviderKind::new("xai").unwrap(),
+                AuthorizationMutationTarget::Create {
+                    name: "form account".into(),
+                },
+                AuthorizationOwnerBinding::from_context(&MutationContext {
+                    actor: MutationActor::System,
+                    request_id: "login-input-test".into(),
+                }),
+            ),
+            input: ProviderDocument::new(OpaqueProviderData::new(
+                json!({"token":"unexpected-fixture-secret"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ProviderAdminErrorKind::Invalid);
+    assert!(!format!("{error:?}").contains("unexpected-fixture-secret"));
 }

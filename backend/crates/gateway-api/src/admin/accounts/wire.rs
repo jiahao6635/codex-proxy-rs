@@ -162,7 +162,7 @@ impl ListQuery {
         if page_size == 0 || page_size > MAX_PAGE_SIZE {
             return Err(WireValidationError::new("pageSize"));
         }
-        let provider_kind = parse_provider(self.provider.as_deref().unwrap_or("all"))?;
+        let provider_kind = parse_provider(self.provider.as_deref().unwrap_or_default())?;
         let group_filter = match self.group_id.as_deref().map(str::trim) {
             None | Some("") => None,
             Some("ungrouped") => Some(AccountGroupFilter::Ungrouped),
@@ -213,7 +213,7 @@ impl ListQuery {
 
 fn parse_provider(value: &str) -> Result<Option<ProviderKind>, WireValidationError> {
     let value = value.trim();
-    if value.is_empty() || value.eq_ignore_ascii_case("all") {
+    if value.is_empty() {
         return Ok(None);
     }
     ProviderKind::new(value.to_owned())
@@ -248,6 +248,7 @@ pub struct AccountPageData {
     pub items: Vec<AccountView>,
     pub page: PageMeta,
     pub summary: AccountSummaryView,
+    pub providers: Vec<String>,
 }
 
 /// 账号概览计数。
@@ -266,6 +267,7 @@ pub struct AccountSummaryView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountView {
+    pub capabilities: AccountCapabilitiesView,
     pub outbound_proxy_endpoint: Option<String>,
     pub id: String,
     pub name: String,
@@ -301,6 +303,36 @@ pub struct AccountView {
     pub updated_at_display: String,
     pub quota: AccountQuotaView,
     pub usage: AccountUsageView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountCapabilitiesView {
+    pub quota: bool,
+    pub quota_refresh: bool,
+    pub profile: bool,
+    pub subscription: bool,
+    pub avatar: bool,
+    pub reset_credits: bool,
+    pub consume_reset_credit: bool,
+}
+
+impl From<gateway_admin::model::provider_capabilities::ProviderAccountCapabilities>
+    for AccountCapabilitiesView
+{
+    fn from(
+        value: gateway_admin::model::provider_capabilities::ProviderAccountCapabilities,
+    ) -> Self {
+        Self {
+            quota: value.quota,
+            quota_refresh: value.quota_refresh,
+            profile: value.profile,
+            subscription: value.subscription,
+            avatar: value.avatar,
+            reset_credits: value.reset_credits,
+            consume_reset_credit: value.consume_reset_credit,
+        }
+    }
 }
 
 /// 容量估算仅供管理端展示；金额不是订阅账单或可消费余额。

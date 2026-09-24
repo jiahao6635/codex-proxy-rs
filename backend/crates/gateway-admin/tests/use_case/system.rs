@@ -54,6 +54,7 @@ impl SystemOperations for RecordingSystemOperations {
     async fn perform_update(
         &self,
         target_version: Option<String>,
+        _: std::sync::Arc<dyn gateway_admin::ports::system::SystemUpdatePreflight>,
     ) -> Result<SystemOperationAccepted, SystemOperationError> {
         *self.target.lock().expect("target") = Some(target_version.clone());
         Ok(SystemOperationAccepted::Update {
@@ -82,7 +83,10 @@ impl SystemOperations for RecordingSystemOperations {
         })
     }
 
-    async fn rollback(&self) -> Result<SystemOperationAccepted, SystemOperationError> {
+    async fn rollback(
+        &self,
+        _: std::sync::Arc<dyn gateway_admin::ports::system::SystemUpdatePreflight>,
+    ) -> Result<SystemOperationAccepted, SystemOperationError> {
         Ok(SystemOperationAccepted::Rollback {
             operation_id: "operation-rollback".to_owned(),
             message: "accepted".to_owned(),

@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use super::{
-    AdminError, MutationActor, MutationContext, Revision,
+    AdminError, MutationActor, MutationContext, PageSize, Revision,
     accounts::{
         AccountImportSettings, AccountRecord, AccountSummary, AccountUsage, CredentialState,
     },
@@ -384,13 +384,19 @@ enum StoredAuthorizationOwnerV1 {
     System,
 }
 
-/// 启动 Provider OAuth Authorization Code 流程。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 启动 Provider 登录；输入仅用于本次准备，不进入宿主的持久事务目标。
+#[derive(Debug, Clone, PartialEq)]
 pub struct StartAuthorization {
     pub context: MutationContext,
     pub name: String,
     pub reauthorization: Option<ProviderAccountId>,
     pub outbound_proxy: Option<super::proxies::AccountProxySelection>,
+    pub input: ProviderDocument,
+}
+
+pub struct PrepareAuthorization {
+    pub pending: PendingAuthorizationMutation,
+    pub input: ProviderDocument,
 }
 
 /// OAuth 流程启动结果。
@@ -425,8 +431,8 @@ pub trait AuthorizationCommitGuard: Send + 'static {
 
 /// OAuth complete 后由 Provider 返回的准备结果；Store 仍是唯一提交者。
 pub enum PreparedAuthorizationCredential {
-    Create(PreparedCredentialCreate),
-    Reauthorize(PreparedCredentialRotation),
+    Create(Vec<PreparedCredentialCreate>),
+    Reauthorize(Box<PreparedCredentialRotation>),
 }
 
 /// Provider 从 opaque pending payload 恢复的信封与已验证 credential 必须一起返回。
@@ -449,16 +455,129 @@ impl fmt::Debug for PreparedAuthorizationCommit {
 /// Store 可持久化的 OAuth credential facts，不携带 Provider guard。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AuthorizationCredentialCommit {
-    Create(PreparedCredentialCreate),
-    Reauthorize(PreparedCredentialRotationFacts),
+    Create(Vec<PreparedCredentialCreate>),
+    Reauthorize(Box<PreparedCredentialRotationFacts>),
 }
 
 /// Admin 交给 Store 的 OAuth 原子事务命令。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuthorizationCommit {
+    pub key: AuthorizationReceiptKey,
     pub settings: Option<AccountImportSettings>,
     pub pending: PendingAuthorizationMutation,
     pub credential: AuthorizationCredentialCommit,
+}
+
+/// 回执以 Provider、授权流和管理员身份绑定；不持久化原始 flow 或回调材料。
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AuthorizationReceiptKey {
+    provider_kind: ProviderKind,
+    flow_digest: String,
+    owner_digest: String,
+}
+
+impl AuthorizationReceiptKey {
+    pub fn new(
+        provider_kind: ProviderKind,
+        flow: &str,
+        context: &MutationContext,
+    ) -> Result<Self, AdminError> {
+        use sha2::{Digest as _, Sha256};
+        if flow.trim().is_empty() || flow.len() > 1024 || flow.chars().any(char::is_control) {
+            return Err(AdminError::invalid("授权流程标识无效"));
+        }
+        Ok(Self {
+            provider_kind,
+            flow_digest: hex::encode(Sha256::digest(flow.as_bytes())),
+            owner_digest: authorization_owner_digest(context),
+        })
+    }
+
+    #[must_use]
+    pub const fn provider_kind(&self) -> &ProviderKind {
+        &self.provider_kind
+    }
+
+    #[must_use]
+    pub fn flow_digest(&self) -> &str {
+        &self.flow_digest
+    }
+
+    #[must_use]
+    pub fn owner_digest(&self) -> &str {
+        &self.owner_digest
+    }
+
+    #[must_use]
+    pub fn matches_context(&self, context: &MutationContext) -> bool {
+        authorization_owner_digest(context) == self.owner_digest
+    }
+}
+
+fn authorization_owner_digest(context: &MutationContext) -> String {
+    use sha2::{Digest as _, Sha256};
+    let owner = match &context.actor {
+        MutationActor::AdminSession { admin_user_id } => format!("admin_session:{admin_user_id}"),
+        MutationActor::AdminApiKey => "admin_api_key".into(),
+        MutationActor::System => "system".into(),
+    };
+    hex::encode(Sha256::digest(owner.as_bytes()))
+}
+
+impl fmt::Debug for AuthorizationReceiptKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthorizationReceiptKey([REDACTED])")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationCommitResult {
+    pub result: CredentialBatchMutationResult,
+    pub newly_committed: bool,
+}
+
+/// 同一授权事务产生的账号集合；重新授权的集合始终只有原账号。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialBatchMutationResult {
+    pub config_revision: Revision,
+    pub accounts: Vec<AuthorizedAccount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedAccount {
+    pub account_id: ProviderAccountId,
+    pub credential_revision: Option<Revision>,
+}
+
+impl From<CredentialMutationResult> for CredentialBatchMutationResult {
+    fn from(result: CredentialMutationResult) -> Self {
+        Self {
+            config_revision: result.config_revision,
+            accounts: vec![AuthorizedAccount {
+                account_id: result.account_id,
+                credential_revision: result.credential_revision,
+            }],
+        }
+    }
+}
+
+/// 轮询可以附带浏览器返回值；敏感材料不能进入 Debug 或通用审计。
+pub struct PollAuthorization {
+    pub context: MutationContext,
+    pub flow_id: String,
+    pub callback_url: Option<String>,
+    pub settings: Option<AccountImportSettings>,
+}
+
+pub enum PreparedAuthorizationPoll {
+    Pending { retry_after: std::time::Duration },
+    Complete(Box<PreparedAuthorizationCommit>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorizationPollResult {
+    Pending { retry_after: std::time::Duration },
+    Complete(CredentialBatchMutationResult),
 }
 
 /// OAuth 准备结果拆解后的 Store 命令与两个结算 guard。
@@ -494,6 +613,7 @@ impl PreparedAuthorizationCommit {
     pub(crate) fn into_commit(
         self,
         settings: Option<AccountImportSettings>,
+        key: AuthorizationReceiptKey,
     ) -> AuthorizationCommitSettlement {
         let (credential, guard) = match self.credential {
             PreparedAuthorizationCredential::Create(credential) => {
@@ -502,13 +622,14 @@ impl PreparedAuthorizationCommit {
             PreparedAuthorizationCredential::Reauthorize(prepared) => {
                 let (facts, guard) = prepared.into_parts();
                 (
-                    AuthorizationCredentialCommit::Reauthorize(facts),
+                    AuthorizationCredentialCommit::Reauthorize(Box::new(facts)),
                     Some(guard),
                 )
             }
         };
         AuthorizationCommitSettlement {
             command: AuthorizationCommit {
+                key,
                 settings,
                 pending: self.pending,
                 credential,
@@ -519,13 +640,8 @@ impl PreparedAuthorizationCommit {
     }
 
     pub(crate) async fn abort(self) -> Result<(), AdminError> {
-        let AuthorizationCommitSettlement {
-            credential_guard,
-            authorization_guard,
-            ..
-        } = self.into_commit(None);
-        drop(credential_guard);
-        if let Some(guard) = authorization_guard {
+        drop(self.credential);
+        if let Some(guard) = self.authorization_guard {
             guard.abort().await?;
         }
         Ok(())
@@ -1060,6 +1176,62 @@ pub struct ProviderModels {
     pub observed_at: Option<DateTime<Utc>>,
 }
 
+/// 插件账号回调的服务端过滤条件；Provider 缺省时跨全部已注册类型分页。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginAccountListQuery {
+    pub provider_kind: Option<ProviderKind>,
+    pub cursor: Option<ProviderAccountId>,
+    pub limit: PageSize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginAccountPage {
+    pub accounts: Vec<AccountRecord>,
+    pub next_cursor: Option<ProviderAccountId>,
+}
+
+/// 原始凭据与当前账号 revision 的同一读取结果。
+#[derive(Clone, PartialEq)]
+pub struct PluginAccountCredential {
+    pub account: AccountRecord,
+    pub provider_material: ProviderDocument,
+}
+
+impl fmt::Debug for PluginAccountCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PluginAccountCredential")
+            .field("account", &self.account)
+            .field("provider_material", &self.provider_material)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginAccountSaveReason {
+    Explicit,
+    ModelDiscovery,
+    Maintenance,
+}
+
+/// Runtime 已完成 wire 校验、Admin 仍需绑定当前账号和 revision 的 prepared facts。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreparedPluginAccountSave {
+    Create(PreparedCredentialCreate),
+    Replace {
+        facts: PreparedCredentialRotationFacts,
+        authentication_kind: String,
+        reason: PluginAccountSaveReason,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginAccountSaveResult {
+    pub config_revision: Revision,
+    pub account_id: ProviderAccountId,
+    pub credential_revision: Revision,
+}
+
 /// Provider 执行 refresh 时所需的当前公共账号事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareCredentialRefresh {
@@ -1095,6 +1267,7 @@ impl fmt::Debug for ProviderExport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountDirectoryItem {
     pub account: AccountRecord,
+    pub capabilities: super::provider_capabilities::ProviderAccountCapabilities,
     /// Provider 提供的套餐展示名称；未识别到套餐时为空。
     pub plan_type_display: Option<String>,
     pub projection: gateway_core::account::AccountStatusProjection,
@@ -1109,6 +1282,7 @@ pub struct AccountDirectoryPage {
     pub items: Vec<AccountDirectoryItem>,
     pub total: u64,
     pub summary: AccountSummary,
+    pub providers: Vec<String>,
 }
 
 /// 凭据刷新提交后的完整账号结果。

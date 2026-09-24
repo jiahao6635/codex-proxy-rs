@@ -4,12 +4,20 @@ use std::{collections::BTreeMap, fmt};
 
 use chrono::{DateTime, Utc};
 
-use gateway_core::routing::{PublicModelId, UpstreamModelId};
+use gateway_core::routing::{ProviderKind, PublicModelId, UpstreamModelId};
 
 use super::Revision;
 
 /// 客户端模型到上游模型的全局精确映射。
 pub type ModelMappings = BTreeMap<PublicModelId, UpstreamModelId>;
+
+/// Provider-owned 请求画像选择；Provider ID 是唯一命名空间。
+pub type ProviderRequestProfiles =
+    BTreeMap<ProviderKind, gateway_core::account::OpaqueProviderData>;
+
+/// Provider-owned 请求画像的部分更新；`None` 只表示显式删除该 Provider 的历史选择。
+pub type ProviderRequestProfileUpdates =
+    BTreeMap<ProviderKind, Option<gateway_core::account::OpaqueProviderData>>;
 
 /// 账号调度策略；由 Core 拥有稳定值与 wire 映射。
 pub use gateway_core::account::RotationStrategy;
@@ -17,8 +25,7 @@ pub use gateway_core::account::RotationStrategy;
 /// 完整运行设置事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSettings {
-    pub openai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
-    pub xai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
+    pub request_profiles: ProviderRequestProfiles,
     pub config_revision: Revision,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -50,8 +57,8 @@ pub struct RuntimeSettings {
 /// 原子替换运行设置的命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplaceRuntimeSettings {
-    pub openai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
-    pub xai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
+    /// 只覆盖提交的 Provider；未提交项保留当前持久值。
+    pub request_profile_updates: ProviderRequestProfileUpdates,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
     pub model_mappings: ModelMappings,
@@ -134,10 +141,8 @@ impl RuntimeSettings {
         &self,
         provider: &str,
     ) -> Option<&gateway_core::account::OpaqueProviderData> {
-        match provider {
-            "openai" => self.openai_client_profile.as_ref(),
-            "xai" => self.xai_client_profile.as_ref(),
-            _ => None,
-        }
+        ProviderKind::new(provider.to_owned())
+            .ok()
+            .and_then(|provider| self.request_profiles.get(&provider))
     }
 }

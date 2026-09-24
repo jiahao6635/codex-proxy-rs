@@ -2,6 +2,7 @@ mod auth;
 mod endpoint;
 mod error;
 mod images;
+mod middleware;
 mod models;
 mod responses;
 mod router;
@@ -62,21 +63,63 @@ pub(super) fn api_router_with_admin(admin: gateway_admin::AdminServices) -> axum
     )
 }
 
+pub(super) fn api_router_with_admin_and_execution(
+    admin: gateway_admin::AdminServices,
+    execution: Arc<dyn ExecutionService>,
+) -> axum::Router {
+    api_router_with_config_and_execution(
+        admin,
+        gateway_api::ApiConfig {
+            asset_directory: std::env::temp_dir(),
+            cors_allowed_origins: Vec::new(),
+            request_timeout_seconds: None,
+            request_id_header: "x-request-id".to_owned(),
+        },
+        execution,
+    )
+}
+
+pub(super) fn api_router_with_admin_and_client(
+    admin: gateway_admin::AdminServices,
+    plaintext: &str,
+    client_key_id: &str,
+) -> axum::Router {
+    let execution = Arc::new(DefaultExecutionService::new(
+        RuntimeSnapshotHandle::new(snapshot_with_client_key(plaintext, "openai", client_key_id)),
+        Arc::new(UnusedExecutionStore),
+        ProviderRegistry::default(),
+        Arc::new(UnusedAdmissions),
+        Arc::new(UnusedCircuits),
+        Arc::new(UnusedContinuation),
+        Arc::new(IgnoredClientApiKeyUsage),
+    ));
+    api_router_with_admin_and_execution(admin, execution)
+}
+
 pub(super) fn api_router_with_config(
     admin: gateway_admin::AdminServices,
     config: gateway_api::ApiConfig,
 ) -> axum::Router {
+    let execution = Arc::new(DefaultExecutionService::new(
+        RuntimeSnapshotHandle::new(snapshot("unused-client-route-key", "openai")),
+        Arc::new(UnusedExecutionStore),
+        ProviderRegistry::default(),
+        Arc::new(UnusedAdmissions),
+        Arc::new(UnusedCircuits),
+        Arc::new(UnusedContinuation),
+        Arc::new(IgnoredClientApiKeyUsage),
+    ));
+    api_router_with_config_and_execution(admin, config, execution)
+}
+
+fn api_router_with_config_and_execution(
+    admin: gateway_admin::AdminServices,
+    config: gateway_api::ApiConfig,
+    execution: Arc<dyn ExecutionService>,
+) -> axum::Router {
     gateway_api::initialize(
         config,
-        Arc::new(DefaultExecutionService::new(
-            RuntimeSnapshotHandle::new(snapshot("unused-client-route-key", "openai")),
-            Arc::new(UnusedExecutionStore),
-            ProviderRegistry::default(),
-            Arc::new(UnusedAdmissions),
-            Arc::new(UnusedCircuits),
-            Arc::new(UnusedContinuation),
-            Arc::new(IgnoredClientApiKeyUsage),
-        )),
+        execution,
         admin,
         Vec::new(),
         Arc::new(EmptyWorkerHealth),
@@ -191,6 +234,14 @@ impl ClientApiKeyUsageSink for IgnoredClientApiKeyUsage {
 }
 
 fn snapshot(plaintext: &str, provider_name: &str) -> RuntimeSnapshot {
+    snapshot_with_client_key(plaintext, provider_name, "key_api_test")
+}
+
+fn snapshot_with_client_key(
+    plaintext: &str,
+    provider_name: &str,
+    client_key_id: &str,
+) -> RuntimeSnapshot {
     let provider = ProviderKind::new(provider_name).expect("provider");
     let account_directory = Arc::new(RuntimeAccountDirectory::new(BTreeMap::from([(
         ProviderAccountId::new("acct_api_test").expect("account ID"),
@@ -219,7 +270,7 @@ fn snapshot(plaintext: &str, provider_name: &str) -> RuntimeSnapshot {
             })
             .collect(),
         vec![ClientPolicy::new(
-            ClientApiKeyId::new("key_api_test").expect("key ID"),
+            ClientApiKeyId::new(client_key_id).expect("key ID"),
             PlaintextClientApiKey::new(plaintext).expect("plaintext key"),
             Arc::new(FrozenAccountScope::new(
                 Arc::clone(&account_directory),

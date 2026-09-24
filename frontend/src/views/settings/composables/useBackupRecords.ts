@@ -1,5 +1,6 @@
 import type { BackupRecord, BackupStatus } from '@/api'
 
+import { toast } from '@codex-proxy/ui'
 import { computed, onScopeDispose, shallowRef } from 'vue'
 import {
   createBackup,
@@ -8,7 +9,6 @@ import {
   getBackupRecords,
 } from '@/api'
 import { ApiError } from '@/api/request'
-import { toast } from '@/components/base/BaseToast'
 import { usePagedQuery } from '@/composables/usePagedQuery'
 import { errorMessage } from '@/utils/async'
 

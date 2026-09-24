@@ -1,9 +1,9 @@
 import type { Ref } from 'vue'
 import type { AccountModelAccess, getAccounts } from '@/api'
 
+import { toast } from '@codex-proxy/ui'
 import { computed, ref, shallowRef, watch } from 'vue'
 import { batchUpdateAccounts } from '@/api'
-import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { accountModelAccessError } from '../utils/modelAccess'
 import { concurrencyLimitInput, parseAccountSchedulingForm } from '../utils/schedulingForm'

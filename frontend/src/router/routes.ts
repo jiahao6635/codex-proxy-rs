@@ -46,34 +46,55 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/usage/index.vue'),
       },
       {
+        path: 'plugins',
+        component: () => import('@/views/plugins/index.vue'),
+        children: [
+          {
+            path: '',
+            name: 'plugins',
+            component: () => import('@/views/plugins/components/PluginManagement.vue'),
+          },
+          {
+            path: ':instanceId/:pageId',
+            name: 'plugin-page',
+            component: () => import('@/views/plugins/components/PluginPage.vue'),
+          },
+        ],
+      },
+      {
         path: 'theme',
         name: 'theme',
         component: () => import('@/views/theme/index.vue'),
       },
       {
         path: 'settings',
-        name: 'settings',
-        component: () => import('@/views/settings/index.vue'),
-      },
-      {
-        path: 'settings/upstream',
-        name: 'settings-upstream',
-        component: () => import('@/views/settings/index.vue'),
-      },
-      {
-        path: 'settings/access',
-        name: 'settings-access',
-        component: () => import('@/views/settings/index.vue'),
-      },
-      {
-        path: 'settings/backup',
-        name: 'settings-backup',
-        component: () => import('@/views/settings/index.vue'),
-      },
-      {
-        path: 'settings/pricing',
-        name: 'settings-pricing',
-        component: () => import('@/views/settings/index.vue'),
+        children: [
+          {
+            path: '',
+            name: 'settings',
+            component: () => import('@/views/settings/index.vue'),
+          },
+          {
+            path: 'upstream',
+            name: 'settings-upstream',
+            component: () => import('@/views/settings/index.vue'),
+          },
+          {
+            path: 'access',
+            name: 'settings-access',
+            component: () => import('@/views/settings/index.vue'),
+          },
+          {
+            path: 'backup',
+            name: 'settings-backup',
+            component: () => import('@/views/settings/index.vue'),
+          },
+          {
+            path: 'pricing',
+            name: 'settings-pricing',
+            component: () => import('@/views/settings/index.vue'),
+          },
+        ],
       },
     ],
   },

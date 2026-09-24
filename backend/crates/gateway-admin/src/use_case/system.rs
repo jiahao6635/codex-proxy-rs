@@ -11,6 +11,7 @@ use crate::{
     },
     ports::system::{
         SystemOperationError, SystemOperationErrorKind, SystemOperations, SystemUpdateEventStream,
+        SystemUpdatePreflight,
     },
 };
 
@@ -32,12 +33,19 @@ pub trait SystemService: Send + Sync {
 /// 保持 Host 能力窄边界的默认系统用例。
 pub(crate) struct DefaultSystemService {
     operations: Arc<dyn SystemOperations>,
+    preflight: Arc<dyn SystemUpdatePreflight>,
 }
 
 impl DefaultSystemService {
     #[must_use]
-    pub(crate) const fn new(operations: Arc<dyn SystemOperations>) -> Self {
-        Self { operations }
+    pub(crate) fn new(
+        operations: Arc<dyn SystemOperations>,
+        preflight: Arc<dyn SystemUpdatePreflight>,
+    ) -> Self {
+        Self {
+            operations,
+            preflight,
+        }
     }
 }
 
@@ -66,7 +74,7 @@ impl SystemService for DefaultSystemService {
             .map(|version| version.trim().to_owned())
             .filter(|version| !version.is_empty());
         self.operations
-            .perform_update(target_version)
+            .perform_update(target_version, Arc::clone(&self.preflight))
             .await
             .map_err(map_system_error)
     }
@@ -79,7 +87,10 @@ impl SystemService for DefaultSystemService {
     }
 
     async fn rollback(&self) -> Result<SystemOperationAccepted, AdminError> {
-        self.operations.rollback().await.map_err(map_system_error)
+        self.operations
+            .rollback(Arc::clone(&self.preflight))
+            .await
+            .map_err(map_system_error)
     }
 
     async fn restart(&self) -> Result<SystemOperationAccepted, AdminError> {

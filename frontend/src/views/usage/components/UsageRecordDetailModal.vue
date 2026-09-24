@@ -2,11 +2,8 @@
 import type { EChartsOption } from 'echarts'
 import type { UsageViewModel } from '../utils/records'
 
+import { BaseButton, BaseModal, BaseTable, defineTableColumns } from '@codex-proxy/ui'
 import { computed } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import { defineTableColumns } from '@/components/base/BaseTable/columns'
-import BaseTable from '@/components/base/BaseTable/index.vue'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { chartTooltipStyle } from '@/components/charts/tooltip'
 import { useChartPalette } from '@/composables/useChartPalette'

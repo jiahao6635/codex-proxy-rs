@@ -1,14 +1,8 @@
 <script setup lang="ts">
-import { Openai, Xai } from '@boxicons/vue'
+import { BaseButton, BaseIconButton, BaseInput, BasePopover, BaseSegmented, BaseSelect } from '@codex-proxy/ui'
 import { CircleAlert, Download, Percent, Plus, RotateCcw, Search, X } from '@lucide/vue'
 import { computed, shallowRef, useId } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BasePopover from '@/components/base/BasePopover.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
-import { PROVIDER_DISPLAY_NAMES } from '@/utils/providers'
+import { formatProviderLabel, providerIcon } from '@/utils/providers'
 import { sourceLabels } from './model'
 
 const props = defineProps<{
@@ -17,6 +11,7 @@ const props = defineProps<{
   saving: boolean
   syncing: boolean
   syncedAt?: string | null
+  providers: string[]
 }>()
 defineEmits<{ add: [], sync: [], setMultiplier: [], reset: [], clear: [] }>()
 const search = defineModel<string>('search', { required: true })
@@ -25,10 +20,11 @@ const source = defineModel<string>('source', { required: true })
 const syncInfoOpen = shallowRef(false)
 const syncInfoId = useId()
 const syncTime = computed(() => props.syncedAt ? new Date(props.syncedAt).toLocaleString() : '尚未同步')
-const providerOptions = [
-  { label: PROVIDER_DISPLAY_NAMES.openai, value: 'openai', icon: Openai },
-  { label: PROVIDER_DISPLAY_NAMES.xai, value: 'xai', icon: Xai },
-]
+const providerOptions = computed(() => props.providers.map(value => ({
+  label: formatProviderLabel(value),
+  value,
+  icon: providerIcon(value),
+})))
 </script>
 
 <template>
@@ -39,7 +35,16 @@ const providerOptions = [
           <Search class="size-4" />
         </template>
       </BaseInput>
-      <BaseSegmented v-model="provider" class="w-21 shrink-0 bg-(--cp-input-bg)!" label="模型提供商" :options="providerOptions" :disabled="saving" display="icon" />
+      <div v-if="providerOptions.length" class="min-w-0 max-w-full overflow-x-auto">
+        <BaseSegmented
+          v-model="provider"
+          label="模型提供商"
+          display="icon"
+          :style="{ width: `${providerOptions.length * 40 + 4}px` }"
+          :options="providerOptions"
+          :disabled="saving"
+        />
+      </div>
       <BaseSelect v-model="source" class="w-32" aria-label="价格来源" :options="[{ label: '全部来源', value: 'all' }, { label: sourceLabels.custom, value: 'custom' }, { label: sourceLabels.synced, value: 'synced' }, { label: sourceLabels.builtin, value: 'builtin' }]" />
       <div v-if="selectedCount" class="ml-auto flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto" role="group" aria-label="批量操作">
         <span class="inline-flex h-cp-control w-full items-center gap-1 whitespace-nowrap text-cp text-cp-text-secondary sm:mr-1 sm:w-auto" aria-live="polite">

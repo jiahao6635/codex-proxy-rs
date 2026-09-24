@@ -1,11 +1,8 @@
 <script setup lang="ts">
 import type { ClientDownloadPackage, CodexDesktopWindowsDownloads } from '@/api'
-import { ArrowDownToLine, PackageOpen, RefreshCw } from '@lucide/vue'
+import { BaseButton, BaseEmpty, BaseIconButton, BaseSkeleton } from '@codex-proxy/ui'
 
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseSkeleton from '@/components/base/BaseSkeleton.vue'
+import { ArrowDownToLine, PackageOpen, RefreshCw } from '@lucide/vue'
 import { formatDateTime } from '@/utils/date'
 
 import ClientInstallCommandList from './ClientInstallCommandList.vue'

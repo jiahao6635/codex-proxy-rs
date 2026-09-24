@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import type { KeyUsageBudget } from '@/api/modules/key-usage'
+import { BaseCard } from '@codex-proxy/ui'
 import { Clock3, Gauge, Network } from '@lucide/vue'
 import { computed } from 'vue'
-import BaseCard from '@/components/base/BaseCard.vue'
 import { keyUsageTime, money } from '../utils/format'
 
 const props = defineProps<{ budget: KeyUsageBudget }>()

@@ -1,6 +1,8 @@
 # Build outputs and dependency caches.
 **/target/
-frontend/node_modules/
+**/node_modules/
+**/.pnpm-store/
+**/.pnpm-cache/
 frontend/dist/
 frontend/.vite/
 dist/*
@@ -19,6 +21,7 @@ deploy/logs/
 local.yaml
 local.yml
 .env
+.env.*
 config.yaml
 deploy/config.yaml
 deploy/.env

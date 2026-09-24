@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { AccountGroup } from '@/api'
 
-import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
+import { BaseCheckbox } from '@codex-proxy/ui'
 
 withDefaults(
   defineProps<{

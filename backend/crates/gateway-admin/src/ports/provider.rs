@@ -15,11 +15,11 @@ use crate::model::observability::{
 };
 use crate::model::provider_credentials::{
     AuthorizationStarted, CompleteAuthorization, ConsumeProviderResetCredit,
-    PendingAuthorizationMutation, PrepareCredentialImport, PrepareCredentialRefresh,
-    PrepareCredentialRotation, PreparedAuthorizationCommit, PreparedCredentialImport,
-    PreparedCredentialRotation, ProviderExport, ProviderExportCredentialInput, ProviderModels,
-    ProviderProfileAvatar, ProviderProfileStatistics, ProviderQuota, ProviderQuotaRequest,
-    ProviderResetCreditResult, ProviderResetCredits, ProviderSubscription, explicit_plan_type,
+    PrepareCredentialImport, PrepareCredentialRefresh, PrepareCredentialRotation,
+    PreparedAuthorizationCommit, PreparedCredentialImport, PreparedCredentialRotation,
+    ProviderExport, ProviderExportCredentialInput, ProviderModels, ProviderProfileAvatar,
+    ProviderProfileStatistics, ProviderQuota, ProviderQuotaRequest, ProviderResetCreditResult,
+    ProviderResetCredits, ProviderSubscription, explicit_plan_type,
 };
 use crate::model::{
     provider_credentials::{ProviderDocument, ProviderQuotaWindow},
@@ -117,11 +117,31 @@ pub trait ProviderAdmin: Send + Sync {
 
     fn provider_kind(&self) -> &ProviderKind;
 
+    fn credential_capabilities(
+        &self,
+    ) -> crate::model::provider_capabilities::ProviderCredentialCapabilities {
+        Default::default()
+    }
+
+    /// 只读取当前代次的声明及账号类型，不执行网络或数据库查询。
+    fn account_capabilities(
+        &self,
+        _account_id: &ProviderAccountId,
+        _authentication_kind: &str,
+    ) -> crate::model::provider_capabilities::ProviderAccountCapabilities {
+        Default::default()
+    }
+
     /// 提供该 Provider 的可选客户端身份；通用管理层不解释内部字段。
     fn client_profile_options(
         &self,
     ) -> Result<gateway_core::account::OpaqueProviderData, ProviderAdminError> {
         Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
+    /// 没有持久选择时使用的 Provider 默认画像；只返回已准备的本地事实。
+    fn default_client_profile(&self) -> Option<gateway_core::account::OpaqueProviderData> {
+        None
     }
 
     /// 校验并投影客户端身份，结果不含认证或账号材料。
@@ -150,7 +170,7 @@ pub trait ProviderAdmin: Send + Sync {
     async fn account_facts_changed(&self, _account_ids: &[ProviderAccountId]) {}
 
     /// 生成一次连接测试所需的 Provider-owned operation；Core 负责实际执行与落账。
-    fn connection_test_operation(
+    async fn connection_test_operation(
         &self,
         upstream_model: &UpstreamModelId,
         input_text: &str,
@@ -180,13 +200,21 @@ pub trait ProviderAdmin: Send + Sync {
 
     async fn start_authorization(
         &self,
-        pending: PendingAuthorizationMutation,
+        command: crate::model::provider_credentials::PrepareAuthorization,
     ) -> Result<AuthorizationStarted, ProviderAdminError>;
 
     async fn complete_authorization(
         &self,
         command: CompleteAuthorization,
     ) -> Result<PreparedAuthorizationCommit, ProviderAdminError>;
+
+    async fn poll_authorization(
+        &self,
+        _command: crate::model::provider_credentials::PollAuthorization,
+    ) -> Result<crate::model::provider_credentials::PreparedAuthorizationPoll, ProviderAdminError>
+    {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
 
     async fn prepare_rotation(
         &self,
@@ -275,16 +303,69 @@ pub trait ProviderAdmin: Send + Sync {
 /// 按 ProviderKind 动态发现管理能力；不含具体 Provider 分支。
 #[derive(Clone)]
 pub struct ProviderAdminRegistry {
-    providers: Arc<BTreeMap<ProviderKind, Arc<dyn ProviderAdmin>>>,
+    pub(super) providers: Arc<BTreeMap<ProviderKind, Arc<dyn ProviderAdmin>>>,
+    pub(super) extensions: Option<(
+        super::provider_extensions::ProviderAdminExtensionIndex,
+        gateway_core::runtime::RuntimeSnapshotHandle,
+    )>,
+    pub(super) snapshot: Option<Arc<gateway_core::routing::RuntimeSnapshot>>,
 }
 
 impl ProviderAdminRegistry {
-    #[must_use]
-    pub fn pricing_catalog(&self) -> gateway_core::metering::PricingOverrides {
-        self.providers
+    /// 返回当前冻结代次中真正提供客户端画像选项的 Provider。
+    pub fn client_profile_providers(&self) -> Result<Vec<ProviderKind>, ProviderAdminError> {
+        let frozen = self.freeze()?;
+        let mut supported = Vec::new();
+        for (kind, provider) in frozen.providers.iter() {
+            match provider.client_profile_options() {
+                Ok(_) => supported.push(kind.clone()),
+                Err(error) if error.kind() == ProviderAdminErrorKind::Unsupported => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(supported)
+    }
+
+    /// 一次读取冻结整个目录，能力与执行器始终来自同一已发布代次。
+    pub fn credential_descriptors(
+        &self,
+    ) -> Result<
+        Vec<crate::model::provider_capabilities::ProviderCredentialDescriptor>,
+        ProviderAdminError,
+    > {
+        Ok(self
+            .freeze()?
+            .providers
+            .iter()
+            .map(|(kind, provider)| {
+                crate::model::provider_capabilities::ProviderCredentialDescriptor {
+                    provider: kind.clone(),
+                    capabilities: provider.credential_capabilities(),
+                }
+            })
+            .collect())
+    }
+
+    pub fn pricing_catalog(
+        &self,
+    ) -> Result<gateway_core::metering::PricingOverrides, ProviderAdminError> {
+        Ok(self
+            .freeze()?
+            .providers
             .iter()
             .map(|(kind, provider)| (kind.as_str().to_owned(), provider.pricing_catalog()))
-            .collect()
+            .collect())
+    }
+
+    /// 一个管理用例可显式冻结目录，批量操作不会混入下一份配置。
+    pub fn freeze(&self) -> Result<Self, ProviderAdminError> {
+        let Some((index, snapshots)) = &self.extensions else {
+            return Ok(self.clone());
+        };
+        let snapshot = snapshots
+            .acquire()
+            .map_err(|_| ProviderAdminError::new(ProviderAdminErrorKind::Unavailable))?;
+        index.resolve(snapshot)
     }
 
     /// 创建无重复 ProviderKind 的注册表。
@@ -304,17 +385,25 @@ impl ProviderAdminRegistry {
         }
         Ok(Self {
             providers: Arc::new(registered),
+            extensions: None,
+            snapshot: None,
         })
     }
 
     pub fn require(
         &self,
         provider_kind: &ProviderKind,
-    ) -> Result<Arc<dyn ProviderAdmin>, ProviderAdminError> {
-        self.providers
-            .get(provider_kind)
-            .cloned()
-            .ok_or_else(|| ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    ) -> Result<super::provider_extensions::ProviderAdminHandle, ProviderAdminError> {
+        if let Some(provider) = self.providers.get(provider_kind) {
+            return Ok(super::provider_extensions::ProviderAdminHandle {
+                provider: provider.clone(),
+                snapshot: self.snapshot.clone(),
+            });
+        }
+        if self.extensions.is_some() {
+            return self.freeze()?.require(provider_kind);
+        }
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
     }
 
     /// 账号目录与关联列表共用套餐补全和展示规则，已知账号套餐优先于额度快照。
@@ -339,7 +428,7 @@ impl ProviderAdminRegistry {
         let plan_type = explicit_plan_type(plan_type)?.trim();
         let provider = ProviderKind::new(provider_kind.to_owned())
             .ok()
-            .and_then(|kind| self.providers.get(&kind));
+            .and_then(|kind| self.require(&kind).ok());
         let display = provider.map_or_else(
             || plan_type.to_owned(),
             |provider| provider.plan_type_display(plan_type),
@@ -355,14 +444,16 @@ impl ProviderAdminRegistry {
             ProviderKind,
             gateway_core::account::OpaqueProviderData,
         >,
-    ) -> Vec<DashboardWireProfile> {
-        self.providers
+    ) -> Result<Vec<DashboardWireProfile>, ProviderAdminError> {
+        Ok(self
+            .freeze()?
+            .providers
             .iter()
             .filter_map(|(kind, provider)| match configurations.get(kind) {
                 Some(configuration) => provider.configured_wire_profile(configuration),
                 None => provider.dashboard_wire_profile(),
             })
-            .collect()
+            .collect())
     }
 
     /// 动态分派 Provider-owned 费用规则，不含任何具体 Provider 分支。

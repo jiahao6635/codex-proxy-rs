@@ -33,6 +33,7 @@ pub mod auth;
 mod health;
 mod key_usage;
 pub mod openai;
+mod provider;
 mod session_cookie;
 
 /// API-owned HTTP 与静态资源配置。
@@ -141,10 +142,18 @@ pub fn initialize(
     let mut router = Router::new()
         .route("/healthz", get(health::healthz))
         .merge(openai::router::router())
+        .merge(provider::router())
         .merge(admin::router::<ApiState>())
+        .merge(admin::model_router())
         .merge(auth::router::<ApiState>())
         .merge(key_usage::router::<ApiState>())
-        .fallback_service(ServeDir::new(config.asset_directory).fallback(ServeFile::new(index)));
+        .fallback_service(
+            Router::new()
+                .fallback_service(
+                    ServeDir::new(config.asset_directory).fallback(ServeFile::new(index)),
+                )
+                .layer(axum::middleware::map_response(static_cache_control)),
+        );
     if !config.cors_allowed_origins.is_empty() {
         let origins = config
             .cors_allowed_origins
@@ -205,6 +214,14 @@ pub fn initialize(
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .with_state(state);
     Ok(ApiBundle { router })
+}
+
+async fn static_cache_control(mut response: axum::response::Response) -> axum::response::Response {
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    response
 }
 
 /// API 初始化失败的脱敏分类。

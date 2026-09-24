@@ -1,12 +1,8 @@
 <script setup lang="ts">
 import type { PricingRow } from './model'
 import type { PricingChange } from '@/api'
+import { BaseButton, BaseFormItem, BaseInput, BaseModal, BaseScrollbar } from '@codex-proxy/ui'
 import { computed, ref, watch } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
 import { multiplierText, parseMultiplier } from './model'
 
 defineProps<{ rows: PricingRow[], reset: boolean, saving: boolean }>()

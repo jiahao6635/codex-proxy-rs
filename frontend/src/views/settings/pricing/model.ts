@@ -24,6 +24,9 @@ export interface PricingRow {
   custom?: ModelPricing
   effective: ModelPricing
 }
+export function pricingProviders(catalog: PricingCatalog): string[] {
+  return Object.keys(catalog.defaults).sort((left, right) => left.localeCompare(right))
+}
 export function pricingRows(catalog: PricingCatalog, provider: string): PricingRow[] {
   const defaults = catalog.defaults[provider] ?? {}
   const synced = catalog.synced[provider] ?? {}

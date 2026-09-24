@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { Github } from '@boxicons/vue'
+import { BaseModal } from '@codex-proxy/ui'
 import { ExternalLink } from '@lucide/vue'
-import { computed } from 'vue'
 
-import BaseModal from '@/components/base/BaseModal/index.vue'
+import { computed } from 'vue'
 
 const props = defineProps<{
   version: { version: string, gitSha: string } | null

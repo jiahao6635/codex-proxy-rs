@@ -43,6 +43,19 @@ pub struct QuotaForecastSource {
     pub usd: Option<f64>,
 }
 
+/// 为目标周期选择唯一的预测源窗口；缺少同周期窗口时复用最短的可统计窗口。
+///
+/// Admin 的历史查询与最终投影必须共用这里的顺序，避免查询不会进入响应的窗口。
+pub(crate) fn quota_forecast_source_window(
+    quota: &ProviderQuota,
+    period: AccountUsagePeriod,
+) -> Option<(&ProviderQuotaWindow, AccountUsagePeriod)> {
+    quota
+        .usage_windows()
+        .find(|(_, source_period)| *source_period == period)
+        .or_else(|| quota.usage_windows().min_by_key(|(_, period)| *period))
+}
+
 /// 优先预测真实的对应窗口；缺少对应周期时只给出明确标识的 7/30 天容量折算。
 /// 本地日志不能证明站外消耗或完整留存，因此即使样本充足也不声称官方额度。
 #[must_use]
@@ -53,10 +66,7 @@ pub fn account_quota_forecasts(
     samples: &[QuotaForecastSample],
 ) -> [AccountQuotaForecast; 2] {
     [AccountUsagePeriod::Weekly, AccountUsagePeriod::Monthly].map(|period| {
-        let selected = quota
-            .usage_windows()
-            .find(|(_, source_period)| *source_period == period)
-            .or_else(|| quota.usage_windows().min_by_key(|(_, period)| *period));
+        let selected = quota_forecast_source_window(quota, period);
         let mut forecast = AccountQuotaForecast {
             period,
             target_seconds: match period {

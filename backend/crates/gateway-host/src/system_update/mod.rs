@@ -21,7 +21,8 @@ use gateway_admin::model::system::{
     SystemUpdateEventLevel, SystemUpdateStatus, SystemVersion,
 };
 use gateway_admin::ports::system::{
-    SystemOperationError, SystemOperationErrorKind, SystemOperations, SystemUpdateEventStream,
+    SystemOperationError, SystemOperationErrorKind, SystemOperations, SystemUpdateCandidate,
+    SystemUpdateEventStream, SystemUpdatePreflight,
 };
 use gateway_core::lifecycle::CancellationToken;
 use serde::Deserialize;
@@ -40,13 +41,15 @@ use self::state::{
     OperationFileLock, UpdateOperation, UpdateTempDir, finish, operation_id, read_status,
     recover_interrupted, set_running,
 };
-use self::swap::{replace_release_files, rollback_release};
+use self::swap::{replace_release_files, rollback_official_plugins_dir, rollback_release};
 
 pub use self::release::validate_download_url;
 
 const APP_BINARY_NAME: &str = "codex-proxy-rs";
 const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com/repos";
 const DEFAULT_UPDATE_REPOSITORY: &str = "zyycn/codex-proxy-rs";
+const OFFICIAL_PLUGIN_MANIFEST: &str = "plugin-release-manifest.json";
+const MAX_OFFICIAL_PLUGIN_MANIFEST_SIZE: u64 = 256 * 1024;
 
 type OperationError = SystemOperationError;
 
@@ -205,6 +208,15 @@ impl SystemUpdateConfig {
             .map_err(|error| internal(format!("failed to resolve executable: {error}")))
     }
 
+    pub(crate) fn official_plugins_dir(&self) -> Result<PathBuf, OperationError> {
+        let executable = self.executable_path()?;
+        let parent = executable
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .ok_or_else(|| internal("failed to resolve official plugin release directory"))?;
+        Ok(parent.join("plugins").join("official"))
+    }
+
     pub(crate) fn web_dist_dir(&self) -> Result<&Path, OperationError> {
         self.web_dist_dir
             .as_deref()
@@ -238,6 +250,7 @@ impl ProcessSystemOperations {
     fn start_update(
         &self,
         target_version: Option<String>,
+        preflight: Arc<dyn SystemUpdatePreflight>,
     ) -> Result<SystemOperationAccepted, OperationError> {
         let operation_lock = Arc::clone(&self.operation_lock)
             .try_lock_owned()
@@ -282,7 +295,7 @@ impl ProcessSystemOperations {
             let result = tokio::select! {
                 biased;
                 () = service.cancellation.cancelled() => Err(conflict("服务关闭，更新已中断")),
-                result = service.perform_update_inner(&target, &operation_id) => result,
+                result = service.perform_update_inner(&target, &operation_id, preflight.as_ref()) => result,
             };
             if let Err(error) = operation.complete(&result) {
                 tracing::warn!(error = %error, "系统更新终态落盘失败");
@@ -308,6 +321,7 @@ impl ProcessSystemOperations {
         &self,
         target: &str,
         operation_id: &str,
+        preflight: &dyn SystemUpdatePreflight,
     ) -> Result<(), OperationError> {
         let repository = self
             .config
@@ -338,7 +352,8 @@ impl ProcessSystemOperations {
             Some("prepare"),
             format!("准备更新到 v{target}"),
         );
-        self.install_release(&release, target, operation_id).await
+        self.install_release(&release, target, operation_id, preflight)
+            .await
     }
 
     async fn install_release(
@@ -346,6 +361,7 @@ impl ProcessSystemOperations {
         release: &release::GitHubRelease,
         version: &str,
         operation_id: &str,
+        preflight: &dyn SystemUpdatePreflight,
     ) -> Result<(), OperationError> {
         self.events.info(
             Some(operation_id),
@@ -413,6 +429,23 @@ impl ProcessSystemOperations {
         let extracted = extract_release(&archive_path, temp.path())?;
         self.events
             .success(Some(operation_id), Some("extract"), "更新包解压完成");
+        let release_manifest = read_release_manifest(&extracted.official_plugins_dir)?;
+        let candidate = SystemUpdateCandidate {
+            target_version: version.to_owned(),
+            release_manifest: release_manifest.clone(),
+        };
+        self.events.info(
+            Some(operation_id),
+            Some("preflight"),
+            "正在检查启用插件与目标版本的兼容性",
+        );
+        let plugin_revision = preflight.validate(candidate).await?;
+        preflight.confirm_revision(plugin_revision).await?;
+        self.events.success(
+            Some(operation_id),
+            Some("preflight"),
+            "启用插件兼容性检查通过",
+        );
         self.events
             .info(Some(operation_id), Some("replace"), "正在替换应用文件");
         replace_release_files(
@@ -420,6 +453,15 @@ impl ProcessSystemOperations {
             self.config.web_dist_dir()?,
             extracted,
         )?;
+        let mut applied = AppliedReleaseGuard::new(&self.config);
+        let applied_manifest = read_release_manifest(&self.config.official_plugins_dir()?)?;
+        if applied_manifest.as_ref() != release_manifest.as_ref() {
+            return Err(applied.rollback(conflict("已应用的更新候选与预检候选不一致")));
+        }
+        if let Err(error) = preflight.confirm_revision(plugin_revision).await {
+            return Err(applied.rollback(error));
+        }
+        applied.commit();
         self.events
             .success(Some(operation_id), Some("replace"), "应用文件替换完成");
         Ok(())
@@ -478,8 +520,9 @@ impl SystemOperations for ProcessSystemOperations {
     async fn perform_update(
         &self,
         target_version: Option<String>,
+        preflight: Arc<dyn SystemUpdatePreflight>,
     ) -> Result<SystemOperationAccepted, OperationError> {
-        self.start_update(target_version)
+        self.start_update(target_version, preflight)
     }
 
     async fn update_status(&self) -> Result<SystemUpdateStatus, OperationError> {
@@ -492,7 +535,10 @@ impl SystemOperations for ProcessSystemOperations {
         read_status(&self.config.update_state_file, &self.config.version)
     }
 
-    async fn rollback(&self) -> Result<SystemOperationAccepted, OperationError> {
+    async fn rollback(
+        &self,
+        preflight: Arc<dyn SystemUpdatePreflight>,
+    ) -> Result<SystemOperationAccepted, OperationError> {
         let _operation = self
             .operation_lock
             .try_lock()
@@ -502,6 +548,18 @@ impl SystemOperations for ProcessSystemOperations {
         }
         let operation_id = operation_id("rollback");
         let file_lock = OperationFileLock::acquire(&self.config.update_lock_file)?;
+        let target_version = read_status(&self.config.update_state_file, &self.config.version)?
+            .previous_version
+            .ok_or_else(|| conflict("没有可用于回滚的上一版本"))?;
+        let release_manifest =
+            read_release_manifest(&rollback_official_plugins_dir(&self.config)?)?;
+        let plugin_revision = preflight
+            .validate(SystemUpdateCandidate {
+                target_version,
+                release_manifest: Arc::clone(&release_manifest),
+            })
+            .await?;
+        preflight.confirm_revision(plugin_revision).await?;
         set_running(
             &self.config.update_state_file,
             &operation_id,
@@ -509,7 +567,26 @@ impl SystemOperations for ProcessSystemOperations {
             None,
             &self.config.version,
         )?;
-        let result = rollback_release(&self.config);
+        let result = match rollback_release(&self.config) {
+            Ok(()) => {
+                let mut applied = AppliedReleaseGuard::new(&self.config);
+                let result = match read_release_manifest(&self.config.official_plugins_dir()?) {
+                    Ok(manifest) if manifest.as_ref() == release_manifest.as_ref() => {
+                        preflight.confirm_revision(plugin_revision).await
+                    }
+                    Ok(_) => Err(conflict("已应用的回滚候选与预检候选不一致")),
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(()) => {
+                        applied.commit();
+                        Ok(())
+                    }
+                    Err(error) => Err(applied.rollback(error)),
+                }
+            }
+            Err(error) => Err(error),
+        };
         finish(
             &self.config.update_state_file,
             &operation_id,
@@ -563,6 +640,63 @@ impl SystemOperations for ProcessSystemOperations {
             operation_id,
             message: message.to_owned(),
         })
+    }
+}
+
+fn read_release_manifest(directory: &Path) -> Result<Arc<[u8]>, OperationError> {
+    let path = directory.join(OFFICIAL_PLUGIN_MANIFEST);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| invalid(format!("official plugin manifest is unavailable: {error}")))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(invalid("official plugin manifest is not a regular file"));
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_OFFICIAL_PLUGIN_MANIFEST_SIZE {
+        return Err(invalid("official plugin manifest size is invalid"));
+    }
+    fs::read(path)
+        .map(Arc::<[u8]>::from)
+        .map_err(|error| invalid(format!("official plugin manifest cannot be read: {error}")))
+}
+
+fn restore_applied_release(config: &SystemUpdateConfig, cause: OperationError) -> OperationError {
+    match rollback_release(config) {
+        Ok(()) => cause,
+        Err(error) => internal(format!(
+            "release verification failed and restoring the previous files failed: {error}"
+        )),
+    }
+}
+
+struct AppliedReleaseGuard<'a> {
+    config: &'a SystemUpdateConfig,
+    armed: bool,
+}
+
+impl<'a> AppliedReleaseGuard<'a> {
+    const fn new(config: &'a SystemUpdateConfig) -> Self {
+        Self {
+            config,
+            armed: true,
+        }
+    }
+
+    const fn commit(&mut self) {
+        self.armed = false;
+    }
+
+    fn rollback(mut self, cause: OperationError) -> OperationError {
+        self.armed = false;
+        restore_applied_release(self.config, cause)
+    }
+}
+
+impl Drop for AppliedReleaseGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = rollback_release(self.config)
+        {
+            tracing::error!(error = %error, "系统发行物临界区取消后的恢复失败");
+        }
     }
 }
 

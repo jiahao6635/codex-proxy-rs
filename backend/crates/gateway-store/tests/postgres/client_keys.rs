@@ -49,8 +49,7 @@ async fn migrated_keys_persist_exactly_and_keep_short_keys_masked() {
         let (_, record) = store
             .create_client_key(
                 NewClientKey {
-                    openai_client_profile_override: None,
-                    xai_client_profile_override: None,
+                    request_profile_overrides: Default::default(),
                     id: id.clone(),
                     name: format!("Migrated {index}"),
                     label: None,
@@ -105,8 +104,7 @@ async fn duplicate_migrated_keys_conflict_atomically_without_extra_audits() {
     };
     let key = "legacy-key-case-sensitive!";
     let command = |id: &str| NewClientKey {
-        openai_client_profile_override: None,
-        xai_client_profile_override: None,
+        request_profile_overrides: Default::default(),
         id: ClientApiKeyId::new(id).unwrap(),
         name: id.to_owned(),
         label: None,
@@ -142,8 +140,7 @@ async fn duplicate_migrated_keys_conflict_atomically_without_extra_audits() {
 #[test]
 fn generated_client_key_format_remains_valid() {
     let key = NewClientApiKey {
-        openai_client_profile_override: None,
-        xai_client_profile_override: None,
+        request_profile_overrides: Default::default(),
         budget: Default::default(),
         id: "key-1".to_owned(),
         name: "default".to_owned(),
@@ -176,8 +173,7 @@ async fn client_key_names_are_checked_atomically_on_create_and_rename() {
         request_id: "duplicate-name-test".to_owned(),
     };
     let create = |id: &str, name: &str| NewClientKey {
-        openai_client_profile_override: None,
-        xai_client_profile_override: None,
+        request_profile_overrides: Default::default(),
         id: ClientApiKeyId::new(id).unwrap(),
         name: name.to_owned(),
         label: None,
@@ -187,8 +183,7 @@ async fn client_key_names_are_checked_atomically_on_create_and_rename() {
         plaintext: format!("synthetic-credential-{id}"),
     };
     let update = |id: ClientApiKeyId, name: &str| UpdateClientKey {
-        openai_client_profile_override: None,
-        xai_client_profile_override: None,
+        request_profile_override_updates: Default::default(),
         id,
         name: name.to_owned(),
         label: None,
@@ -643,8 +638,7 @@ async fn dedicated_reveal_returns_plaintext_without_debug_exposure() {
 fn client_key_debug_redacts_plaintext() {
     let secret = format!("sk_{}", "s".repeat(43));
     let key = NewClientApiKey {
-        openai_client_profile_override: None,
-        xai_client_profile_override: None,
+        request_profile_overrides: Default::default(),
         budget: Default::default(),
         id: "key-1".to_owned(),
         name: "default".to_owned(),
@@ -712,6 +706,8 @@ async fn key_profile_override_roundtrips_and_explicit_clear_restores_inheritance
             .clone(),
     );
     let id = ClientApiKeyId::new("key_profile").unwrap();
+    let openai = gateway_core::routing::ProviderKind::new("openai").unwrap();
+    let dynamic = gateway_core::routing::ProviderKind::new("provider.example").unwrap();
     let (_, record) = store
         .create_client_key(
             NewClientKey {
@@ -722,16 +718,24 @@ async fn key_profile_override_roundtrips_and_explicit_clear_restores_inheritance
                 limits: RateLimits::unlimited(),
                 budget: Default::default(),
                 plaintext: "synthetic-profile-test-key".to_owned(),
-                openai_client_profile_override: Some(profile.clone()),
-                xai_client_profile_override: Some(profile.clone()),
+                request_profile_overrides: BTreeMap::from([
+                    (openai.clone(), profile.clone()),
+                    (dynamic.clone(), profile.clone()),
+                ]),
             },
             &context,
         )
         .await
         .unwrap();
-    assert_eq!(record.openai_client_profile_override, Some(profile.clone()));
-    assert_eq!(record.xai_client_profile_override, Some(profile.clone()));
-    let update = |override_value| UpdateClientKey {
+    assert_eq!(
+        record.request_profile_overrides.get(&openai),
+        Some(&profile)
+    );
+    assert_eq!(
+        record.request_profile_overrides.get(&dynamic),
+        Some(&profile)
+    );
+    let update = |override_value: Option<Option<OpaqueProviderData>>| UpdateClientKey {
         id: id.clone(),
         name: "profile".to_owned(),
         label: None,
@@ -739,18 +743,22 @@ async fn key_profile_override_roundtrips_and_explicit_clear_restores_inheritance
         limits: RateLimits::unlimited(),
         daily_limit_usd: None,
         weekly_limit_usd: None,
-        openai_client_profile_override: override_value,
-        xai_client_profile_override: None,
+        request_profile_override_updates: override_value
+            .map(|profile| BTreeMap::from([(openai.clone(), profile)]))
+            .unwrap_or_default(),
     };
     let (_, unchanged) = store
         .update_client_key(update(None), &context)
         .await
         .unwrap();
     assert_eq!(
-        unchanged.openai_client_profile_override,
-        Some(profile.clone())
+        unchanged.request_profile_overrides.get(&openai),
+        Some(&profile)
     );
-    assert_eq!(unchanged.xai_client_profile_override, Some(profile.clone()));
+    assert_eq!(
+        unchanged.request_profile_overrides.get(&dynamic),
+        Some(&profile)
+    );
     let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
         .load_runtime_snapshot()
         .await
@@ -760,24 +768,31 @@ async fn key_profile_override_roundtrips_and_explicit_clear_restores_inheritance
         Some(&profile)
     );
     assert_eq!(
-        snapshot.client_api_keys[0]
-            .request_profiles
-            .get(&gateway_core::routing::ProviderKind::new("xai").unwrap()),
+        snapshot.client_api_keys[0].request_profiles.get(&dynamic),
         Some(&profile)
     );
-    let mut clear_xai = update(None);
-    clear_xai.xai_client_profile_override = Some(None);
-    let (_, cleared_xai) = store.update_client_key(clear_xai, &context).await.unwrap();
-    assert_eq!(cleared_xai.xai_client_profile_override, None);
+    let mut clear_dynamic = update(None);
+    clear_dynamic
+        .request_profile_override_updates
+        .insert(dynamic.clone(), None);
+    let (_, cleared_dynamic) = store
+        .update_client_key(clear_dynamic, &context)
+        .await
+        .unwrap();
+    assert!(
+        !cleared_dynamic
+            .request_profile_overrides
+            .contains_key(&dynamic)
+    );
     assert_eq!(
-        cleared_xai.openai_client_profile_override,
-        Some(profile.clone())
+        cleared_dynamic.request_profile_overrides.get(&openai),
+        Some(&profile)
     );
     let (_, cleared) = store
         .update_client_key(update(Some(None)), &context)
         .await
         .unwrap();
-    assert_eq!(cleared.openai_client_profile_override, None);
+    assert!(!cleared.request_profile_overrides.contains_key(&openai));
     let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
         .load_runtime_snapshot()
         .await

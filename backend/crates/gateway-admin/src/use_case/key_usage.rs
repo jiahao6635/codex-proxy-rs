@@ -37,6 +37,12 @@ pub trait KeyUsageService: Send + Sync {
     /// 验证 Key 并只读查询当前额度，不记录 Key 使用或执行推理准入。
     async fn budget(&self, plaintext: &str) -> Result<Option<ClientBudgetStatus>, AdminError>;
 
+    /// 使用 Core 已认证的宿主身份查询额度，不接收插件自报的 Key ID。
+    async fn budget_for_client(
+        &self,
+        id: &ClientApiKeyId,
+    ) -> Result<Option<ClientBudgetStatus>, AdminError>;
+
     async fn version(&self, session_id: Option<&str>) -> Result<Option<SystemVersion>, AdminError>;
 
     async fn config(&self, session_id: Option<&str>)
@@ -111,15 +117,25 @@ impl KeyUsageService for DefaultKeyUsageService {
         let id = match self.verifier.verify_client_key(plaintext) {
             Ok(id) => id,
             Err(ClientAuthenticationError::InvalidKey) => return Ok(None),
-            Err(ClientAuthenticationError::SnapshotUnavailable) => {
+            Err(
+                ClientAuthenticationError::SnapshotUnavailable
+                | ClientAuthenticationError::ProviderUnavailable,
+            ) => {
                 return Err(AdminError::new(
                     AdminErrorKind::Unavailable,
                     "密钥验证暂时不可用",
                 ));
             }
         };
+        self.budget_for_client(&id).await
+    }
+
+    async fn budget_for_client(
+        &self,
+        id: &ClientApiKeyId,
+    ) -> Result<Option<ClientBudgetStatus>, AdminError> {
         self.keys
-            .get_client_key(&id)
+            .get_client_key(id)
             .await
             .map(|key| key.filter(|key| key.enabled).map(|key| key.budget))
             .map_err(|error| map_store_error(error, "key usage budget"))

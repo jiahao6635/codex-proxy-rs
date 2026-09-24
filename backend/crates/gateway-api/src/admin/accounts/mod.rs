@@ -26,10 +26,11 @@ use gateway_admin::model::{
     },
     provider_credentials::{
         AccountDirectoryItem, AccountDirectoryPage, AccountExportBundle, AccountPersonalInfo,
-        AccountRefreshResult, AccountUsagePeriod, AuthorizationStarted, CompleteAuthorization,
-        ConsumeProviderResetCredit, CredentialDeletion, CredentialDeletionResult,
-        CredentialImportResult, CredentialMutation, CredentialMutationResult, ImportCredentials,
-        ProviderDocument, ProviderModels, ProviderProfileActivityInsights, ProviderProfileAvatar,
+        AccountRefreshResult, AccountUsagePeriod, AuthorizationPollResult, AuthorizationStarted,
+        CompleteAuthorization, ConsumeProviderResetCredit, CredentialDeletion,
+        CredentialDeletionResult, CredentialImportResult, CredentialMutation,
+        CredentialMutationResult, ImportCredentials, PollAuthorization, ProviderDocument,
+        ProviderModels, ProviderProfileActivityInsights, ProviderProfileAvatar,
         ProviderProfileDailyUsage, ProviderProfileInvocation, ProviderProfileStatistics,
         ProviderProfileStatisticsSummary, ProviderQuota, ProviderQuotaWindow, ProviderResetCredit,
         ProviderResetCreditResult, ProviderResetCredits, ProviderSubscription, RotateCredential,
@@ -56,28 +57,27 @@ const MAX_SEARCH_BYTES: usize = 256;
 const MAX_ID_BYTES: usize = 256;
 const MAX_NAME_BYTES: usize = 512;
 const MAX_IMPORT_DATA_BYTES: usize = 64 * 1024 * 1024;
-const MAX_ACCESS_TOKEN_BYTES: usize = 16 * 1024;
-const MAX_REFRESH_TOKEN_BYTES: usize = 64 * 1024;
-const MAX_ID_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_CALLBACK_URL_BYTES: usize = 64 * 1024;
 const MAX_ACCOUNT_DELETE_BATCH: usize = 200;
 const MAX_ACCOUNT_GROUP_BATCH: usize = 1000;
 const MAX_AVATAR_VERSION_BYTES: usize = 32;
 
+mod capabilities;
 mod credentials;
 mod handlers;
 mod import_tasks;
 mod presenter;
 mod wire;
 
+pub use capabilities::*;
 pub use credentials::*;
 pub use handlers::{profile_avatar_response, router};
 pub(super) use presenter::quota_window_view;
 pub use wire::*;
 
 use credentials::{
-    AccountProvider, parse_account_weight, parse_concurrency_limit, provider_document_value,
-    require_account_id, validate_wire_group_ids,
+    parse_account_weight, parse_concurrency_limit, provider_document_value, require_account_id,
+    validate_wire_group_ids,
 };
 use presenter::*;
 use wire::BatchUpdatedAccountsData;

@@ -8,10 +8,12 @@ pub(super) struct GrokStreamAttempt {
     pub(super) credential_recovery: Arc<dyn GrokCredentialRecovery>,
     pub(super) responses_url: Url,
     pub(super) request: GrokResponsesRequest,
+    pub(super) middleware_headers: Vec<MiddlewareHeader>,
     pub(super) upstream_model: UpstreamModelId,
     pub(super) context: AttemptContext,
     pub(super) session: Arc<SelectedGrokSession>,
     pub(super) output_started_at: Instant,
+    pub(super) native_response_boundary: bool,
     pub(super) session_capture: Option<GrokSessionCapture>,
     pub(super) reasoning_replay_capture: Option<GrokReasoningReplayCapture>,
 }
@@ -22,12 +24,38 @@ pub(super) struct GrokCompactionStreamAttempt {
     pub(super) credential_recovery: Arc<dyn GrokCredentialRecovery>,
     pub(super) responses_url: Url,
     pub(super) request: GrokCompactionRequest,
+    pub(super) middleware_headers: Vec<MiddlewareHeader>,
     pub(super) upstream_model: UpstreamModelId,
     pub(super) upstream_session_id: Option<String>,
     pub(super) context: AttemptContext,
     pub(super) session: Arc<SelectedGrokSession>,
     pub(super) reasoning_replay: GrokReasoningReplay,
     pub(super) reasoning_replay_key: Option<GrokReasoningReplayKey>,
+}
+
+fn append_middleware_grok_headers(
+    target: &mut Vec<crate::transport::GrokHeader>,
+    headers: &[MiddlewareHeader],
+) -> Result<(), ProviderError> {
+    let provider_header_count = target.len();
+    for header in headers {
+        if target[..provider_header_count]
+            .iter()
+            .any(|existing| existing.name().eq_ignore_ascii_case(header.name()))
+        {
+            return Err(provider_error(
+                ProviderErrorKind::Protocol,
+                UpstreamSendState::NotSent,
+            ));
+        }
+        let value = std::str::from_utf8(header.value())
+            .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
+        target.push(crate::transport::GrokHeader::public(
+            header.name().to_owned(),
+            value.to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) struct AcceptedGrokInference {
@@ -83,6 +111,7 @@ pub(super) fn cold_compaction_http_sse_stream(
         credential_recovery,
         responses_url,
         mut request,
+        middleware_headers,
         upstream_model,
         upstream_session_id,
         context,
@@ -91,7 +120,7 @@ pub(super) fn cold_compaction_http_sse_stream(
         reasoning_replay_key,
     } = attempt;
     Box::pin(async_stream::try_stream! {
-        let headers = build_grok_headers(
+        let mut headers = build_grok_headers(
             &wire_profile,
             &session,
             &client_identity,
@@ -100,6 +129,7 @@ pub(super) fn cold_compaction_http_sse_stream(
             None,
             &upstream_model,
         );
+        append_middleware_grok_headers(&mut headers, &middleware_headers)?;
         let mut invalid_encrypted_content_retried = false;
         let accepted = loop {
             if context.cancellation().is_cancelled() {
@@ -381,10 +411,12 @@ pub(super) fn cold_http_sse_stream(
         credential_recovery,
         responses_url,
         mut request,
+        middleware_headers,
         upstream_model,
         context,
         session,
         output_started_at,
+        native_response_boundary,
         mut session_capture,
         mut reasoning_replay_capture,
     } = attempt;
@@ -395,7 +427,7 @@ pub(super) fn cold_http_sse_stream(
                 UpstreamSendState::NotSent,
             ))?;
         }
-        let headers = build_grok_headers(
+        let mut headers = build_grok_headers(
             &wire_profile,
             &session,
             &client_identity,
@@ -404,6 +436,7 @@ pub(super) fn cold_http_sse_stream(
             None,
             &upstream_model,
         );
+        append_middleware_grok_headers(&mut headers, &middleware_headers)?;
         let cancellation = context.cancellation().clone();
         let mut invalid_encrypted_content_retried = false;
         let response = loop {
@@ -510,7 +543,13 @@ pub(super) fn cold_http_sse_stream(
             let Some(chunk) = next else {
                 break;
             };
-            let mut events = match decoder.push(&chunk) {
+            let (mut events, mut projected_events) = match if native_response_boundary {
+                decoder
+                    .push_before_translation(&chunk)
+                    .map(|batch| (batch.source_events, Some(batch.projected_events)))
+            } else {
+                decoder.push(&chunk).map(|events| (events, None))
+            } {
                 Ok(events) => events,
                 Err(error) => {
                     let error = map_continuation_failure(&context, error);
@@ -560,10 +599,12 @@ pub(super) fn cold_http_sse_stream(
                 .iter()
                 .flat_map(ProviderEvent::canonical_facts)
                 .any(|event| matches!(event, GatewayEvent::Completed(_)));
-            attach_xai_session_update(&mut events, &mut session_capture)?;
-            if let Some(capture) = reasoning_replay_capture.as_mut() {
-                capture.observe(&events);
-            }
+            attach_grok_response_state(
+                &mut events,
+                projected_events.as_deref_mut(),
+                &mut session_capture,
+                &mut reasoning_replay_capture,
+            )?;
             if completed && session.allows_account_state_mutation() {
                 selector.record_success(&session).await;
             }
@@ -575,7 +616,13 @@ pub(super) fn cold_http_sse_stream(
                 return;
             }
         }
-        let mut final_events = match decoder.finish() {
+        let (mut final_events, mut projected_events) = match if native_response_boundary {
+            decoder
+                .finish_before_translation()
+                .map(|batch| (batch.source_events, Some(batch.projected_events)))
+        } else {
+            decoder.finish().map(|events| (events, None))
+        } {
             Ok(events) => events,
             Err(error) => {
                 let error = map_continuation_failure(&context, error);
@@ -624,10 +671,12 @@ pub(super) fn cold_http_sse_stream(
                 ProviderResponseTimings { first_token_ms, ..base_timings },
             ));
         }
-        attach_xai_session_update(&mut final_events, &mut session_capture)?;
-        if let Some(capture) = reasoning_replay_capture.as_mut() {
-            capture.observe(&final_events);
-        }
+        attach_grok_response_state(
+            &mut final_events,
+            projected_events.as_deref_mut(),
+            &mut session_capture,
+            &mut reasoning_replay_capture,
+        )?;
         if completed && session.allows_account_state_mutation() {
             selector.record_success(&session).await;
         }
@@ -636,4 +685,41 @@ pub(super) fn cold_http_sse_stream(
             yield event;
         }
     })
+}
+
+fn attach_grok_response_state(
+    delivery_events: &mut [ProviderEvent],
+    projected_events: Option<&mut [ProviderEvent]>,
+    session_capture: &mut Option<GrokSessionCapture>,
+    reasoning_replay_capture: &mut Option<GrokReasoningReplayCapture>,
+) -> Result<(), ProviderError> {
+    let Some(projected_events) = projected_events else {
+        attach_xai_session_update(delivery_events, session_capture)?;
+        if let Some(capture) = reasoning_replay_capture.as_mut() {
+            capture.observe(delivery_events);
+        }
+        return Ok(());
+    };
+
+    attach_xai_session_update(projected_events, session_capture)?;
+    if let Some(capture) = reasoning_replay_capture.as_mut() {
+        capture.observe(projected_events);
+    }
+    let Some(state) = projected_events
+        .iter_mut()
+        .find_map(ProviderEvent::take_session_update)
+    else {
+        return Ok(());
+    };
+    let terminal = delivery_events
+        .iter_mut()
+        .find(|event| {
+            event
+                .canonical_facts()
+                .iter()
+                .any(|fact| matches!(fact, GatewayEvent::Completed(_)))
+        })
+        .ok_or_else(protocol_sent)?;
+    terminal.attach_session_update(state);
+    Ok(())
 }

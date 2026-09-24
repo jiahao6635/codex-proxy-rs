@@ -1,11 +1,10 @@
 <script setup lang="ts">
 import type { HealthTimeline, HealthTimelinePoint } from '../constants'
+import { BaseCard, BasePopover } from '@codex-proxy/ui'
+
 import { usePreferredReducedMotion } from '@vueuse/core'
 import { gsap } from 'gsap'
-
 import { computed, onBeforeUnmount, shallowRef, useTemplateRef, watch } from 'vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BasePopover from '@/components/base/BasePopover.vue'
 import { formatHealthCount, healthLegend, healthReliabilityValueClass, healthStatusMeta } from '../constants'
 import HealthTimelinePointPopover from './HealthTimelinePointPopover.vue'
 

@@ -142,6 +142,22 @@ fn corresponding_actual_window_takes_priority_and_retains_its_duration() {
 }
 
 #[test]
+fn source_selection_keeps_provider_order_with_the_maximum_window_count() {
+    let windows = (0..64)
+        .map(|index| {
+            if index % 2 == 0 {
+                window(&format!("week-{index}"), 7)
+            } else {
+                window(&format!("month-{index}"), 30)
+            }
+        })
+        .collect();
+    let [week, month] = forecast(&quota(windows));
+    assert_eq!(week.source.unwrap().label, "week-0");
+    assert_eq!(month.source.unwrap().label, "month-1");
+}
+
+#[test]
 fn short_or_model_specific_windows_are_not_account_capacity() {
     let mut model = window("model", 7);
     model.local_usage_attribution = QuotaLocalUsageAttribution::Unavailable;

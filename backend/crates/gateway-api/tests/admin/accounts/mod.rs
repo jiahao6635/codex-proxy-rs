@@ -1,3 +1,4 @@
+mod capabilities;
 mod handlers;
 mod import_tasks;
 mod presenter;
@@ -77,6 +78,34 @@ mod query {
     use gateway_admin::model::accounts::{AccountSortField, AccountStatus, SortDirection};
     use gateway_api::admin::accounts::ListQuery;
     use serde_json::json;
+
+    #[test]
+    fn account_query_should_filter_every_explicit_provider_id_literally() {
+        for provider in ["all", "ALL", "example"] {
+            let query: ListQuery = serde_json::from_value(json!({ "provider": provider })).unwrap();
+            assert_eq!(
+                query
+                    .validate()
+                    .unwrap()
+                    .provider_kind
+                    .as_ref()
+                    .map(|kind| kind.as_str()),
+                Some(provider)
+            );
+        }
+    }
+
+    #[test]
+    fn account_query_should_only_omit_empty_provider_filters() {
+        for value in [
+            json!({}),
+            json!({ "provider": "" }),
+            json!({ "provider": "  " }),
+        ] {
+            let query: ListQuery = serde_json::from_value(value).unwrap();
+            assert!(query.validate().unwrap().provider_kind.is_none());
+        }
+    }
 
     #[test]
     fn account_query_should_parse_provider_status_and_sort_once() {
@@ -501,7 +530,7 @@ mod actions {
         AccountDeletionRequest, AccountExportData, AccountExportQuery, AccountIdQuery,
         AccountImportData, AccountImportRequest, AccountMutationData, AccountRefreshRequest,
         AccountResetCreditConsumeRequest, AccountTestQuery, CompleteAccountAuthorizationRequest,
-        RotateAccountRequest, StartAccountAuthorizationRequest,
+        StartAccountAuthorizationRequest, UpdateAccountRequest,
     };
     use gateway_core::{
         account::ProviderAccountId, engine::probe::AccountProbeErrorSource,
@@ -601,41 +630,79 @@ mod actions {
     }
 
     #[test]
-    fn api_key_rotation_settings_must_target_the_same_account_and_remain_valid() {
+    fn account_update_validates_connection_and_settings_together() {
         let mut request = json!({
-            "provider": "openai",
             "accountId": "acct_api",
-            "baseUrl": "https://api.example.invalid/v1",
-            "transport": "http",
-            "settings": {
-                "accountId": "acct_api",
-                "enabled": true,
-                "concurrencyLimit": null,
-                "weight": 1,
-                "groupIds": []
-            }
+            "connection": {
+                "baseUrl": "https://api.example.invalid/v1",
+                "transport": "http"
+            },
+            "enabled": true,
+            "concurrencyLimit": null,
+            "weight": 1,
+            "groupIds": []
         });
-        serde_json::from_value::<RotateAccountRequest>(request.clone())
+        serde_json::from_value::<UpdateAccountRequest>(request.clone())
             .expect("decode combined save")
             .validate()
-            .expect("blank replacement key preserves the existing key");
-        request["settings"]["accountId"] = json!("acct_other");
+            .expect("omitted replacement key preserves the existing key");
+        request["connection"]["apiKey"] = json!("");
         assert_eq!(
-            serde_json::from_value::<RotateAccountRequest>(request.clone())
+            serde_json::from_value::<UpdateAccountRequest>(request.clone())
                 .unwrap()
                 .validate()
                 .unwrap_err()
                 .field(),
-            "settings.accountId"
+            "connection.apiKey"
         );
-        request["settings"]["accountId"] = json!("acct_api");
-        request["settings"]["concurrencyLimit"] = json!(0);
+        request["connection"]["apiKey"] = json!("test-replacement-key");
+        request["concurrencyLimit"] = json!(0);
         assert!(
-            serde_json::from_value::<RotateAccountRequest>(request)
+            serde_json::from_value::<UpdateAccountRequest>(request)
                 .unwrap()
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn account_connection_update_rejects_invalid_fields_and_generic_credentials() {
+        let request = json!({
+            "accountId": "acct_api",
+            "enabled": true,
+            "concurrencyLimit": null,
+            "weight": 1,
+            "groupIds": [],
+            "connection": {"baseUrl": "https://api.example.invalid/v1", "transport": "http"}
+        });
+        for (field, value, expected) in [
+            ("baseUrl", "", "connection.baseUrl"),
+            ("transport", "websocket", "connection.transport"),
+            ("apiKey", "invalid key", "connection.apiKey"),
+        ] {
+            let mut invalid = request.clone();
+            invalid["connection"][field] = json!(value);
+            assert_eq!(
+                serde_json::from_value::<UpdateAccountRequest>(invalid)
+                    .unwrap()
+                    .validate()
+                    .unwrap_err()
+                    .field(),
+                expected
+            );
+        }
+        for field in [
+            "accountId",
+            "provider",
+            "accessToken",
+            "refreshToken",
+            "data",
+            "expectedCredentialRevision",
+        ] {
+            let mut invalid = request.clone();
+            invalid["connection"][field] = json!("unsupported");
+            assert!(serde_json::from_value::<UpdateAccountRequest>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -653,25 +720,6 @@ mod actions {
                 "name": "reauthorize",
                 "accountId": "acct_1",
                 "expectedCredentialRevision": 1
-            }))
-            .is_err()
-        );
-
-        let rotation: RotateAccountRequest = serde_json::from_value(json!({
-            "provider": "openai",
-            "accountId": "acct_1",
-            "accessToken": "header.payload.signature",
-            "refreshToken": "refresh-token",
-            "idToken": "id-header.id-payload.id-signature"
-        }))
-        .expect("decode rotation");
-        assert!(rotation.validate().is_ok());
-        assert!(
-            serde_json::from_value::<RotateAccountRequest>(json!({
-                "provider": "openai",
-                "accountId": "acct_1",
-                "expectedCredentialRevision": 1,
-                "accessToken": "header.payload.signature"
             }))
             .is_err()
         );

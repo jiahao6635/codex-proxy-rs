@@ -11,10 +11,13 @@ use syn::{Item, visit::Visit};
 /// workspace 成员冻结清单;新增 crate 必须同步扩展本文件的依赖规则。
 pub(super) const WORKSPACE_MEMBERS: &[&str] = &[
     "apps/gateway",
+    "apps/plugin-cli",
     "crates/gateway-admin",
     "crates/gateway-api",
     "crates/gateway-core",
     "crates/gateway-host",
+    "crates/gateway-plugin/runtime",
+    "crates/gateway-plugin/sdk",
     "crates/gateway-protocol",
     "crates/gateway-store",
     "crates/providers/openai",
@@ -150,6 +153,13 @@ fn gateway_protocol_has_no_workspace_dependencies() {
 }
 
 #[test]
+fn plugin_sdk_has_no_workspace_dependencies() {
+    for name in dependency_names("crates/gateway-plugin/sdk") {
+        assert!(!name.starts_with("gateway-") && !name.starts_with("provider-"));
+    }
+}
+
+#[test]
 fn provider_crates_do_not_depend_on_each_other() {
     assert_no_dependency("crates/providers/openai", &["provider-xai"]);
     assert_no_dependency("crates/providers/xai", &["provider-openai"]);
@@ -166,25 +176,34 @@ fn gateway_admin_stays_free_of_infrastructure_dependencies() {
 /// workspace 包名到冻结成员路径的映射。
 const PACKAGE_TO_MEMBER: &[(&str, &str)] = &[
     ("codex-proxy-rs", "apps/gateway"),
+    ("codex-proxy-plugin-cli", "apps/plugin-cli"),
     ("gateway-admin", "crates/gateway-admin"),
     ("gateway-api", "crates/gateway-api"),
     ("gateway-core", "crates/gateway-core"),
     ("gateway-host", "crates/gateway-host"),
+    ("gateway-plugin-runtime", "crates/gateway-plugin/runtime"),
+    ("gateway-plugin-sdk", "crates/gateway-plugin/sdk"),
     ("gateway-protocol", "crates/gateway-protocol"),
     ("gateway-store", "crates/gateway-store"),
     ("provider-openai", "crates/providers/openai"),
     ("provider-xai", "crates/providers/xai"),
 ];
 
-/// Adapter/provider 根门面的稳定合同模块；任何增减都必须同步完成边界审计。
+/// SDK 与 Adapter/provider 根门面的稳定合同模块；任何增减都必须同步完成边界审计。
 const ADAPTER_PUBLIC_MODULES: &[(&str, &[&str])] = &[
+    ("crates/gateway-plugin/sdk", &["call", "client"]),
+    ("crates/gateway-plugin/runtime", &[]),
     ("crates/gateway-api", &["admin", "auth", "openai"]),
     (
         "crates/gateway-host",
         &[
             "client_distribution",
             "config",
+            "outbound",
+            "official_plugins",
             "pricing",
+            "plugin_distribution",
+            "process",
             "proxy_probe",
             "serve",
             "system_update",
@@ -207,10 +226,12 @@ const ROOT_TEST_SCENARIOS: &[(&str, &[&str])] = &[
 
 /// 冻结的 workspace 内部运行时依赖边；新增/删除任何边都必须同步本表。
 const ALLOWED_INTERNAL_EDGES: &[(&str, &str)] = &[
+    ("codex-proxy-plugin-cli", "gateway-plugin-sdk"),
     ("codex-proxy-rs", "gateway-admin"),
     ("codex-proxy-rs", "gateway-api"),
     ("codex-proxy-rs", "gateway-core"),
     ("codex-proxy-rs", "gateway-host"),
+    ("codex-proxy-rs", "gateway-plugin-runtime"),
     ("codex-proxy-rs", "gateway-store"),
     ("codex-proxy-rs", "provider-openai"),
     ("codex-proxy-rs", "provider-xai"),
@@ -220,6 +241,11 @@ const ALLOWED_INTERNAL_EDGES: &[(&str, &str)] = &[
     ("gateway-api", "gateway-protocol"),
     ("gateway-host", "gateway-admin"),
     ("gateway-host", "gateway-core"),
+    ("gateway-plugin-runtime", "gateway-host"),
+    ("gateway-plugin-runtime", "gateway-core"),
+    ("gateway-plugin-runtime", "gateway-admin"),
+    ("gateway-plugin-runtime", "gateway-plugin-sdk"),
+    ("gateway-plugin-runtime", "gateway-protocol"),
     ("gateway-store", "gateway-admin"),
     ("gateway-store", "gateway-core"),
     ("provider-openai", "gateway-admin"),
@@ -349,13 +375,18 @@ fn production_sources_do_not_host_tests() {
 
 #[test]
 fn workspace_modules_follow_conventional_file_layout() {
+    let targets = test_source_roots();
     for member in WORKSPACE_MEMBERS {
         let member_root = backend_root().join(member);
         assert_module_tree(&member_root.join("src"), &["lib.rs", "main.rs"]);
 
         let tests = member_root.join("tests");
         if tests.is_dir() {
-            assert_module_tree(&tests, &["main.rs"]);
+            let roots = targets.get(&tests).expect("Cargo test source roots");
+            assert_module_tree(
+                &tests,
+                &roots.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
         }
     }
 }
@@ -368,6 +399,7 @@ enum ModuleLayout {
 
 #[test]
 fn integration_tests_mirror_production_module_tree() {
+    let targets = test_source_roots();
     for member in WORKSPACE_MEMBERS {
         let member_root = backend_root().join(member);
         let tests_root = member_root.join("tests");
@@ -376,9 +408,13 @@ fn integration_tests_mirror_production_module_tree() {
         }
 
         let production = module_layouts(&member_root.join("src"), &["lib.rs", "main.rs"]);
-        let tests = module_layouts(&tests_root, &["main.rs"]);
+        let roots = targets.get(&tests_root).expect("Cargo test source roots");
+        let tests = module_layouts(
+            &tests_root,
+            &roots.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
         for (module, test_layout) in tests {
-            if module == Path::new("support") {
+            if module.starts_with("support") {
                 continue;
             }
 
@@ -406,6 +442,28 @@ fn integration_tests_mirror_production_module_tree() {
             );
         }
     }
+}
+
+/// Rust 子进程 fixture 是 Cargo 的独立 crate 根，不能要求它由测试模块再次声明。
+fn test_source_roots() -> BTreeMap<PathBuf, Vec<String>> {
+    let metadata = cargo_metadata_json();
+    let mut roots = BTreeMap::<PathBuf, Vec<String>>::new();
+    for package in metadata["packages"].as_array().expect("Cargo packages") {
+        let root = Path::new(package["manifest_path"].as_str().expect("package manifest"))
+            .parent()
+            .expect("package directory")
+            .join("tests");
+        for target in package["targets"].as_array().expect("Cargo targets") {
+            let source = Path::new(target["src_path"].as_str().expect("target source"));
+            if let Ok(relative) = source.strip_prefix(&root) {
+                roots
+                    .entry(root.clone())
+                    .or_default()
+                    .push(relative.to_str().expect("UTF-8 source path").to_owned());
+            }
+        }
+    }
+    roots
 }
 
 fn module_layouts(root: &Path, crate_roots: &[&str]) -> BTreeMap<PathBuf, ModuleLayout> {

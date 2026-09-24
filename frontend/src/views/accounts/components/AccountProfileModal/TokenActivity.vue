@@ -1,10 +1,9 @@
 <script setup lang="ts">
 import type { ProfileActivityLevel, ProfileActivityMode } from '../../utils/accountProfileStatistics'
 import type { AccountProfileDailyUsage } from '@/api'
-import { computed, shallowRef } from 'vue'
+import { BaseEmpty, BaseSegmented } from '@codex-proxy/ui'
 
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
+import { computed, shallowRef } from 'vue'
 import { buildProfileActivityGrid, profileActivityCellLabel } from '../../utils/accountProfileStatistics'
 
 const props = defineProps<{

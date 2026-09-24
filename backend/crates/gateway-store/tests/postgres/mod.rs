@@ -21,6 +21,7 @@ mod execution_buffer;
 mod health;
 mod observability;
 mod ops_events;
+mod plugins;
 mod pricing;
 mod provider_accounts;
 mod proxies;
@@ -58,6 +59,10 @@ pub(super) fn admin_account_store(pool: &PgPool) -> PgAdminAccountStore {
 
 impl TestDatabase {
     pub(super) async fn create(label: &str) -> Option<Self> {
+        Self::create_through(label, i64::MAX).await
+    }
+
+    pub(super) async fn create_through(label: &str, migration_version: i64) -> Option<Self> {
         let database_url = crate::support::test_env("CPR_TEST_DATABASE_URL")?;
         let schema = format!("cpr_store_{label}_{}", Uuid::new_v4().simple());
         let admin = PgPoolOptions::new()
@@ -86,7 +91,7 @@ impl TestDatabase {
             .await
             .expect("connect isolated test schema");
         TEST_MIGRATOR
-            .run(&pool)
+            .run_to(migration_version, &pool)
             .await
             .expect("apply test migrations");
         Some(Self {
@@ -229,6 +234,7 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
             "account_groups",
             "admin_audit_events",
             "admin_users",
+            "authorization_receipts",
             "backup_records",
             "backup_settings",
             "client_api_key_groups",
@@ -238,6 +244,15 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
             "model_requests",
             "ops_events",
             "outbound_proxies",
+            "plugin_artifact_credentials",
+            "plugin_artifact_platforms",
+            "plugin_artifacts",
+            "plugin_instance_secrets",
+            "plugin_instances",
+            "plugin_source_credentials",
+            "plugin_state_generations",
+            "plugin_state_records",
+            "plugin_update_sources",
             "provider_accounts",
             "runtime_settings",
         ]

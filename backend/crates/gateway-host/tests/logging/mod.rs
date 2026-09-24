@@ -152,6 +152,48 @@ fn sensitive_file_logging_is_separate_and_overrides_global_log_level() {
 }
 
 #[test]
+fn shutdown_logs_remain_visible_on_stdout_with_file_logging_enabled() {
+    const MARKER: &str = "shutdown-reason-test";
+    if env::var_os(CHILD_PROCESS_ENV).is_some() {
+        let mut config = logging_config(
+            PathBuf::from(env::var_os(LOG_DIRECTORY_ENV).unwrap()),
+            false,
+        );
+        config.logging.stdout = true;
+        with_logging(config, || {
+            tracing::info!(target: "gateway_shutdown", reason = "sigterm", marker = MARKER);
+            tracing::info!(target: APPLICATION_LOG_TARGET, marker = APPLICATION_LOG_MARKER);
+        });
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "logging::shutdown_logs_remain_visible_on_stdout_with_file_logging_enabled",
+            "--nocapture",
+        ])
+        .env(CHILD_PROCESS_ENV, "1")
+        .env(LOG_DIRECTORY_ENV, directory.path())
+        .env("RUST_LOG", "info")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(MARKER));
+    assert!(stdout.contains("sigterm"));
+    assert!(!stdout.contains(APPLICATION_LOG_MARKER));
+    let application_log = read_log_file_set(directory.path(), APPLICATION_LOG_FILE_PREFIX);
+    assert!(application_log.contains(MARKER));
+    assert!(application_log.contains(APPLICATION_LOG_MARKER));
+}
+
+#[test]
 fn oauth_recovery_switch_controls_only_its_dedicated_file() {
     const OAUTH_ENABLED_ENV: &str = "CPR_LOGGING_TEST_OAUTH_ENABLED";
     const APPLICATION_ENABLED_ENV: &str = "CPR_LOGGING_TEST_APPLICATION_ENABLED";

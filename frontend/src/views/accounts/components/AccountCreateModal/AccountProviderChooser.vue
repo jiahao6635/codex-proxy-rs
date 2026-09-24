@@ -1,57 +1,50 @@
 <script setup lang="ts">
-import type { AccountCreateProvider } from './model'
-import { Openai, Xai } from '@boxicons/vue'
+import type { AccountCreateSource } from './model'
+import type { AccountProvider } from '@/api'
+import { BaseSegmented } from '@codex-proxy/ui'
 import { LayoutGrid } from '@lucide/vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import { PROVIDER_DISPLAY_NAMES } from '@/utils/providers'
+import { computed } from 'vue'
+import { formatProviderLabel, providerIcon } from '@/utils/providers'
 
-withDefaults(
-  defineProps<{
-    disabled?: boolean
-    selected?: AccountCreateProvider | ''
-  }>(),
-  {
-    disabled: false,
-  },
-)
-
-const emit = defineEmits<{
-  select: [provider: 'openai' | 'xai' | 'batch']
+const props = defineProps<{
+  providers: AccountProvider[]
+  disabled: boolean
 }>()
+const source = defineModel<AccountCreateSource | null>({ required: true })
 
-const providers = [
-  {
-    value: 'batch' as const,
-    label: '批量导入',
-    icon: LayoutGrid,
+const options = computed(() => [
+  ...(props.providers.some(provider => provider.credentials.import)
+    ? [{ value: 'bundle', label: '批量导入', icon: LayoutGrid }]
+    : []),
+  ...props.providers
+    .filter(provider => provider.credentials.import || provider.credentials.login)
+    .map(provider => ({
+      value: `provider:${provider.provider}`,
+      label: formatProviderLabel(provider.provider),
+      icon: providerIcon(provider.provider),
+    })),
+])
+const selected = computed({
+  get: () => source.value?.kind === 'provider' ? `provider:${source.value.id}` : source.value?.kind ?? '',
+  set: (value: string) => {
+    if (!options.value.some(option => option.value === value))
+      return
+    source.value = value === 'bundle' ? { kind: 'bundle' } : { kind: 'provider', id: value.slice('provider:'.length) }
   },
-  {
-    value: 'openai' as const,
-    label: PROVIDER_DISPLAY_NAMES.openai,
-    icon: Openai,
-  },
-  {
-    value: 'xai' as const,
-    label: PROVIDER_DISPLAY_NAMES.xai,
-    icon: Xai,
-  },
-]
-
-function selectProvider(value: string) {
-  const provider = providers.find(provider => provider.value === value)
-  if (provider)
-    emit('select', provider.value)
-}
+})
 </script>
 
 <template>
   <BaseSegmented
-    :model-value="selected ?? ''"
+    v-if="options.length"
+    v-model="selected"
+    class="w-full"
     label="选择账号平台"
-    :options="providers"
+    :options="options"
     :disabled="disabled"
     size="lg"
-    class="w-full"
-    @update:model-value="selectProvider"
   />
+  <p v-else class="m-0 text-cp-sm text-cp-text-tertiary">
+    暂无可录入账号的平台
+  </p>
 </template>

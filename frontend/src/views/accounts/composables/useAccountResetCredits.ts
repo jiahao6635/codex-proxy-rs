@@ -1,12 +1,12 @@
 import type { AccountResetCredit } from '@/api'
+import { toast } from '@codex-proxy/ui'
 import { computed, shallowReactive, shallowRef, watch } from 'vue'
+
 import {
   consumeAccountResetCredit,
   getAccountResetCredits,
 } from '@/api'
-
 import { ApiError } from '@/api/request'
-import { toast } from '@/components/base/BaseToast'
 import { errorMessage } from '@/utils/async'
 import { generateRequestId } from '@/utils/uuid'
 
@@ -83,6 +83,7 @@ async function loadSessionCredits(session: ResetCreditsSession, silent = false) 
 export function useAccountResetCredits(options: {
   accountId: () => string
   onConsumed: (accountId: string) => void
+  capabilities: () => { consumeResetCredit: boolean }
 }) {
   const session = shallowRef(getResetCreditsSession(options.accountId()))
   const credits = computed(() => session.value.snapshot?.credits ?? [])
@@ -110,7 +111,7 @@ export function useAccountResetCredits(options: {
     && (selectedCredit.value !== undefined || availableCredits.value.length === 0),
   )
   const canRequestConsume = computed(() =>
-    ambiguous.value || canStartConsume.value,
+    options.capabilities().consumeResetCredit && (ambiguous.value || canStartConsume.value),
   )
 
   function reconcileSelectedCredit() {
@@ -160,7 +161,7 @@ export function useAccountResetCredits(options: {
 
   async function confirmConsume(): Promise<boolean> {
     const target = session.value
-    if (!showConfirm.value || target.consuming || target.loading)
+    if (!options.capabilities().consumeResetCredit || !showConfirm.value || target.consuming || target.loading)
       return false
 
     const credit = selectedCredit.value

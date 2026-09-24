@@ -12,6 +12,7 @@ use crate::transport::profile::CodexWireProfileState;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::{Stream, StreamExt};
+use gateway_core::engine::middleware::MiddlewareHeader;
 use gateway_protocol::openai::{
     WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY, events::retry_after_seconds_from_body,
     sse::SseError,
@@ -212,6 +213,9 @@ pub enum CodexClientError {
     /// 请求头值无效。
     #[error("invalid request header value: {0}")]
     InvalidHeaderValue(#[from] reqwest::header::InvalidHeaderValue),
+    /// 中间件业务头试图覆盖 Provider 已构造的受管头。
+    #[error("middleware request header conflicts with a provider-managed header")]
+    MiddlewareHeaderConflict,
     /// SSE 响应解析失败。
     #[error("invalid upstream SSE response: {0}")]
     InvalidSse(#[from] SseError),
@@ -281,6 +285,9 @@ impl fmt::Debug for CodexClientError {
             Self::InvalidHeaderValue(_) => {
                 formatter.write_str("CodexClientError::InvalidHeaderValue([REDACTED])")
             }
+            Self::MiddlewareHeaderConflict => {
+                formatter.write_str("CodexClientError::MiddlewareHeaderConflict")
+            }
             Self::InvalidSse(_) => formatter.write_str("CodexClientError::InvalidSse([REDACTED])"),
             Self::ModelCatalog(error) => formatter
                 .debug_tuple("CodexClientError::ModelCatalog")
@@ -334,6 +341,7 @@ impl CodexClientError {
             Self::CustomCa(_)
             | Self::InvalidHeaderName(_)
             | Self::InvalidHeaderValue(_)
+            | Self::MiddlewareHeaderConflict
             | Self::WebSocketEncode(_)
             | Self::RequestBodyEncode(_)
             | Self::RequestCompression(_) => None,
@@ -671,6 +679,7 @@ pub struct CodexBackendClient {
     pub(super) websocket_origin_key: String,
     pub(super) outbound_proxy: Option<gateway_core::account::OutboundProxy>,
     pub(super) egress_key: String,
+    pub(super) middleware_headers: Vec<MiddlewareHeader>,
 }
 
 impl CodexBackendClient {

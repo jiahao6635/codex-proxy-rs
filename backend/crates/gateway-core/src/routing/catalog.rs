@@ -113,12 +113,20 @@ pub struct ProviderCatalogUnavailable;
 
 /// 快照编译与对账使用的对象安全目录端口。
 pub trait ProviderCatalogPort: Send + Sync {
+    /// 动态目录返回对应集合的冻结视图；静态目录继续使用自身。
+    fn for_extensions(
+        &self,
+        _reference: Option<&crate::runtime::extensions::ExtensionSetReference>,
+    ) -> Result<Option<std::sync::Arc<dyn ProviderCatalogPort>>, ProviderCatalogUnavailable> {
+        Ok(None)
+    }
+
     /// 目录是否完整到足以根据缺项拒绝请求；发现型目录交由上游验证模型名。
     fn model_catalog_is_exhaustive(&self, _provider: &ProviderKind) -> bool {
         true
     }
 
-    /// 返回全部已注册 Provider 的目录代次；注册集合在初始化后保持不变。
+    /// 返回当前冻结视图内全部 Provider 的目录代次。
     ///
     /// 即使某个目录暂时不可读，也必须保留它的 Provider 与最近成功发布的代次。
     fn catalog_generations(&self) -> BTreeMap<ProviderKind, ProviderCatalogGeneration>;

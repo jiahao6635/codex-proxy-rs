@@ -1,4 +1,4 @@
-import type { BaseTableSort } from '@/components/base/BaseTable/columns'
+import type { BaseTableSort } from '@codex-proxy/ui'
 import { watchDebounced } from '@vueuse/core'
 
 import { computed, onMounted, shallowRef, watch } from 'vue'
@@ -10,6 +10,7 @@ type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
 export function useAccountsQuery() {
   const searchQuery = shallowRef('')
   const providerQuery = shallowRef('')
+  const providers = shallowRef<string[]>([])
   const statusQuery = shallowRef('')
   const groupQuery = shallowRef('')
   const sort = shallowRef<BaseTableSort>()
@@ -37,6 +38,7 @@ export function useAccountsQuery() {
       }, options),
     onSuccess: (result) => {
       accountSummary.value = result.summary
+      providers.value = result.providers
     },
   })
 
@@ -102,6 +104,7 @@ export function useAccountsQuery() {
     refreshAccountsSilently: () => query.execute({ silent: true }),
     searchQuery,
     providerQuery,
+    providers,
     statusQuery,
     groupQuery,
     sort,

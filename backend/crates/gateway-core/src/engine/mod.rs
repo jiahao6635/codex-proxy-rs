@@ -1,11 +1,16 @@
 //! 模型请求生命周期、单行持久化 port 与 commit/send/cancellation 边界。
 
 pub mod admission;
+pub mod authentication;
 pub mod budget;
 pub mod continuation;
 pub mod coordinator;
 pub mod execution;
-mod observation;
+pub mod extensions;
+pub mod middleware;
+pub mod nested;
+pub mod observation;
+pub mod policy;
 pub mod probe;
 pub mod provider;
 
@@ -21,7 +26,10 @@ use std::time::{Duration, Instant, SystemTime};
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::account::{AccountSelectionPolicy, ProviderAccountId};
+use crate::account::{
+    AccountCandidate, AccountSelection, AccountSelectionContext, AccountSelectionPolicy,
+    ProviderAccountId,
+};
 use crate::engine::continuation::{ContinuationBinding, NativeContinuationPin};
 use crate::error::{
     GatewayError, ProviderConnectionObservation, ProviderError, ProviderErrorKind, StoreError,
@@ -323,6 +331,13 @@ pub struct RequestAttemptContext {
     timing_started_at: Instant,
     trace: crate::diagnostics::TraceContext,
     concurrency_wait_budget: crate::concurrency::ConcurrencyWaitBudget,
+    request_policy: Option<policy::RequestPolicyContext>,
+    execution_effects: Option<Arc<nested::ExecutionEffects>>,
+    middleware: Option<middleware::FrozenMiddlewarePlan>,
+    account_group_ids: Arc<[crate::account::scope::AccountGroupId]>,
+    endpoint: String,
+    client_transport: execution::ClientTransport,
+    extension_scope: extensions::ExtensionCallScope,
 }
 
 impl RequestAttemptContext {
@@ -368,6 +383,13 @@ impl RequestAttemptContext {
             timing_started_at: Instant::now(),
             trace: crate::diagnostics::TraceContext::default(),
             concurrency_wait_budget: crate::concurrency::ConcurrencyWaitBudget::default(),
+            request_policy: None,
+            execution_effects: None,
+            middleware: None,
+            account_group_ids: Arc::from([]),
+            endpoint: String::new(),
+            client_transport: execution::ClientTransport::InternalProbe,
+            extension_scope: extensions::ExtensionCallScope::default(),
         }
     }
 
@@ -394,6 +416,45 @@ impl RequestAttemptContext {
         self
     }
 
+    /// 附着与发布视图同代次的请求策略；诊断与无插件路径保持 `None`。
+    #[must_use]
+    pub fn with_request_policy(mut self, policy: Option<policy::RequestPolicyContext>) -> Self {
+        self.request_policy = policy;
+        self
+    }
+
+    /// 附着本次逻辑请求共享的外部副作用水位；不会传给 Provider 或插件 wire。
+    #[must_use]
+    pub fn with_execution_effects(
+        mut self,
+        effects: Option<Arc<nested::ExecutionEffects>>,
+    ) -> Self {
+        self.execution_effects = effects;
+        self
+    }
+
+    /// 附着与路由快照同代次的 attempt 中间件及可信绑定事实。
+    #[must_use]
+    pub fn with_middleware(
+        mut self,
+        middleware: Option<middleware::FrozenMiddlewarePlan>,
+        account_group_ids: Arc<[crate::account::scope::AccountGroupId]>,
+        endpoint: String,
+        client_transport: execution::ClientTransport,
+    ) -> Self {
+        self.middleware = middleware;
+        self.account_group_ids = account_group_ids;
+        self.endpoint = endpoint;
+        self.client_transport = client_transport;
+        self
+    }
+
+    #[must_use]
+    pub fn with_extension_scope(mut self, extension_scope: extensions::ExtensionCallScope) -> Self {
+        self.extension_scope = extension_scope;
+        self
+    }
+
     #[must_use]
     pub const fn request_id(&self) -> &ModelRequestId {
         &self.request_id
@@ -408,6 +469,36 @@ impl RequestAttemptContext {
     #[must_use]
     pub const fn timing_started_at(&self) -> Instant {
         self.timing_started_at
+    }
+
+    #[must_use]
+    pub const fn request_policy(&self) -> Option<&policy::RequestPolicyContext> {
+        self.request_policy.as_ref()
+    }
+
+    #[must_use]
+    pub const fn extension_scope(&self) -> &extensions::ExtensionCallScope {
+        &self.extension_scope
+    }
+
+    #[must_use]
+    pub const fn middleware(&self) -> Option<&middleware::FrozenMiddlewarePlan> {
+        self.middleware.as_ref()
+    }
+
+    #[must_use]
+    pub fn account_group_ids(&self) -> &[crate::account::scope::AccountGroupId] {
+        &self.account_group_ids
+    }
+
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    #[must_use]
+    pub const fn client_transport(&self) -> execution::ClientTransport {
+        self.client_transport
     }
 }
 
@@ -515,6 +606,60 @@ impl AttemptContext {
         self.request.timing_started_at()
     }
 
+    /// 返回同一次请求冻结的插件策略上下文。
+    #[must_use]
+    pub const fn request_policy_context(&self) -> Option<&policy::RequestPolicyContext> {
+        self.request.request_policy()
+    }
+
+    #[must_use]
+    pub const fn extension_scope(&self) -> &extensions::ExtensionCallScope {
+        self.request.extension_scope()
+    }
+
+    /// 在已选账号并持有其 lease 后，以 owned terminal 执行本次 retry 的中间件链。
+    ///
+    /// terminal 返回的 stream 仍须保持 cold；中间件不能取得 credential、发送状态、
+    /// canonical usage/cost 或结算所有权。
+    pub async fn execute_middleware(
+        &self,
+        operation: crate::operation::Operation,
+        provider: ProviderKind,
+        model: Option<String>,
+        account_id: ProviderAccountId,
+        terminal: provider::ProviderMiddlewareTerminal,
+    ) -> Result<provider::ProviderStream, ProviderError> {
+        let context = middleware::MiddlewareContext::new(
+            middleware::MiddlewareTarget {
+                request_id: self.request.request_id.clone(),
+                mount: middleware::MiddlewareMount::Attempt,
+                attempt_index: Some(self.attempt_index),
+                operation: Some(operation.kind()),
+                endpoint: self.request.endpoint.clone(),
+                transport: self.request.client_transport,
+                provider: Some(provider),
+                model,
+                account_id: Some(account_id),
+            },
+            middleware::MiddlewareAuthority {
+                client_key_id: self.request.client_api_key_ref.clone(),
+                account_group_ids: Arc::clone(&self.request.account_group_ids),
+                cancellation: self.cancellation.clone(),
+                deadline: self.deadline,
+                extension_scope: self.request.extension_scope.clone(),
+                execution_effects: self.request.execution_effects.as_ref().map(Arc::clone),
+            },
+        );
+        provider::execute_attempt_middleware(
+            self.request.middleware.as_ref(),
+            context,
+            operation,
+            self.request.client_transport,
+            terminal,
+        )
+        .await
+    }
+
     #[must_use]
     pub const fn attempt_index(&self) -> NonZeroU32 {
         self.attempt_index
@@ -589,6 +734,24 @@ impl AttemptContext {
     #[must_use]
     pub const fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
+    }
+
+    /// 使用冻结策略选择账号；没有匹配策略时委托现有 `AccountSelector`。
+    pub async fn select_account<'a>(
+        &self,
+        provider: &ProviderKind,
+        model: Option<&str>,
+        candidates: &'a [AccountCandidate],
+        context: &AccountSelectionContext,
+    ) -> Result<Option<AccountSelection<'a>>, policy::AccountPolicyError> {
+        match self.request.request_policy() {
+            Some(policy) => {
+                policy
+                    .select_account(self.attempt_index, provider, model, candidates, context)
+                    .await
+            }
+            None => Ok(crate::account::AccountSelector.select(candidates, context)),
+        }
     }
 }
 

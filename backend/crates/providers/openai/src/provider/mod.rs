@@ -11,6 +11,7 @@ use bytes::Bytes;
 use futures::{StreamExt, future::BoxFuture};
 use gateway_core::account::{AccountFeedbackStats, ProviderAccount};
 use gateway_core::engine::continuation::{ContinuationBinding, NativeContinuationScope};
+use gateway_core::engine::middleware::MiddlewareHeader;
 use gateway_core::engine::provider::{
     ContinuationRequestObservation, EventStream, Provider, ProviderCallMetadata, ProviderRequest,
     ProviderRequestObservation, ProviderSelectionObservation, ProviderStream,
@@ -28,8 +29,8 @@ use gateway_core::event::{
 };
 use gateway_core::lifecycle::CancellationToken;
 use gateway_core::operation::{
-    GenerateRequest, ImageRequest, ImageRequestKind, Operation, OperationKind,
-    ProviderSessionState, StandaloneSearchRequest,
+    CapabilityRequirements, GenerateRequest, ImageRequest, ImageRequestKind, Operation,
+    OperationKind, ProviderSessionState, StandaloneSearchRequest,
 };
 use gateway_core::provider_ports::ProviderSessionAffinityKey;
 use gateway_core::routing::{
@@ -45,7 +46,7 @@ use gateway_core::upstream::{UpstreamSendState, UpstreamTransport};
 use gateway_protocol::openai::events::{
     ParsedRateLimits, parse_rate_limit_headers, rate_limits_to_header_pairs,
 };
-use reqwest::Client;
+use reqwest::{Client, header::HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -137,6 +138,7 @@ pub enum CodexProviderConfigError {
     InvalidBaseUrl,
 }
 
+#[derive(Clone)]
 pub struct CodexProvider {
     selector: Arc<CodexCredentialSelector>,
     catalog: Arc<CodexCredentialCatalogService>,
@@ -152,7 +154,70 @@ pub struct CodexProvider {
     stream_max_retries: u32,
 }
 
+struct PreparedGenerateRequest {
+    upstream: CodexResponsesRequest,
+    previous_session: Option<OpenAiSessionState>,
+    continuation_requested: bool,
+    session_affinity: Option<CodexSessionAffinity>,
+    cyber_policy_session_key: Option<ProviderSessionAffinityKey>,
+}
+
+struct SelectedGenerate {
+    lease: CodexCredentialLease,
+    session_affinity: Option<CodexSessionAffinity>,
+    cyber_policy_key: Option<ProviderSessionAffinityKey>,
+    account_selection_wait_ms: u64,
+    frozen_requirements: CapabilityRequirements,
+}
+
 impl CodexProvider {
+    fn prepare_generate_request(
+        &self,
+        generate: &GenerateRequest,
+        upstream_model: &UpstreamModelId,
+        context: &AttemptContext,
+    ) -> Result<PreparedGenerateRequest, ProviderError> {
+        let previous_session = decode_openai_session_state(generate);
+        let continuation_requested = generate.native_continuation_requested();
+        let mut upstream = encode_generate_request(generate, upstream_model.as_str(), None)
+            .map_err(map_request_error)?;
+        // 插件加工后仍重新应用宿主强制策略与本地会话身份。
+        upstream.apply_fast_policy(context.disable_fast());
+        if let Some(conversation_id) = previous_session
+            .as_ref()
+            .and_then(|state| state.conversation_id.as_ref())
+        {
+            upstream.local_conversation_id = Some(conversation_id.clone());
+        }
+        if let Some(identity) = &self.session_identity {
+            identity.prepare_local_conversation(&mut upstream);
+        }
+        if let Some(previous_session) = previous_session.as_ref() {
+            upstream.turn_state = if same_client_turn(
+                previous_session.client_turn_id.as_deref(),
+                upstream.client_turn_id.as_deref(),
+            ) {
+                upstream
+                    .turn_state
+                    .take()
+                    .or_else(|| previous_session.turn_state.clone())
+            } else {
+                None
+            };
+        }
+        let session_affinity =
+            derive_codex_session_affinity(&upstream, context.client_api_key_ref());
+        let cyber_policy_session_key =
+            derive_codex_cyber_policy_session_key(&upstream, context.client_api_key_ref());
+        Ok(PreparedGenerateRequest {
+            upstream,
+            previous_session,
+            continuation_requested,
+            session_affinity,
+            cyber_policy_session_key,
+        })
+    }
+
     fn client_for_request(
         &self,
         context: &AttemptContext,
@@ -352,7 +417,7 @@ impl Provider for CodexProvider {
     }
 
     async fn execute(
-        &self,
+        self: Arc<Self>,
         request: ProviderRequest,
         context: AttemptContext,
     ) -> Result<ProviderStream, ProviderError> {
@@ -393,45 +458,27 @@ impl Provider for CodexProvider {
                 UpstreamSendState::NotSent,
             ));
         };
-        let previous_session = decode_openai_session_state(generate);
-        let continuation_requested = generate.native_continuation_requested();
-        let mut upstream_request = encode_generate_request(generate, upstream_model.as_str(), None)
-            .map_err(map_request_error)?;
-        // 编码已生成独立请求；HTTP、WS 与重试在头部和计量之前共用此策略。
-        upstream_request.apply_fast_policy(context.disable_fast());
-        if let Some(conversation_id) = previous_session
-            .as_ref()
-            .and_then(|state| state.conversation_id.as_ref())
-        {
-            upstream_request.local_conversation_id = Some(conversation_id.clone());
-        }
-        if let Some(identity) = &self.session_identity {
-            identity.prepare_local_conversation(&mut upstream_request);
-        }
-        if let Some(previous_session) = previous_session.as_ref() {
-            upstream_request.turn_state = if same_client_turn(
-                previous_session.client_turn_id.as_deref(),
-                upstream_request.client_turn_id.as_deref(),
-            ) {
-                upstream_request
-                    .turn_state
-                    .take()
-                    .or_else(|| previous_session.turn_state.clone())
-            } else {
-                None
-            };
-        }
-        let session_affinity =
-            derive_codex_session_affinity(&upstream_request, context.client_api_key_ref());
-        let cyber_policy_session_key =
-            derive_codex_cyber_policy_session_key(&upstream_request, context.client_api_key_ref());
-
-        let requires_websocket = transport_requirement(&upstream_request).requires_websocket()
-            || (context.continuation_attempt() == ContinuationAttempt::Native
-                && (previous_session.as_ref().is_some_and(|state| {
-                    state.continuation_scope == OpenAiContinuationScope::ConnectionLocal
-                }) || matches!(context.continuation(), Some(ContinuationBinding::Pinned(binding))
-                        if binding.scope() == NativeContinuationScope::ConnectionLocal)));
+        // 其他协议必须先取得真实账号，再按固定 attempt 阶段调用转换器；选号前不能
+        // 把未知正文当成 OpenAI wire 解释会话、亲和或传输字段。
+        let preselection = (generate.protocol_payload().protocol() == PROVIDER_NAME)
+            .then(|| self.prepare_generate_request(generate, upstream_model, &context))
+            .transpose()?;
+        let (selection_session_affinity, selection_cyber_policy_key, requires_websocket) =
+            preselection.map_or((None, None, false), |prepared| {
+                let requires_websocket =
+                    transport_requirement(&prepared.upstream).requires_websocket()
+                        || (context.continuation_attempt() == ContinuationAttempt::Native
+                            && (prepared.previous_session.as_ref().is_some_and(|state| {
+                                state.continuation_scope
+                                    == OpenAiContinuationScope::ConnectionLocal
+                            }) || matches!(context.continuation(), Some(ContinuationBinding::Pinned(binding))
+                                    if binding.scope() == NativeContinuationScope::ConnectionLocal)));
+                (
+                    prepared.session_affinity,
+                    prepared.cyber_policy_session_key,
+                    requires_websocket,
+                )
+            });
         let selection_started_at = Instant::now();
         let lease = self
             .selector
@@ -440,18 +487,108 @@ impl Provider for CodexProvider {
                     upstream_model: upstream_model.as_str(),
                     request_url: &self.responses_url,
                     attempt: &context,
-                    session_affinity_key: session_affinity.as_ref().map(|affinity| affinity.key()),
+                    session_affinity_key: selection_session_affinity
+                        .as_ref()
+                        .map(|affinity| affinity.key()),
                 },
-                cyber_policy_session_key.as_ref(),
-                session_affinity.as_ref(),
+                selection_cyber_policy_key.as_ref(),
+                selection_session_affinity.as_ref(),
                 requires_websocket,
             )
             .await
             .map_err(map_selection_error)?;
         let account_selection_wait_ms =
             u64::try_from(selection_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let provider_kind = ProviderKind::new(PROVIDER_NAME)
+            .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
+        let account_id = lease.account_id().clone();
+        let frozen_requirements = Operation::Generate(generate.clone()).capability_requirements();
+        let provider = Arc::clone(&self);
+        let terminal_context = context.clone();
+        let terminal_model = upstream_model.clone();
+        context
+            .execute_middleware(
+                Operation::Generate(generate.clone()),
+                provider_kind,
+                Some(upstream_model.as_str().to_owned()),
+                account_id,
+                Box::new(move |operation, middleware_headers| {
+                    Box::pin(async move {
+                        provider
+                            .execute_selected_generate(
+                                operation,
+                                middleware_headers,
+                                terminal_model,
+                                terminal_context,
+                                SelectedGenerate {
+                                    lease,
+                                    session_affinity: selection_session_affinity,
+                                    cyber_policy_key: selection_cyber_policy_key,
+                                    account_selection_wait_ms,
+                                    frozen_requirements,
+                                },
+                            )
+                            .await
+                    })
+                }),
+            )
+            .await
+    }
+}
+
+impl CodexProvider {
+    async fn execute_selected_generate(
+        self: Arc<Self>,
+        operation: Operation,
+        middleware_headers: Vec<MiddlewareHeader>,
+        upstream_model: UpstreamModelId,
+        context: AttemptContext,
+        selected: SelectedGenerate,
+    ) -> Result<ProviderStream, ProviderError> {
+        let SelectedGenerate {
+            mut lease,
+            session_affinity: selection_session_affinity,
+            cyber_policy_key: selection_cyber_policy_key,
+            account_selection_wait_ms,
+            frozen_requirements,
+        } = selected;
+        let Operation::Generate(generate) = operation else {
+            return Err(provider_error(
+                ProviderErrorKind::Protocol,
+                UpstreamSendState::NotSent,
+            ));
+        };
+        if generate.protocol_payload().protocol() != PROVIDER_NAME
+            || native_request_requirements(&generate) != frozen_requirements
+        {
+            return Err(provider_error(
+                ProviderErrorKind::InvalidRequest,
+                UpstreamSendState::NotSent,
+            ));
+        }
+        validate_openai_reasoning(generate.protocol_payload().body())?;
+        let processed = self.prepare_generate_request(&generate, &upstream_model, &context)?;
+        let mut upstream_request = processed.upstream;
+        let previous_session = processed.previous_session;
+        let continuation_requested = processed.continuation_requested;
+        let session_affinity = processed.session_affinity;
+        let cyber_policy_session_key = processed.cyber_policy_session_key;
+        if selection_session_affinity
+            .as_ref()
+            .map(|affinity| affinity.key())
+            != session_affinity.as_ref().map(|affinity| affinity.key())
+            || selection_cyber_policy_key.as_ref() != cyber_policy_session_key.as_ref()
+        {
+            self.selector
+                .validate_translated_selection(
+                    &mut lease,
+                    session_affinity.as_ref(),
+                    cyber_policy_session_key.as_ref(),
+                )
+                .await
+                .map_err(map_selection_error)?;
+        }
         let lease = Arc::new(lease);
-        // 首字计时的起点：账号选择完成之后、上游建立之前。
         if previous_session.as_ref().is_some_and(|state| {
             state
                 .credential_revision
@@ -555,7 +692,6 @@ impl Provider for CodexProvider {
         ) {
             normalize_non_codex_request_body(upstream_request.body_mut());
         }
-        // 每次执行从原始请求编码，选定出口后再覆盖，避免换号时携带上次位置。
         if let Some(location) = lease
             .account()
             .request_location()
@@ -592,6 +728,19 @@ impl Provider for CodexProvider {
         } else {
             requested_transport
         };
+        if transport == CodexProviderTransport::PreferWebSocket
+            && middleware_headers.iter().any(|header| {
+                match HeaderValue::from_bytes(header.value()) {
+                    Ok(value) => value.to_str().is_err(),
+                    Err(_) => true,
+                }
+            })
+        {
+            return Err(provider_error(
+                ProviderErrorKind::Protocol,
+                UpstreamSendState::NotSent,
+            ));
+        }
         apply_transport(&mut upstream_request, transport);
         let metadata = ProviderCallMetadata::new(
             provider_kind,
@@ -636,10 +785,11 @@ impl Provider for CodexProvider {
                 .map_err(|_| {
                     provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
                 })?
-                .with_authentication(lease.authentication()),
+                .with_authentication(lease.authentication())
+                .with_middleware_headers(middleware_headers),
             response_origin: self.responses_url.clone(),
             request: upstream_request,
-            upstream_model: upstream_model.clone(),
+            upstream_model,
             transport_policy: transport,
             context,
             selector: Arc::clone(&self.selector),
@@ -664,4 +814,35 @@ impl Provider for CodexProvider {
             stream
         })
     }
+}
+
+fn native_request_requirements(request: &GenerateRequest) -> CapabilityRequirements {
+    // 此处只解释已知 OpenAI wire；不在 Core 的通用转换路径推断任意目标协议。
+    Operation::Generate(GenerateRequest::from_protocol_payload(
+        request.protocol_payload().clone(),
+    ))
+    .capability_requirements()
+}
+
+fn validate_openai_reasoning(body: &Map<String, Value>) -> Result<(), ProviderError> {
+    let Some(effort) = body
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|reasoning| reasoning.get("effort"))
+    else {
+        return Ok(());
+    };
+    let Some(effort) = effort.as_str() else {
+        return Err(provider_error(
+            ProviderErrorKind::InvalidRequest,
+            UpstreamSendState::NotSent,
+        ));
+    };
+    if effort.is_empty() || effort.len() > 64 || effort.chars().any(char::is_control) {
+        return Err(provider_error(
+            ProviderErrorKind::InvalidRequest,
+            UpstreamSendState::NotSent,
+        ));
+    }
+    Ok(())
 }

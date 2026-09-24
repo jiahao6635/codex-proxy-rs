@@ -1,10 +1,8 @@
 <script setup lang="ts">
 import type { getApiKeys } from '@/api'
-import { MoreHorizontal, Pencil, Power, RotateCcw, Terminal, Trash2, Upload } from '@lucide/vue'
+import { BaseIconButton, BaseMenuItem, BasePopover } from '@codex-proxy/ui'
 
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseMenuItem from '@/components/base/BaseMenuItem.vue'
-import BasePopover from '@/components/base/BasePopover.vue'
+import { MoreHorizontal, Pencil, Power, RotateCcw, Terminal, Trash2, Upload } from '@lucide/vue'
 
 type ApiKeyRow = Awaited<ReturnType<typeof getApiKeys>>['items'][number]
 

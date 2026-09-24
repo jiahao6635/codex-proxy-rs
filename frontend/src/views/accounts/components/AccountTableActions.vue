@@ -1,19 +1,20 @@
 <script setup lang="ts">
 import type { AccountRow } from '../constants'
+import type { AccountProvider } from '@/api'
+import { BaseIconButton, BaseMenuItem, BasePopover } from '@codex-proxy/ui'
+
 import { KeyRound, MoreHorizontal, Pencil, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
+import { computed } from 'vue'
+import { isSupportedProvider } from '@/utils/providers'
 
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseMenuItem from '@/components/base/BaseMenuItem.vue'
-import BasePopover from '@/components/base/BasePopover.vue'
-
-defineProps<{
+const props = defineProps<{
   account: AccountRow
+  provider?: AccountProvider
   deleting: boolean
   recovering: boolean
   refreshing: boolean
   testing: boolean
 }>()
-
 const emit = defineEmits<{
   edit: [account: AccountRow]
   delete: [account: AccountRow]
@@ -22,6 +23,8 @@ const emit = defineEmits<{
   refresh: [accountId: string]
   reauthorize: [account: AccountRow]
 }>()
+
+const credentialEligible = computed(() => !isSupportedProvider(props.account.provider) || props.account.authenticationKind === 'oauth')
 </script>
 
 <template>
@@ -65,7 +68,7 @@ const emit = defineEmits<{
             测试连接
           </BaseMenuItem>
           <BaseMenuItem
-            v-if="account.authenticationKind === 'oauth'"
+            v-if="credentialEligible && provider?.credentials.refresh"
             :loading="refreshing"
             :disabled="refreshing"
             @click.stop="(close(), emit('refresh', account.id))"
@@ -78,7 +81,7 @@ const emit = defineEmits<{
             </template>
             刷新令牌
           </BaseMenuItem>
-          <BaseMenuItem v-if="account.authenticationKind === 'oauth'" @click.stop="(close(), emit('reauthorize', account))">
+          <BaseMenuItem v-if="credentialEligible && provider?.credentials.login" @click.stop="(close(), emit('reauthorize', account))">
             <template #icon>
               <KeyRound class="size-3.5 text-cp-text-quaternary" />
             </template>

@@ -206,7 +206,23 @@ impl CodexBackendClient {
         };
         insert_optional_protocol_header(&mut headers, "x-codex-routing-hint", Some(&routing_hint));
         append_passthrough_headers(&mut headers, request);
+        self.append_middleware_headers(&mut headers)?;
         Ok(headers)
+    }
+
+    pub(super) fn append_middleware_headers(
+        &self,
+        headers: &mut HeaderMap,
+    ) -> CodexClientResult<()> {
+        let provider_headers = headers.keys().cloned().collect::<Vec<_>>();
+        for header in &self.middleware_headers {
+            let name = HeaderName::from_bytes(header.name().as_bytes())?;
+            if provider_headers.contains(&name) {
+                return Err(super::client::CodexClientError::MiddlewareHeaderConflict);
+            }
+            headers.append(name, HeaderValue::from_bytes(header.value())?);
+        }
+        Ok(())
     }
 }
 

@@ -1,5 +1,86 @@
 import request from '../request'
 
+export type ProviderRequestProfile = Record<string, unknown>
+export type ProviderRequestProfiles = Record<string, ProviderRequestProfile>
+export type ProviderRequestProfileUpdates = Record<string, ProviderRequestProfile | null>
+
+export interface ProviderRequestProfilePreset {
+  id: string
+  label: string
+  description?: string | null
+  configuration: ProviderRequestProfile
+}
+
+export interface ProviderRequestProfileOptions {
+  presets: ProviderRequestProfilePreset[]
+  defaultConfiguration: ProviderRequestProfile
+  globalConfiguration: ProviderRequestProfile
+}
+
+export interface ProviderRequestProfileTarget {
+  osType: string
+  osVersion: string
+  arch: string
+  terminal: string
+}
+
+export interface ProviderRequestProfileAttribute {
+  label: string
+  value: string
+}
+
+export interface ProviderRequestProfileRelease {
+  status: 'unchecked' | 'current' | 'update_available' | 'failed'
+  checkedAt?: string | null
+  latestVersion?: string | null
+  latestBuild?: string | null
+  publishedAt?: string | null
+  minimumSystemVersion?: string | null
+  hardwareRequirements?: string | null
+  downloadUrl?: string | null
+  downloadSize?: number | null
+  signaturePresent?: boolean | null
+  error?: string | null
+}
+
+export interface ProviderRequestProfilePreview {
+  configuration: ProviderRequestProfile
+  source: 'global' | 'override'
+  product: string
+  version: string
+  build?: string | null
+  target: ProviderRequestProfileTarget
+  userAgent: string
+  attributes: ProviderRequestProfileAttribute[]
+  verifiedAt?: string | null
+  release?: ProviderRequestProfileRelease | null
+}
+
+export function getClientProfileProviders() {
+  return request<{ providers: string[] }>({
+    url: '/api/admin/settings/client-profiles',
+    method: 'GET',
+    silent: true,
+  })
+}
+
+export function getProviderClientProfileOptions(provider: string) {
+  return request<ProviderRequestProfileOptions>({
+    url: `/api/admin/settings/client-profiles/${encodeURIComponent(provider)}`,
+    method: 'GET',
+    silent: true,
+  })
+}
+
+export function previewProviderClientProfile(provider: string, configuration: ProviderRequestProfile | null) {
+  return request<ProviderRequestProfilePreview>({
+    url: `/api/admin/settings/client-profiles/${encodeURIComponent(provider)}/preview`,
+    method: 'POST',
+    data: { configuration },
+    silent: true,
+  })
+}
+
 export interface ClientProfileSelection {
   client: 'desktop' | 'cli'
   platform: 'macos' | 'linux' | 'windows'

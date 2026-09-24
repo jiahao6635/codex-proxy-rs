@@ -12,6 +12,7 @@ where
         .route("/api/admin/dashboard/summary", get(dashboard_summary::<S>))
         .route("/api/admin/dashboard/trend", get(dashboard_trend::<S>))
         .route("/api/admin/usage/records", get(usage_records::<S>))
+        .route("/api/admin/usage/providers", get(usage_providers::<S>))
         .route(
             "/api/admin/usage/records/detail",
             get(usage_record_detail::<S>),
@@ -115,6 +116,28 @@ where
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(usage_detail_view(result)),
+    ))
+}
+
+pub(crate) async fn usage_providers<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<UsageProvidersQuery>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let range = usage_range(query.start_time.as_deref(), query.end_time.as_deref())
+        .map_err(map_wire_error)?;
+    let result = state
+        .admin_services()
+        .observability()
+        .usage_provider_kinds(range)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(result),
     ))
 }
 

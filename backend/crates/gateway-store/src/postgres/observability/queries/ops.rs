@@ -68,6 +68,32 @@ left join model_requests mr on mr.id = oe.model_request_id
 left join client_api_keys client_key on client_key.id = mr.client_api_key_ref
 where true";
 
+pub(crate) async fn usage_provider_kinds(
+    pool: &PgPool,
+    range: ObservabilityRange,
+) -> StoreResult<Vec<String>> {
+    let mut statement = QueryBuilder::<Postgres>::new(
+        "select provider_kind from (
+           select mr.provider_kind from model_requests mr where mr.provider_kind is not null",
+    );
+    push_range(&mut statement, "mr.started_at", range);
+    // 长请求可能在区间外开始、区间内报错，复用错误列表的完成时刻口径。
+    statement.push(
+        " union select mr.provider_kind from model_requests mr where mr.provider_kind is not null",
+    );
+    push_request_error_predicates(&mut statement, range, &OpsErrorFilter::default());
+    statement.push(
+        " union select oe.provider_kind from ops_events oe where oe.provider_kind is not null",
+    );
+    push_ops_event_predicates(&mut statement, range, &OpsErrorFilter::default());
+    statement.push(") providers order by provider_kind");
+    statement
+        .build_query_scalar()
+        .fetch_all(pool)
+        .await
+        .map_err(|_| postgres_unavailable("load usage providers"))
+}
+
 pub(crate) async fn list_ops_errors(
     pool: &PgPool,
     query: OpsErrorQuery,

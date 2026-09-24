@@ -1,16 +1,9 @@
 <script setup lang="ts">
 import type { AccountGroupFormValue } from '../composables/useAccountGroups'
 import type { AccountGroup } from '@/api'
-import { computed } from 'vue'
+import { BaseButton, BaseColorPicker, BaseForm, BaseFormItem, BaseInput, BaseModal, BaseSegmented, BaseTextarea } from '@codex-proxy/ui'
 
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseColorPicker from '@/components/base/BaseColorPicker/index.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseForm from '@/components/base/BaseForm/index.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import BaseTextarea from '@/components/base/BaseTextarea.vue'
+import { computed } from 'vue'
 import { ACCOUNT_GROUP_COLOR_PRESETS } from '../constants'
 
 const props = defineProps<{

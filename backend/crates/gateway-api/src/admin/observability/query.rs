@@ -23,6 +23,14 @@ impl DashboardQuery {
     }
 }
 
+/// 用量页面的平台筛选范围，与分页及当前平台选择无关。
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageProvidersQuery {
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+}
+
 /// 逻辑请求列表、汇总和洞察查询参数。
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

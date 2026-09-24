@@ -8,7 +8,7 @@ FROM node:26-bookworm-slim@sha256:2d49d876e96237d76de412761cf05dbfe5aee325cc4406
 
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./
-RUN npm install --global pnpm@11.7.0 \
+RUN npm install --global "$(node -p 'require("./package.json").packageManager')" \
     && pnpm install --frozen-lockfile
 COPY frontend ./
 RUN pnpm build
@@ -88,5 +88,9 @@ ARG CPR_PREBUILT_DIR=dist/docker
 
 COPY --chown=cpr:cpr ${CPR_PREBUILT_DIR}/linux-${TARGETARCH}/codex-proxy-rs /app/bin/codex-proxy-rs
 COPY --chown=cpr:cpr ${CPR_PREBUILT_DIR}/web/dist ./web/dist
-RUN chmod +x /app/bin/codex-proxy-rs
+COPY --chown=cpr:cpr ${CPR_PREBUILT_DIR}/linux-${TARGETARCH}/plugins/official /app/bin/plugins/official
+RUN chmod +x /app/bin/codex-proxy-rs \
+    && find /app/bin/plugins/official -type f -exec chmod 0444 '{}' + \
+    && chmod 0555 /app/bin/plugins/official \
+    && chmod 0755 /app/bin/plugins
 USER cpr

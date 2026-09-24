@@ -1,10 +1,10 @@
 <script setup lang="ts">
+import { BaseScrollbar } from '@codex-proxy/ui'
 import { storeToRefs } from 'pinia'
 import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
-import { RouterView, useRoute } from 'vue-router'
 
+import { RouterView, useRoute } from 'vue-router'
 import AppAboutModal from '@/components/AppAboutModal.vue'
-import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
 import { useSystemUpdateStore } from '@/stores/modules/system-update'
 import { useUiStore } from '@/stores/modules/ui'
 

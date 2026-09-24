@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
+import { BaseButton, BaseModal } from '@codex-proxy/ui'
 
 const open = defineModel<boolean>({ default: false })
 </script>

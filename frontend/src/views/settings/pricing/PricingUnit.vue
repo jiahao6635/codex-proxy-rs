@@ -1,7 +1,7 @@
 <script setup lang="ts">
+import { BasePopover } from '@codex-proxy/ui'
 import { Info } from '@lucide/vue'
 import { shallowRef, useId } from 'vue'
-import BasePopover from '@/components/base/BasePopover.vue'
 
 const infoOpen = shallowRef(false)
 const infoId = useId()

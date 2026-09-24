@@ -34,6 +34,7 @@ fn source_tree_should_match_frozen_machine_manifest() {
     actual.sort();
     let mut expected = vec![
         "src/admin/account_groups.rs",
+        "src/admin/accounts/capabilities.rs",
         "src/admin/accounts/credentials.rs",
         "src/admin/accounts/handlers.rs",
         "src/admin/accounts/import_tasks.rs",
@@ -50,6 +51,11 @@ fn source_tree_should_match_frozen_machine_manifest() {
         "src/admin/observability/query.rs",
         "src/admin/observability/routes.rs",
         "src/admin/observability/wire.rs",
+        "src/admin/plugins/artifacts.rs",
+        "src/admin/plugins/distribution.rs",
+        "src/admin/plugins/instances.rs",
+        "src/admin/plugins/management.rs",
+        "src/admin/plugins/mod.rs",
         "src/admin/presenter.rs",
         "src/admin/proxies.rs",
         "src/admin/settings.rs",
@@ -61,6 +67,10 @@ fn source_tree_should_match_frozen_machine_manifest() {
         "src/key_usage/query.rs",
         "src/key_usage/presenter.rs",
         "src/lib.rs",
+        "src/openai/middleware/http.rs",
+        "src/openai/middleware/mod.rs",
+        "src/openai/middleware/request.rs",
+        "src/openai/middleware/session.rs",
         "src/openai/auth.rs",
         "src/openai/error.rs",
         "src/openai/images/http.rs",
@@ -73,6 +83,7 @@ fn source_tree_should_match_frozen_machine_manifest() {
         "src/openai/responses/mod.rs",
         "src/openai/responses/request.rs",
         "src/openai/responses/response.rs",
+        "src/openai/responses/validation.rs",
         "src/openai/responses/websocket/connection.rs",
         "src/openai/responses/websocket/forward.rs",
         "src/openai/responses/websocket/mod.rs",
@@ -82,6 +93,7 @@ fn source_tree_should_match_frozen_machine_manifest() {
         "src/openai/search/mod.rs",
         "src/openai/service.rs",
         "src/openai/usage.rs",
+        "src/provider.rs",
         "src/session_cookie.rs",
     ];
     expected.sort_unstable();
@@ -96,6 +108,7 @@ fn test_tree_should_match_frozen_rust_mirror() {
     actual.sort();
     let mut expected = vec![
         "tests/admin/account_groups.rs",
+        "tests/admin/accounts/capabilities.rs",
         "tests/admin/accounts/handlers.rs",
         "tests/admin/accounts/import_tasks.rs",
         "tests/admin/accounts/mod.rs",
@@ -107,6 +120,8 @@ fn test_tree_should_match_frozen_rust_mirror() {
         "tests/admin/observability/mod.rs",
         "tests/admin/observability/query.rs",
         "tests/admin/observability/response.rs",
+        "tests/admin/plugins/management.rs",
+        "tests/admin/plugins/mod.rs",
         "tests/admin/proxies.rs",
         "tests/admin/settings.rs",
         "tests/admin/system.rs",
@@ -118,6 +133,7 @@ fn test_tree_should_match_frozen_rust_mirror() {
         "tests/key_usage/mod.rs",
         "tests/key_usage/fixtures.rs",
         "tests/main.rs",
+        "tests/openai/middleware/mod.rs",
         "tests/openai/auth.rs",
         "tests/openai/error.rs",
         "tests/openai/images/mod.rs",
@@ -134,6 +150,7 @@ fn test_tree_should_match_frozen_rust_mirror() {
         "tests/openai/router.rs",
         "tests/openai/search/mod.rs",
         "tests/openai/usage.rs",
+        "tests/provider.rs",
     ];
     expected.sort_unstable();
 

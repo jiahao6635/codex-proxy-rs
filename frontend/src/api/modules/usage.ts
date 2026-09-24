@@ -529,6 +529,15 @@ export function getUsageRecordInsightsOverview(data: UsageRangeQuery, options: R
   })
 }
 
+export function getUsageProviders(data: { startTime?: string, endTime?: string }, options: RequestOptions = {}) {
+  return request<string[]>({
+    url: '/api/admin/usage/providers',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
 export function getUsageRecordInsightsDiagnostics(data: UsageDiagnosticsQuery, options: RequestOptions = {}) {
   return request<UsageDiagnosticsResponse>({
     url: '/api/admin/usage/insights/diagnostics',

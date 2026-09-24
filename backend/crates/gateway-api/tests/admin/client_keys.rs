@@ -432,8 +432,7 @@ fn client_key_responses_should_keep_shape_and_redact_creation_debug() {
         .single()
         .expect("valid time");
     let view = ClientKeyView::from(gateway_admin::model::client_keys::ClientKeyRecord {
-        openai_client_profile_override: None,
-        xai_client_profile_override: None,
+        request_profile_overrides: Default::default(),
         budget: Default::default(),
         id: gateway_core::policy::ClientApiKeyId::new("key_visible").expect("Client Key ID"),
         name: "visible".to_owned(),
@@ -574,11 +573,13 @@ async fn list_route_should_accept_the_full_nonzero_u16_page_size() {
 fn profile_override_distinguishes_omission_from_explicit_inheritance() {
     let mut payload = json!({"id":"key_profile", "name":"profile", "groupIds":[], "maxConcurrency":0, "requestsPerMinute":0});
     let decode = |body| {
-        serde_json::from_value::<UpdateClientKeyRequest>(body)
+        let mut command = serde_json::from_value::<UpdateClientKeyRequest>(body)
             .unwrap()
             .into_command()
-            .unwrap()
-            .openai_client_profile_override
+            .unwrap();
+        command
+            .request_profile_override_updates
+            .remove(&gateway_core::routing::ProviderKind::new("openai").expect("Provider kind"))
     };
     assert_eq!(decode(payload.clone()), None);
     payload["openaiClientProfileOverride"] = json!(null);
@@ -592,15 +593,72 @@ fn profile_override_distinguishes_omission_from_explicit_inheritance() {
 fn xai_profile_override_distinguishes_omission_from_explicit_inheritance() {
     let mut payload = json!({"id":"key_profile", "name":"profile", "groupIds":[], "maxConcurrency":0, "requestsPerMinute":0});
     let decode = |body| {
-        serde_json::from_value::<UpdateClientKeyRequest>(body)
+        let mut command = serde_json::from_value::<UpdateClientKeyRequest>(body)
             .unwrap()
             .into_command()
-            .unwrap()
-            .xai_client_profile_override
+            .unwrap();
+        command
+            .request_profile_override_updates
+            .remove(&gateway_core::routing::ProviderKind::new("xai").expect("Provider kind"))
     };
     assert_eq!(decode(payload.clone()), None);
     payload["xaiClientProfileOverride"] = json!(null);
     assert_eq!(decode(payload.clone()), Some(None));
     payload["xaiClientProfileOverride"] = json!({"versionMode":"latest"});
     assert!(decode(payload).unwrap().is_some());
+}
+
+#[test]
+fn generic_profile_overrides_accept_dynamic_providers_and_reject_legacy_conflicts() {
+    let profile = json!({"preset":"desktop"});
+    let dynamic = json!({"preset":"managed"});
+    let request: CreateClientKeyRequest = serde_json::from_value(json!({
+        "name":"profile",
+        "groupIds":[],
+        "maxConcurrency":0,
+        "requestsPerMinute":0,
+        "providerRequestProfileOverrides": {
+            "openai": profile,
+            "provider.example": dynamic,
+        },
+        "openaiClientProfileOverride": {"preset":"desktop"},
+    }))
+    .unwrap();
+    let command = request.into_command().unwrap();
+    assert_eq!(command.request_profile_overrides.len(), 2);
+    assert!(command.request_profile_overrides.contains_key(
+        &gateway_core::routing::ProviderKind::new("provider.example").expect("Provider kind")
+    ));
+
+    let conflict: CreateClientKeyRequest = serde_json::from_value(json!({
+        "name":"profile",
+        "groupIds":[],
+        "maxConcurrency":0,
+        "requestsPerMinute":0,
+        "providerRequestProfileOverrides": {"openai":{"preset":"desktop"}},
+        "openaiClientProfileOverride": {"preset":"cli"},
+    }))
+    .unwrap();
+    assert_eq!(
+        conflict.into_command().unwrap_err().field(),
+        "providerRequestProfileOverrides"
+    );
+}
+
+#[test]
+fn generic_profile_override_clear_rejects_conflicting_legacy_update() {
+    let request: UpdateClientKeyRequest = serde_json::from_value(json!({
+        "id":"key_profile",
+        "name":"profile",
+        "groupIds":[],
+        "maxConcurrency":0,
+        "requestsPerMinute":0,
+        "providerRequestProfileOverrides": {"xai":null},
+        "xaiClientProfileOverride": {"preset":"desktop"},
+    }))
+    .unwrap();
+    assert_eq!(
+        request.into_command().unwrap_err().field(),
+        "providerRequestProfileOverrides"
+    );
 }

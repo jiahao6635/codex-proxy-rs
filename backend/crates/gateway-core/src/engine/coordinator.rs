@@ -5,12 +5,14 @@ use crate::diagnostics::TraceContext;
 use serde_json::json;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use super::observation::ResponseObservation;
+use super::nested::ExecutionEffects;
+use super::observation::{
+    RequestObservationDispatch, ResponseObservation, WebSocketResponseAttempt,
+};
 use crate::engine::continuation::{
     ContinuationBinding, NativeContinuationPin, NativeContinuationScope, PreviousResponseId,
 };
@@ -47,6 +49,83 @@ pub struct AttemptCoordinator<S: ?Sized> {
 enum AccountSelection {
     Scheduled(Option<crate::account::ProviderAccountId>),
     Diagnostic(crate::account::ProviderAccountId),
+}
+
+pub(super) struct CoordinationExtensions {
+    continuation: Option<ContinuationBinding>,
+    observation: Option<RequestObservationDispatch>,
+    request_policy: Option<super::policy::RequestPolicyContext>,
+    execution_effects: Option<Arc<ExecutionEffects>>,
+    execution_effects_baseline: usize,
+    middleware: Option<super::middleware::FrozenMiddlewarePlan>,
+    account_group_ids: Arc<[crate::account::scope::AccountGroupId]>,
+    endpoint: String,
+    client_transport: super::execution::ClientTransport,
+    extension_scope: super::extensions::ExtensionCallScope,
+}
+
+impl CoordinationExtensions {
+    pub(super) fn new(
+        continuation: Option<ContinuationBinding>,
+        observation: Option<RequestObservationDispatch>,
+    ) -> Self {
+        Self {
+            continuation,
+            observation,
+            request_policy: None,
+            execution_effects: None,
+            execution_effects_baseline: 0,
+            middleware: None,
+            account_group_ids: Arc::from([]),
+            endpoint: String::new(),
+            client_transport: super::execution::ClientTransport::InternalProbe,
+            extension_scope: super::extensions::ExtensionCallScope::default(),
+        }
+    }
+
+    #[must_use]
+    pub(super) fn with_extension_scope(
+        mut self,
+        extension_scope: super::extensions::ExtensionCallScope,
+    ) -> Self {
+        self.extension_scope = extension_scope;
+        self
+    }
+
+    #[must_use]
+    pub(super) fn with_request_policy(
+        mut self,
+        request_policy: Option<super::policy::RequestPolicyContext>,
+    ) -> Self {
+        self.request_policy = request_policy;
+        self
+    }
+
+    #[must_use]
+    pub(super) fn with_execution_effects(
+        mut self,
+        execution_effects: Option<Arc<ExecutionEffects>>,
+        execution_effects_baseline: usize,
+    ) -> Self {
+        self.execution_effects = execution_effects;
+        self.execution_effects_baseline = execution_effects_baseline;
+        self
+    }
+
+    #[must_use]
+    pub(super) fn with_middleware(
+        mut self,
+        middleware: Option<super::middleware::FrozenMiddlewarePlan>,
+        account_group_ids: Arc<[crate::account::scope::AccountGroupId]>,
+        endpoint: String,
+        client_transport: super::execution::ClientTransport,
+    ) -> Self {
+        self.middleware = middleware;
+        self.account_group_ids = account_group_ids;
+        self.endpoint = endpoint;
+        self.client_transport = client_transport;
+        self
+    }
 }
 
 impl AccountSelection {
@@ -92,7 +171,27 @@ where
             operation,
             plan,
             AccountSelection::Scheduled(required_account),
-            continuation,
+            CoordinationExtensions::new(continuation, None),
+            cancellation,
+        )
+        .await
+    }
+
+    pub(super) async fn start_observed(
+        &self,
+        request: NewModelRequest,
+        operation: Operation,
+        plan: RoutingPlan,
+        required_account: Option<crate::account::ProviderAccountId>,
+        extensions: CoordinationExtensions,
+        cancellation: CancellationToken,
+    ) -> Result<ResponseExecutionSession<S>, EngineError> {
+        self.start_with_account_selection(
+            request,
+            operation,
+            plan,
+            AccountSelection::Scheduled(required_account),
+            extensions,
             cancellation,
         )
         .await
@@ -115,7 +214,7 @@ where
             operation,
             plan,
             AccountSelection::Diagnostic(required_account),
-            continuation,
+            CoordinationExtensions::new(continuation, None),
             cancellation,
         )
         .await
@@ -127,9 +226,21 @@ where
         operation: Operation,
         plan: RoutingPlan,
         account_selection: AccountSelection,
-        continuation: Option<ContinuationBinding>,
+        extensions: CoordinationExtensions,
         cancellation: CancellationToken,
     ) -> Result<ResponseExecutionSession<S>, EngineError> {
+        let CoordinationExtensions {
+            continuation,
+            observation: request_observation,
+            request_policy,
+            execution_effects,
+            execution_effects_baseline,
+            middleware,
+            account_group_ids,
+            endpoint,
+            client_transport,
+            extension_scope,
+        } = extensions;
         let request_id = request.id.clone();
         let client_api_key_ref = request.client_api_key_ref.clone();
         let timing_started_at = Instant::now();
@@ -169,6 +280,7 @@ where
             client_api_key_ref,
             concurrency_wait_budget: ConcurrencyWaitBudget::default(),
             observation: ResponseObservation::new(timing_started_at),
+            request_observation,
             budget_prior_attempts_usd: Decimal::ZERO,
             budget_attempt_already_counted: false,
             trace,
@@ -183,12 +295,21 @@ where
             request_persisted: false,
             operation,
             plan,
+            request_policy,
+            execution_effects,
+            execution_effects_baseline,
+            middleware,
+            account_group_ids,
+            endpoint,
+            client_transport,
+            extension_scope,
             account_selection,
             continuation,
             continuation_attempt,
             account_state_owner,
             cancellation,
             attempts: 0,
+            websocket_observation_sequence: 0,
             routing_attempts: 0,
             candidate_index,
             excluded_accounts: BTreeSet::new(),
@@ -275,6 +396,7 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     client_api_key_ref: crate::policy::ClientApiKeyId,
     concurrency_wait_budget: ConcurrencyWaitBudget,
     observation: ResponseObservation,
+    request_observation: Option<RequestObservationDispatch>,
     budget_prior_attempts_usd: Decimal,
     budget_attempt_already_counted: bool,
     trace: TraceContext,
@@ -285,6 +407,14 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     request_persisted: bool,
     operation: Operation,
     plan: RoutingPlan,
+    request_policy: Option<super::policy::RequestPolicyContext>,
+    execution_effects: Option<Arc<ExecutionEffects>>,
+    execution_effects_baseline: usize,
+    middleware: Option<super::middleware::FrozenMiddlewarePlan>,
+    account_group_ids: Arc<[crate::account::scope::AccountGroupId]>,
+    endpoint: String,
+    client_transport: super::execution::ClientTransport,
+    extension_scope: super::extensions::ExtensionCallScope,
     account_selection: AccountSelection,
     continuation: Option<ContinuationBinding>,
     continuation_attempt: ContinuationAttempt,
@@ -292,6 +422,8 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     cancellation: CancellationToken,
     /// 所有实际上游 attempt 数；包含同账号传输重试，作为持久化序号。
     attempts: u32,
+    /// WebSocket 观察序列在同一逻辑请求内按实际上游 wire 单调递增。
+    websocket_observation_sequence: u64,
     /// 路由预算只统计正常选号/账号恢复，不被 Provider-owned 传输预算消耗。
     routing_attempts: u32,
     candidate_index: usize,
@@ -371,18 +503,14 @@ where
         }
         loop {
             match self.pull().await? {
-                PullOutcome::Event(event) => {
-                    if self.downstream_committed_at.is_some() {
-                        return Ok(Some(CoordinatedEvent::single(
-                            event,
-                            CommitRequirement::AlreadyCommitted,
-                        )));
-                    }
-                    self.delivery_pending = true;
-                    return Ok(Some(CoordinatedEvent::single(
-                        event,
-                        CommitRequirement::CommitBeforeDelivery,
-                    )));
+                PullOutcome::Events(events) => {
+                    let requirement = if self.downstream_committed_at.is_some() {
+                        CommitRequirement::AlreadyCommitted
+                    } else {
+                        self.delivery_pending = true;
+                        CommitRequirement::CommitBeforeDelivery
+                    };
+                    return CoordinatedEvent::try_batch(events, requirement).map(Some);
                 }
                 PullOutcome::AttemptDiscarded => {}
                 PullOutcome::TerminalFailure {
@@ -427,7 +555,7 @@ where
         let mut events = Vec::new();
         loop {
             match self.pull().await? {
-                PullOutcome::Event(event) => events.push(event),
+                PullOutcome::Events(next) => events.extend(next),
                 PullOutcome::AttemptDiscarded => events.clear(),
                 PullOutcome::TerminalFailure {
                     error, send_state, ..
@@ -482,6 +610,20 @@ where
         if self.upstream_complete {
             self.finish_success().await?;
         }
+        Ok(())
+    }
+
+    /// 仅当 HTTP 流插件明确丢弃了整个尚未提交的非终态批次时释放交付屏障。
+    /// 原始 Provider facts 已经观察，不回滚计量，也不把丢弃误记为客户端 commit。
+    pub fn discard_pending_delivery(&mut self) -> Result<(), EngineError> {
+        if !self.delivery_pending
+            || self.downstream_committed_at.is_some()
+            || self.pending_terminal_failure.is_some()
+            || self.is_finalized()
+        {
+            return Err(EngineError::InvalidDeliveryState);
+        }
+        self.delivery_pending = false;
         Ok(())
     }
 
@@ -684,10 +826,34 @@ where
                     if event.wire_event().is_some() && !event.has_canonical_facts() {
                         self.observe_wire_event().await;
                     }
+                    if self.request_observation.is_some() && event.wire_event().is_some() {
+                        let websocket_attempt = self
+                            .current
+                            .as_ref()
+                            .and_then(websocket_observation_attempt);
+                        self.observe_websocket_response(&event, websocket_attempt);
+                    }
                     if !event.has_client_event() {
                         continue;
                     }
-                    return Ok(PullOutcome::Event(event));
+                    let terminal = event
+                        .canonical_facts()
+                        .iter()
+                        .any(|fact| matches!(fact, GatewayEvent::Completed(_)));
+                    let translated = self
+                        .current
+                        .as_mut()
+                        .ok_or(EngineError::NoActiveAttempt)?
+                        .stream
+                        .translate_native_response(event, terminal);
+                    match translated {
+                        Ok(events) if events.is_empty() => continue,
+                        Ok(events) => return Ok(PullOutcome::Events(events)),
+                        Err(error) => {
+                            self.finish_provider_error(&error).await?;
+                            return Err(provider_engine_error(error));
+                        }
+                    }
                 }
                 PollBoundary::Item(Some(Err(error))) => {
                     match self.handle_stream_error(error).await? {
@@ -797,17 +963,21 @@ where
             .ok_or_else(|| EngineError::ProviderNotRegistered {
                 provider: candidate.provider().as_str().to_owned(),
             })?;
-        if !self.request_profiles.contains_key(candidate.provider())
-            && let Some(configuration) = self
+        if !self.request_profiles.contains_key(candidate.provider()) {
+            let profile = match self
                 .plan
                 .account_scope()
                 .request_profile(candidate.provider())
-        {
-            match provider.resolve_request_profile(configuration) {
-                Ok(profile) => {
+            {
+                Some(configuration) => provider.resolve_request_profile(configuration).map(Some),
+                None => provider.default_request_profile(),
+            };
+            match profile {
+                Ok(Some(profile)) => {
                     self.request_profiles
                         .insert(candidate.provider().clone(), profile);
                 }
+                Ok(None) => {}
                 Err(error) => {
                     self.finish_provider_error(&error).await?;
                     return Err(provider_engine_error(error));
@@ -822,6 +992,15 @@ where
                 .with_request_location(self.plan.request_location().cloned())
                 .with_concurrency_wait_budget(self.concurrency_wait_budget.clone())
                 .with_timing_started_at(self.observation.timing_started_at)
+                .with_request_policy(self.request_policy.clone())
+                .with_execution_effects(self.execution_effects.as_ref().map(Arc::clone))
+                .with_middleware(
+                    self.middleware.clone(),
+                    Arc::clone(&self.account_group_ids),
+                    self.endpoint.clone(),
+                    self.client_transport,
+                )
+                .with_extension_scope(self.extension_scope.clone())
                 .with_trace(self.trace.clone()),
             next_attempt,
             self.deadline,
@@ -850,15 +1029,15 @@ where
             }),
         );
         let provider_request = ProviderRequest::new(self.operation.clone(), candidate.clone());
-        let stream = match poll_provider(
+        let provider_boundary = poll_provider(
             provider,
             provider_request,
             context,
             self.cancellation.clone(),
             self.deadline,
         )
-        .await
-        {
+        .await;
+        let stream = match provider_boundary {
             ProviderBoundary::Cancelled => {
                 self.finish_interruption(&EngineError::Cancelled).await?;
                 return Err(EngineError::Cancelled);
@@ -886,6 +1065,7 @@ where
                             | ProviderErrorKind::ConcurrencyQueueFull
                             | ProviderErrorKind::ConcurrencyQueueTimeout
                     ) && error.send_state() == UpstreamSendState::NotSent
+                        && self.current_send_state() == UpstreamSendState::NotSent
                         && matches!(
                             self.continuation_attempt,
                             ContinuationAttempt::None | ContinuationAttempt::ReplayAny
@@ -1177,15 +1357,25 @@ where
         record_trace_error(&self.trace.attempt(self.attempts), &error);
         let mut atomic_client_events = error.take_atomic_client_events();
         let current = self.current.take().ok_or(EngineError::NoActiveAttempt)?;
+        if self.request_observation.is_some() {
+            let websocket_attempt = websocket_observation_attempt(&current);
+            for event in atomic_client_events
+                .iter()
+                .filter(|event| event.wire_event().is_some())
+            {
+                self.observe_websocket_response(event, websocket_attempt.clone());
+            }
+        }
         self.record_provider_failure(current.metadata.provider().clone(), error.kind());
-        // attempt_send_state 是本 attempt 自身的发送事实，驱动重试门；
-        // 持久化与终态用请求级水位，二者不可混用（水位会把早先 attempt 的
-        // sent 传染给本 attempt，从而错误放行/拦截重试）。
+        // attempt_send_state 是本 attempt 自身的发送事实；共享 effect 单独作为
+        // 一票否决的重试门。持久化与终态用请求级水位，不能把早先 Provider attempt
+        // 的 sent 传染给当前 attempt，但任何已观测外部副作用都必须阻止重放。
         let attempt_send_state = if current.send_observed {
             UpstreamSendState::Sent
         } else {
             error.send_state()
         };
+        let execution_effect_observed = self.execution_effect_observed();
         let send_state = self.raise_send_watermark(attempt_send_state);
         if self.request_persisted {
             best_effort_store_write(
@@ -1198,13 +1388,15 @@ where
             .await;
         }
         let provider_proved_replay_safe = provider_proved_replay_safe(&error);
-        let continuation_retry = self.prepare_continuation_retry(
-            &current,
-            &error,
-            attempt_send_state,
-            provider_proved_replay_safe,
-        );
-        let account_rotation_retry = self.account_selection.required_account().is_none()
+        let continuation_retry = !execution_effect_observed
+            && self.prepare_continuation_retry(
+                &current,
+                &error,
+                attempt_send_state,
+                provider_proved_replay_safe,
+            );
+        let account_rotation_retry = !execution_effect_observed
+            && self.account_selection.required_account().is_none()
             && self.continuation_attempt == ContinuationAttempt::None
             && self.downstream_committed_at.is_none()
             && !self.delivery_pending
@@ -1218,14 +1410,16 @@ where
             Some(crate::error::PreDeliveryRetry::SameAccountTransportRetry {
                 retry_index,
                 delay,
-            }) if self.downstream_committed_at.is_none()
+            }) if !execution_effect_observed
+                && self.downstream_committed_at.is_none()
                 && !self.delivery_pending
                 && attempt_send_state != UpstreamSendState::Ambiguous =>
             {
                 Some((AttemptTransport::Retry(retry_index), delay))
             }
             Some(crate::error::PreDeliveryRetry::SameAccountTransportFallback)
-                if self.downstream_committed_at.is_none()
+                if !execution_effect_observed
+                    && self.downstream_committed_at.is_none()
                     && !self.delivery_pending
                     && attempt_send_state != UpstreamSendState::Ambiguous =>
             {
@@ -1233,7 +1427,8 @@ where
             }
             _ => None,
         };
-        let ordinary_retry = self.account_selection.required_account().is_none()
+        let ordinary_retry = !execution_effect_observed
+            && self.account_selection.required_account().is_none()
             && self.continuation_attempt == ContinuationAttempt::None
             && self.downstream_committed_at.is_none()
             && !self.delivery_pending
@@ -1261,7 +1456,8 @@ where
             }
             _ => None,
         };
-        let same_account_retry = error.retries_same_account()
+        let same_account_retry = !execution_effect_observed
+            && error.retries_same_account()
             && provider_proved_replay_safe
             && self.downstream_committed_at.is_none()
             && !self.delivery_pending
@@ -1281,6 +1477,7 @@ where
             "sameAccountRetry": same_account_retry, "accountRotationRetry": account_rotation_retry,
             "ordinaryRetry": ordinary_retry, "transportRecovery": transport_recovery.is_some(),
             "transientRetry": transient_retry.is_some(),
+            "executionEffectObserved": execution_effect_observed,
             "delayMs": transient_retry.or(transport_recovery.map(|(_, delay)| delay)).map(duration_ms),
             "downstreamCommitted": self.downstream_committed_at.is_some(),
             "sendState": format!("{attempt_send_state:?}"),
@@ -1381,6 +1578,24 @@ where
         }
     }
 
+    fn observe_websocket_response(
+        &mut self,
+        event: &ProviderEvent,
+        attempt: Option<WebSocketResponseAttempt>,
+    ) {
+        let Some(observer) = self.request_observation.clone() else {
+            return;
+        };
+        let Some(wire) = event.wire_event().cloned() else {
+            return;
+        };
+        let Some(attempt) = attempt else {
+            return;
+        };
+        self.websocket_observation_sequence = self.websocket_observation_sequence.saturating_add(1);
+        observer.websocket_response(attempt, self.websocket_observation_sequence, wire);
+    }
+
     fn prepare_continuation_retry(
         &mut self,
         current: &CurrentAttempt,
@@ -1446,6 +1661,7 @@ where
     fn prepare_unavailable_native_continuation_replay(&mut self, error: &ProviderError) -> bool {
         if self.account_selection.required_account().is_some()
             || self.continuation_attempt != ContinuationAttempt::Native
+            || self.current_send_state() != UpstreamSendState::NotSent
             || !matches!(
                 error.kind(),
                 ProviderErrorKind::NoEligibleAccount
@@ -1717,6 +1933,23 @@ where
 
     async fn persist_finalization(&mut self, finalization: ModelRequestFinalization) {
         self.finalized_at = Some(finalization.completed_at);
+        let observed_provider = self
+            .current
+            .as_ref()
+            .map(|current| current.metadata.provider().clone())
+            .or_else(|| {
+                self.provider_attempt_outcomes
+                    .last()
+                    .map(|outcome| outcome.provider_kind().clone())
+            });
+        let observer = self.request_observation.clone();
+        let observation = observer.as_ref().map(|observer| {
+            observer.finalization(
+                &finalization,
+                observed_provider,
+                self.current.as_ref().map(|current| &current.metadata),
+            )
+        });
         let mut persisted = self.request_persisted;
         // 首次合并写失败后不能以零 attempt 补行；建流前也只有确定未发送的请求可按零次收敛。
         let request = if !persisted
@@ -1747,6 +1980,9 @@ where
                     store.finalize_model_request(finalization),
                 )
                 .await;
+            }
+            if let (Some(observer), Some(observation)) = (observer, observation) {
+                observer.dispatch(observation);
             }
             persisted
         })));
@@ -1818,13 +2054,25 @@ where
         } else {
             UpstreamSendState::NotSent
         };
+        let observed = if self.execution_effect_observed() {
+            escalate_send_state(observed, UpstreamSendState::Ambiguous)
+        } else {
+            observed
+        };
         escalate_send_state(self.send_state_watermark, observed)
+    }
+
+    fn execution_effect_observed(&self) -> bool {
+        self.execution_effects
+            .as_ref()
+            .is_some_and(|effects| effects.epoch() != self.execution_effects_baseline)
     }
 
     /// 抬升并返回请求级发送水位；attempt 间切换（`current` 被取走）后，
     /// 后续终态沿用已达到的最高档，不会把已落库的 `sent` 写回 `not_sent`。
     fn raise_send_watermark(&mut self, observed: UpstreamSendState) -> UpstreamSendState {
-        self.send_state_watermark = escalate_send_state(self.send_state_watermark, observed);
+        let observed = escalate_send_state(self.current_send_state(), observed);
+        self.send_state_watermark = observed;
         self.send_state_watermark
     }
 
@@ -1872,7 +2120,7 @@ async fn best_effort_store_write<T>(
 }
 
 enum PullOutcome {
-    Event(ProviderEvent),
+    Events(Vec<ProviderEvent>),
     AttemptDiscarded,
     TerminalFailure {
         events: Vec<ProviderEvent>,
@@ -1983,6 +2231,16 @@ async fn poll_provider(
         _ = timeout => ProviderBoundary::Deadline,
         result = execution => ProviderBoundary::Result(Box::new(result)),
     }
+}
+
+fn websocket_observation_attempt(current: &CurrentAttempt) -> Option<WebSocketResponseAttempt> {
+    (current.metadata.transport().as_str() == "websocket").then(|| {
+        WebSocketResponseAttempt::new(
+            current.metadata.provider().clone(),
+            current.metadata.provider_account_id().clone(),
+            current.index,
+        )
+    })
 }
 
 fn initial_continuation_attempt(

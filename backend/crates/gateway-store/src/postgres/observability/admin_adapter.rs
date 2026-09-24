@@ -212,6 +212,15 @@ impl ObservabilityRepository for PgObservabilityRepository {
             .await
     }
 
+    async fn usage_provider_kinds(&self, range: ObservabilityRange) -> StoreResult<Vec<String>> {
+        self.query_budget
+            .run(
+                "load usage providers",
+                usage_provider_kinds(&self.pool, range),
+            )
+            .await
+    }
+
     async fn usage_record_detail(&self, request_id: &str) -> StoreResult<UsageRecordDetail> {
         self.query_budget
             .run(
@@ -409,6 +418,16 @@ impl AdminObservabilityStore for PgAdminObservabilityStore {
             .await
             .map_err(observability_error)?;
         admin_usage_page(page)
+    }
+
+    async fn usage_provider_kinds(
+        &self,
+        range: admin_observability::TimeRange,
+    ) -> AdminStoreResult<Vec<String>> {
+        self.repository
+            .usage_provider_kinds(store_range(range)?)
+            .await
+            .map_err(observability_error)
     }
 
     async fn usage_record_detail(

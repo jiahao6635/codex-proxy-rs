@@ -1,9 +1,8 @@
 <script setup lang="ts">
 import type { AccountErrorReason, AccountStatus } from '@/api'
-import { computed } from 'vue'
+import { BasePopover, BaseScrollbar } from '@codex-proxy/ui'
 
-import BasePopover from '@/components/base/BasePopover.vue'
-import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
+import { computed } from 'vue'
 import { useUiClock } from '@/composables/useUiClock'
 import { resolveAccountStatusPresentation } from './presenter'
 

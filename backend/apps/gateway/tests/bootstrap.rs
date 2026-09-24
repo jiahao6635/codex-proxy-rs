@@ -9,6 +9,54 @@ const REDIS_PASSWORD: &str = "222222222222222222222222222222222222222222222222";
 const ADMIN_PASSWORD: &str = "test-admin-password";
 const TOPOLOGY_CHILD_ENV: &str = "CPR_TEST_TOPOLOGY_CHILD";
 
+#[test]
+fn basic_cli_options_do_not_load_configuration_and_reject_unexpected_arguments() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("deploy")).unwrap();
+    fs::write(directory.path().join("deploy/config.yaml"), "invalid: [").unwrap();
+    for flag in ["--help", "-h", "help", "--version", "-V"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_codex-proxy-rs"))
+            .arg(flag)
+            .current_dir(directory.path())
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{flag}");
+        assert!(!output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+    for args in [
+        vec!["unknown"],
+        vec!["--help", "extra"],
+        vec!["serve", "extra"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_codex-proxy-rs"))
+            .args(args)
+            .current_dir(directory.path())
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("configuration"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_command_is_not_interpreted_as_serve() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-proxy-rs"))
+        .arg(std::ffi::OsString::from_vec(vec![0xff]))
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("command must be UTF-8"));
+}
+
 #[tokio::test]
 async fn proxy_probe_should_use_provider_custom_ca_for_https_proxies() {
     use gateway_admin::ports::proxy::ProxyProbe;

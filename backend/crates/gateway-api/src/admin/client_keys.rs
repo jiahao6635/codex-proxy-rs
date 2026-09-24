@@ -2,7 +2,7 @@
 
 use crate::auth::SessionState;
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
@@ -17,7 +17,7 @@ use gateway_core::{
     engine::budget::ClientBudgetLimits,
     metering::Decimal,
     policy::{ClientApiKeyId, PlaintextClientApiKey, RateLimits},
-    routing::AccountGroupId,
+    routing::{AccountGroupId, ProviderKind},
 };
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +37,10 @@ use super::{
 const MAX_CURSOR_BYTES: usize = 512;
 const MAX_SEARCH_BYTES: usize = 256;
 const DEFAULT_PAGE_SIZE: u16 = 50;
+
+type ProviderRequestProfileOverrides = BTreeMap<String, serde_json::Map<String, serde_json::Value>>;
+type ProviderRequestProfileOverrideUpdates =
+    BTreeMap<String, Option<serde_json::Map<String, serde_json::Value>>>;
 
 fn parse_budget(
     value: Option<String>,
@@ -147,6 +151,8 @@ impl ClientKeySort {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateClientKeyRequest {
+    #[serde(default)]
+    provider_request_profile_overrides: ProviderRequestProfileOverrides,
     openai_client_profile_override: Option<serde_json::Map<String, serde_json::Value>>,
     xai_client_profile_override: Option<serde_json::Map<String, serde_json::Value>>,
     custom_key: Option<String>,
@@ -177,13 +183,13 @@ impl CreateClientKeyRequest {
         let group_ids = validate_group_ids(self.group_ids)?;
         validate_limit(self.max_concurrency, "maxConcurrency")?;
         validate_limit(self.requests_per_minute, "requestsPerMinute")?;
+        let request_profile_overrides = normalize_request_profile_overrides(
+            self.provider_request_profile_overrides,
+            self.openai_client_profile_override,
+            self.xai_client_profile_override,
+        )?;
         Ok(CreateClientKey {
-            openai_client_profile_override: self
-                .openai_client_profile_override
-                .map(gateway_core::account::OpaqueProviderData::new),
-            xai_client_profile_override: self
-                .xai_client_profile_override
-                .map(gateway_core::account::OpaqueProviderData::new),
+            request_profile_overrides,
             custom_key: self
                 .custom_key
                 .filter(|key| !key.is_empty())
@@ -210,6 +216,8 @@ impl CreateClientKeyRequest {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateClientKeyRequest {
+    #[serde(default)]
+    provider_request_profile_overrides: ProviderRequestProfileOverrideUpdates,
     #[serde(default, deserialize_with = "deserialize_profile_override")]
     openai_client_profile_override: Option<Option<serde_json::Map<String, serde_json::Value>>>,
     #[serde(default, deserialize_with = "deserialize_profile_override")]
@@ -233,13 +241,13 @@ impl UpdateClientKeyRequest {
         let group_ids = validate_group_ids(self.group_ids)?;
         validate_limit(self.max_concurrency, "maxConcurrency")?;
         validate_limit(self.requests_per_minute, "requestsPerMinute")?;
+        let request_profile_override_updates = normalize_request_profile_override_updates(
+            self.provider_request_profile_overrides,
+            self.openai_client_profile_override,
+            self.xai_client_profile_override,
+        )?;
         Ok(UpdateClientKey {
-            openai_client_profile_override: self
-                .openai_client_profile_override
-                .map(|value| value.map(gateway_core::account::OpaqueProviderData::new)),
-            xai_client_profile_override: self
-                .xai_client_profile_override
-                .map(|value| value.map(gateway_core::account::OpaqueProviderData::new)),
+            request_profile_override_updates,
             id: client_key_id(self.id, "clientKeyMutationNotFound")?,
             name: self.name,
             label: self.label,
@@ -325,7 +333,10 @@ impl ClientKeyMutationRequest {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientKeyView {
+    provider_request_profile_overrides: ProviderRequestProfileOverrides,
+    /// 固定兼容字段；值始终从 provider_request_profile_overrides 派生。
     openai_client_profile_override: Option<serde_json::Map<String, serde_json::Value>>,
+    /// 固定兼容字段；值始终从 provider_request_profile_overrides 派生。
     xai_client_profile_override: Option<serde_json::Map<String, serde_json::Value>>,
     id: String,
     name: String,
@@ -364,13 +375,17 @@ impl From<ClientKeyRecord> for ClientKeyView {
         } else {
             "groups"
         };
+        let provider_request_profile_overrides = record
+            .request_profile_overrides
+            .into_iter()
+            .map(|(provider, profile)| (provider.as_str().to_owned(), profile.into_inner()))
+            .collect::<ProviderRequestProfileOverrides>();
         Self {
-            openai_client_profile_override: record
-                .openai_client_profile_override
-                .map(gateway_core::account::OpaqueProviderData::into_inner),
-            xai_client_profile_override: record
-                .xai_client_profile_override
-                .map(gateway_core::account::OpaqueProviderData::into_inner),
+            openai_client_profile_override: provider_request_profile_overrides
+                .get("openai")
+                .cloned(),
+            xai_client_profile_override: provider_request_profile_overrides.get("xai").cloned(),
+            provider_request_profile_overrides,
             id: record.id.to_string(),
             name: record.name,
             label: record.label,
@@ -698,6 +713,102 @@ fn client_key_id(
 fn validate_limit(value: u64, field: &'static str) -> Result<(), WireValidationError> {
     if i64::try_from(value).is_err() {
         return Err(WireValidationError::new(field));
+    }
+    Ok(())
+}
+
+fn normalize_request_profile_overrides(
+    profiles: ProviderRequestProfileOverrides,
+    openai: Option<serde_json::Map<String, serde_json::Value>>,
+    xai: Option<serde_json::Map<String, serde_json::Value>>,
+) -> Result<gateway_admin::model::client_keys::ProviderRequestProfileOverrides, WireValidationError>
+{
+    if profiles.len() > 256 {
+        return Err(WireValidationError::new("providerRequestProfileOverrides"));
+    }
+    let mut normalized = profiles
+        .into_iter()
+        .map(|(provider, profile)| {
+            validate_request_profile_size(&profile)?;
+            Ok((
+                ProviderKind::new(provider)
+                    .map_err(|_| WireValidationError::new("providerRequestProfileOverrides"))?,
+                gateway_core::account::OpaqueProviderData::new(profile),
+            ))
+        })
+        .collect::<Result<gateway_admin::model::client_keys::ProviderRequestProfileOverrides, _>>(
+        )?;
+    for (provider, profile) in [("openai", openai), ("xai", xai)] {
+        let Some(profile) = profile else {
+            continue;
+        };
+        validate_request_profile_size(&profile)?;
+        let provider = ProviderKind::new(provider).expect("static Provider kind is valid");
+        let profile = gateway_core::account::OpaqueProviderData::new(profile);
+        if normalized
+            .get(&provider)
+            .is_some_and(|current| current != &profile)
+        {
+            return Err(WireValidationError::new("providerRequestProfileOverrides"));
+        }
+        normalized.insert(provider, profile);
+    }
+    Ok(normalized)
+}
+
+fn normalize_request_profile_override_updates(
+    profiles: ProviderRequestProfileOverrideUpdates,
+    openai: Option<Option<serde_json::Map<String, serde_json::Value>>>,
+    xai: Option<Option<serde_json::Map<String, serde_json::Value>>>,
+) -> Result<
+    gateway_admin::model::client_keys::ProviderRequestProfileOverrideUpdates,
+    WireValidationError,
+> {
+    if profiles.len() > 256 {
+        return Err(WireValidationError::new("providerRequestProfileOverrides"));
+    }
+    let mut normalized = profiles
+        .into_iter()
+        .map(|(provider, profile)| {
+            if let Some(profile) = profile.as_ref() {
+                validate_request_profile_size(profile)?;
+            }
+            Ok((
+                ProviderKind::new(provider).map_err(|_| {
+                    WireValidationError::new("providerRequestProfileOverrides")
+                })?,
+                profile.map(gateway_core::account::OpaqueProviderData::new),
+            ))
+        })
+        .collect::<Result<
+            gateway_admin::model::client_keys::ProviderRequestProfileOverrideUpdates,
+            _,
+        >>()?;
+    for (provider, profile) in [("openai", openai), ("xai", xai)] {
+        let Some(profile) = profile else {
+            continue;
+        };
+        if let Some(profile) = profile.as_ref() {
+            validate_request_profile_size(profile)?;
+        }
+        let provider = ProviderKind::new(provider).expect("static Provider kind is valid");
+        let profile = profile.map(gateway_core::account::OpaqueProviderData::new);
+        if normalized
+            .get(&provider)
+            .is_some_and(|current| current != &profile)
+        {
+            return Err(WireValidationError::new("providerRequestProfileOverrides"));
+        }
+        normalized.insert(provider, profile);
+    }
+    Ok(normalized)
+}
+
+fn validate_request_profile_size(
+    profile: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), WireValidationError> {
+    if serde_json::to_vec(profile).map_or(true, |encoded| encoded.len() > 64 * 1024) {
+        return Err(WireValidationError::new("providerRequestProfileOverrides"));
     }
     Ok(())
 }

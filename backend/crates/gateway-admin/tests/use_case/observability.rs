@@ -750,6 +750,10 @@ impl ObservabilityStore for FixtureObservabilityStore {
         ))
     }
 
+    async fn usage_provider_kinds(&self, _: TimeRange) -> AdminStoreResult<Vec<String>> {
+        Ok(vec!["retired-provider".into()])
+    }
+
     async fn list_usage_records(&self, query: UsageQuery) -> AdminStoreResult<UsagePage> {
         let items = self.usage_records.lock().expect("usage records").clone();
         let total = u64::try_from(items.len()).unwrap_or(u64::MAX);
@@ -808,8 +812,7 @@ impl SettingsStore for FixtureSettingsStore {
     }
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings> {
         Ok(RuntimeSettings {
-            openai_client_profile: None,
-            xai_client_profile: None,
+            request_profiles: Default::default(),
             request_location_enabled: false,
             request_location: Default::default(),
             config_revision: Revision::new(1).expect("revision"),

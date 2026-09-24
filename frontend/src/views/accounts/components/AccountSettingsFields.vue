@@ -1,9 +1,7 @@
 <script setup lang="ts">
 import type { AccountGroup, AccountModelAccess } from '@/api'
+import { BaseFormItem, BaseInput, BaseSwitch } from '@codex-proxy/ui'
 import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import AccountModelAccessField from './AccountModelAccessField.vue'
 import AccountProxyField from './AccountProxyField.vue'
 

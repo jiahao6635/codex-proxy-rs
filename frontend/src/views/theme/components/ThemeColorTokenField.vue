@@ -1,9 +1,8 @@
 <script setup lang="ts">
-import { RotateCcw } from '@lucide/vue'
+import { BaseColorPicker, BaseIconButton } from '@codex-proxy/ui'
 
-import BaseColorPicker from '@/components/base/BaseColorPicker/index.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import { themeTokenAllowsAlpha } from '@/theme'
+import { themeTokenAllowsAlpha } from '@codex-proxy/ui/theme'
+import { RotateCcw } from '@lucide/vue'
 
 withDefaults(defineProps<{
   label: string

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { ClientProfilePreview } from '@/api/modules/client-profiles'
-import BaseSkeleton from '@/components/base/BaseSkeleton.vue'
+import { BaseSkeleton } from '@codex-proxy/ui'
 import { formatDateTime } from '@/utils/date'
 
 defineProps<{

@@ -1,12 +1,9 @@
 <script setup lang="ts">
 import type { PricingRow } from './model'
 import type { ModelPricing, PricingChange } from '@/api'
+import { BaseButton, BaseConfirmModal, BaseEmpty, BaseTablePagination } from '@codex-proxy/ui'
 import { CircleAlert } from '@lucide/vue'
 import { computed, ref, shallowRef } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import PricingBatchModal from './PricingBatchModal.vue'
 import PricingEditor from './PricingEditor.vue'
 import PricingSyncModal from './PricingSyncModal.vue'
@@ -14,7 +11,7 @@ import PricingTable from './PricingTable.vue'
 import PricingToolbar from './PricingToolbar.vue'
 import { usePricing } from './usePricing'
 
-const { catalog, provider, search, source, page, pageSize, selected, error, rows, visible, pagination, loading, saving, syncing, preview, load, save, startSync, confirmSync, toggle, togglePage } = usePricing()
+const { catalog, providers, provider, search, source, page, pageSize, selected, error, rows, visible, pagination, loading, saving, syncing, preview, load, save, startSync, confirmSync, toggle, togglePage } = usePricing()
 const editorOpen = ref(false)
 const editing = shallowRef<PricingRow>()
 const deleting = shallowRef<PricingRow>()
@@ -57,6 +54,7 @@ async function deleteModel() {
       :saving="saving"
       :syncing="syncing"
       :synced-at="catalog.syncedAt"
+      :providers="providers"
       @add="edit()"
       @sync="startSync"
       @set-multiplier="batch(false)"

@@ -1,11 +1,7 @@
 <script setup lang="ts">
 import type { PricingCatalog, PricingSyncPreview } from '@/api'
+import { BaseButton, BaseCheckbox, BaseModal, BaseScrollbar, BaseTag } from '@codex-proxy/ui'
 import { computed, shallowRef, watch } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
-import BaseTag from '@/components/base/BaseTag.vue'
 import { bands, effectivePrice, priceFields } from './model'
 
 const props = defineProps<{ preview?: PricingSyncPreview, catalog: PricingCatalog, saving: boolean }>()

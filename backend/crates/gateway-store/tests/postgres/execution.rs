@@ -441,6 +441,14 @@ async fn billing_snapshot_survives_later_price_changes_and_usage_detail_reads() 
     seed_running_request(&database.pool, "req_billing_snapshot")
         .await
         .unwrap();
+    sqlx::query(
+        "update model_requests
+         set provider_kind = 'example-plugin', upstream_model_id = 'plugin-model'
+         where id = 'req_billing_snapshot'",
+    )
+    .execute(&database.pool)
+    .await
+    .unwrap();
     let money = |ticks| {
         Money::new(
             Decimal::from_scaled(ticks).unwrap(),
@@ -489,7 +497,7 @@ async fn billing_snapshot_survives_later_price_changes_and_usage_detail_reads() 
     assert_eq!(saved.custom_multiplier_bps, 12500);
     assert_eq!(saved.total_amount.amount, "0.00075".parse().unwrap());
     sqlx::query("update runtime_settings set pricing_overrides_json = $1 where id = 1")
-        .bind(json!({"openai":{"gpt-5.4":{"multiplierBps":90000,"bands":{}}}}))
+        .bind(json!({"example-plugin":{"plugin-model":{"multiplierBps":90000,"bands":{}}}}))
         .execute(&database.pool)
         .await
         .unwrap();

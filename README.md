@@ -19,6 +19,16 @@
 > [!NOTE]
 > 本项目提供 Responses API，不支持 `/v1/chat/completions`，接入前请确认客户端支持 Responses 协议
 
+## 功能
+
+| 场景 | 能力 |
+| --- | --- |
+| 客户端接入 | Responses HTTP / SSE / WebSocket、Images、模型目录与 standalone Search |
+| 多账号与路由 | OpenAI、xAI 及插件 Provider，账号分组、模型范围、出站代理与安全重试 |
+| 使用与管理 | 管理端、Key 自助用量页、费用限额、请求记录与错误诊断 |
+| 插件扩展 | 制品访问域确认、自动默认配置，中间件、管理页面和其他声明能力 |
+| 运维 | 单副本部署，PostgreSQL / Redis、S3/R2 备份与同一大版本内在线更新 |
+
 ## 快速预览
 
 无需部署，打开 [快速预览服务](https://codex-proxy-rs.ainz.cc) 即可体验管理端的系统概览、账号分组、代理管理与用量统计
@@ -99,7 +109,7 @@ API Key 持有者可在同一登录页切换登录身份，进入 `/key-usage` �
 | Base URL | `http://127.0.0.1:8080/v1`；远程接入使用服务器的 HTTPS 地址 |
 | API Key | 管理端创建的客户端密钥 |
 
-可用模型以该密钥查询到的模型列表为准：
+查询该密钥可见的模型目录：
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \
@@ -108,14 +118,13 @@ curl http://127.0.0.1:8080/v1/models \
 
 ## 文档
 
-- [客户端接入与生图](deploy/README.md#客户端配置)
-- [部署、备份与恢复](deploy/README.md)
-- [API 参考](docs/api.md)
-- [模型定价与手动同步](docs/api.md#模型定价)
-- [系统架构](docs/architecture.md)
-- [管理端主题](docs/theme.md)
-- [数据库迁移](backend/migrations/README.md)
-- [贡献与审查](CONTRIBUTING.md)
+| 任务 | 文档 |
+| --- | --- |
+| 部署与使用 | [部署、备份与恢复](deploy/README.md) · [客户端接入与生图](deploy/README.md#客户端配置) |
+| 接口集成 | [API 参考](docs/api.md) · [模型定价](docs/api.md#模型定价) |
+| 使用插件 | [安装、配置与使用](docs/plugins.md) |
+| 开发插件 | [SDK 与合同](backend/crates/gateway-plugin/sdk/README.md) · [打包工具](backend/apps/plugin-cli/README.md) |
+| 开发宿主 | [贡献与验证](CONTRIBUTING.md) · [系统架构](docs/architecture.md) · [管理端主题](docs/theme.md) · [数据库迁移](backend/migrations/README.md) |
 
 ## 社区
 

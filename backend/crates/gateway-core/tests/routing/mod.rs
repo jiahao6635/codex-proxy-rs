@@ -7,7 +7,8 @@ use bytes::Bytes;
 use gateway_core::account::{AccountSelectionPolicy, ProviderAccountId, RotationStrategy};
 use gateway_core::operation::{
     CapabilityRequirements, Feature, GenerateRequest, ImageRequest, ImageRequestKind, Operation,
-    OperationKind, ProtocolPayload, RawJsonPayload,
+    OperationKind, ProtocolPayload, ProviderHttpMethod, ProviderHttpRequest, RawHttpPayload,
+    RawJsonPayload, TokenCountRequest,
 };
 use gateway_core::policy::{ClientApiKeyId, ClientPolicy, PlaintextClientApiKey, RateLimits};
 use gateway_core::routing::{
@@ -444,6 +445,31 @@ fn empty_account_scope_should_not_be_misreported_as_model_not_found() {
 }
 
 #[test]
+fn forced_provider_does_not_bypass_an_empty_key_account_scope() {
+    let snapshot = snapshot();
+    let empty_scope = Arc::new(FrozenAccountScope::new(
+        Arc::new(RuntimeAccountDirectory::default()),
+        ClientRoutingScope::all_accounts(),
+    ));
+    let error = snapshot
+        .plan(
+            &PublicModelId::new("gpt-5.5").expect("model"),
+            &operation(),
+            empty_scope,
+            &RoutingContext {
+                required_provider: Some(ProviderKind::new("openai").expect("provider")),
+                ..RoutingContext::default()
+            },
+        )
+        .expect_err("a forced Provider is not an account authorization");
+
+    assert!(matches!(
+        error,
+        gateway_core::error::RoutingError::NoCapableProvider { .. }
+    ));
+}
+
+#[test]
 fn provider_endpoint_plan_should_not_consult_or_publish_the_text_model_catalog() {
     let snapshot = snapshot();
     let provider = ProviderKind::new("openai").expect("provider");
@@ -453,6 +479,7 @@ fn provider_endpoint_plan_should_not_consult_or_publish_the_text_model_catalog()
     let plan = snapshot
         .plan_provider_endpoint(
             &provider,
+            None,
             &image_operation(),
             snapshot.all_account_scope(),
             &RoutingContext::default(),
@@ -473,6 +500,7 @@ fn provider_endpoint_plan_should_still_respect_circuit_filtering() {
     let error = snapshot
         .plan_provider_endpoint(
             &provider,
+            None,
             &image_operation(),
             snapshot.all_account_scope(),
             &RoutingContext {
@@ -486,6 +514,109 @@ fn provider_endpoint_plan_should_still_respect_circuit_filtering() {
         error,
         gateway_core::error::RoutingError::NoCapableProviderEndpoint { .. }
     ));
+}
+
+#[test]
+fn token_count_endpoint_should_require_exact_model_capability_and_scope() {
+    let provider = ProviderKind::new("openai").expect("provider");
+    let model = UpstreamModelId::new("gpt-5.5").expect("model");
+    let operation = Operation::CountTokens(TokenCountRequest::from_raw_json(
+        RawJsonPayload::new("token-count", Bytes::from_static(br#"{"input":"hello"}"#))
+            .expect("token count payload"),
+    ));
+    let unsupported = snapshot()
+        .plan_provider_endpoint(
+            &provider,
+            Some(&model),
+            &operation,
+            account_scope(),
+            &RoutingContext::default(),
+        )
+        .expect_err("generate-only model cannot count tokens");
+    assert!(matches!(
+        unsupported,
+        gateway_core::error::RoutingError::UnsupportedProviderEndpoint { .. }
+    ));
+
+    let capabilities = ModelCapabilities::new(
+        BTreeSet::from([OperationKind::Generate, OperationKind::CountTokens]),
+        Some(16_000),
+    );
+    let capable = RuntimeSnapshot::new(
+        ConfigRevision::new(1).expect("revision"),
+        scheduling(),
+        vec![provider.clone()],
+        vec![ProviderModel::new(
+            provider.clone(),
+            model.clone(),
+            capabilities,
+        )],
+        Vec::new(),
+    )
+    .expect("snapshot")
+    .with_account_directory(account_directory());
+    let plan = capable
+        .plan_provider_endpoint(
+            &provider,
+            Some(&model),
+            &operation,
+            capable.all_account_scope(),
+            &RoutingContext::default(),
+        )
+        .expect("declared token counter");
+    assert_eq!(plan.operation(), OperationKind::CountTokens);
+    assert_eq!(plan.candidates()[0].upstream_model(), Some(&model));
+    assert!(
+        capable
+            .plan_provider_endpoint(
+                &provider,
+                None,
+                &operation,
+                capable.all_account_scope(),
+                &RoutingContext::default(),
+            )
+            .is_err(),
+        "token counting cannot drop the model binding"
+    );
+}
+
+#[test]
+fn provider_http_endpoint_should_be_provider_scoped_without_a_model_binding() {
+    let snapshot = snapshot();
+    let provider = ProviderKind::new("openai").expect("provider");
+    let operation = Operation::ProviderHttp(
+        ProviderHttpRequest::new(
+            "models",
+            ProviderHttpMethod::Get,
+            None,
+            Vec::new(),
+            RawHttpPayload::new("provider-http", Bytes::new()).expect("HTTP payload"),
+        )
+        .expect("provider HTTP operation"),
+    );
+    let plan = snapshot
+        .plan_provider_endpoint(
+            &provider,
+            None,
+            &operation,
+            snapshot.all_account_scope(),
+            &RoutingContext::default(),
+        )
+        .expect("provider endpoint");
+    assert_eq!(plan.candidates()[0].provider(), &provider);
+    assert_eq!(plan.candidates()[0].upstream_model(), None);
+    assert!(
+        snapshot
+            .plan_provider_endpoint(
+                &provider,
+                Some(&UpstreamModelId::new("gpt-5.5").expect("model")),
+                &operation,
+                snapshot.all_account_scope(),
+                &RoutingContext::default(),
+            )
+            .is_err(),
+        "raw provider HTTP cannot smuggle a model binding"
+    );
 }
 
 #[test]
@@ -657,7 +788,10 @@ fn alias_should_only_be_available_from_a_provider_with_its_mapped_model() {
 
 #[test]
 fn account_model_access_filters_catalog_and_aliases_using_the_whole_frozen_pool() {
-    use gateway_core::account::{AccountModelAccess, AccountModelAccessMode};
+    use gateway_core::{
+        account::{AccountModelAccess, AccountModelAccessMode},
+        error::RoutingError,
+    };
     let provider = ProviderKind::new("openai").expect("provider");
     let restricted =
         AccountModelAccess::new(AccountModelAccessMode::Denylist, vec!["gpt-5.5".to_owned()])
@@ -667,7 +801,10 @@ fn account_model_access_filters_catalog_and_aliases_using_the_whole_frozen_pool(
         RuntimeAccount::new(provider.clone(), BTreeSet::new())
             .with_model_access(restricted.clone()),
     )])));
-    let old_scope = FrozenAccountScope::new(directory, ClientRoutingScope::all_accounts());
+    let old_scope = Arc::new(FrozenAccountScope::new(
+        directory,
+        ClientRoutingScope::all_accounts(),
+    ));
     let snapshot = snapshot();
     assert_eq!(
         snapshot
@@ -680,6 +817,15 @@ fn account_model_access_filters_catalog_and_aliases_using_the_whole_frozen_pool(
     assert!(!snapshot.contains_public_model_for_scope(
         &PublicModelId::new("gpt-5.4").expect("alias"),
         &old_scope
+    ));
+    assert!(matches!(
+        snapshot.plan(
+            &PublicModelId::new("gpt-5.4").expect("alias"),
+            &operation(),
+            old_scope.clone(),
+            &RoutingContext::default(),
+        ),
+        Err(RoutingError::NoCapableProvider { .. })
     ));
     let new_scope = FrozenAccountScope::new(
         Arc::new(RuntimeAccountDirectory::new(BTreeMap::from([

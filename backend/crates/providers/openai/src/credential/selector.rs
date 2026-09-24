@@ -12,7 +12,7 @@ use gateway_core::account::{
     ProviderAccountId, QuotaEvidence,
 };
 use gateway_core::concurrency::{CapacityWait, ConcurrencyWaitQueue, QueueRejection};
-use gateway_core::engine::{AttemptContext, ContinuationAttempt};
+use gateway_core::engine::{AttemptContext, ContinuationAttempt, policy::AccountPolicyError};
 use gateway_core::provider_ports::{
     ProviderLeaseAcquisition, ProviderLeaseGuard, ProviderLeasePort, ProviderLeaseRequest,
     ProviderSchedulingLeaseRequest, ProviderSessionAffinityKey, ProviderSessionAffinityPort,
@@ -141,6 +141,7 @@ enum AffinityEscapeReason {
     LeaseSaturated,
     HigherPriority,
     PinnedAccount,
+    SchedulingPolicy,
     SelectionInvariant,
 }
 
@@ -153,6 +154,7 @@ impl AffinityEscapeReason {
             Self::LeaseSaturated => "lease_saturated",
             Self::HigherPriority => "higher_priority",
             Self::PinnedAccount => "pinned_account",
+            Self::SchedulingPolicy => "scheduling_policy",
             Self::SelectionInvariant => "selection_invariant",
         }
     }
@@ -206,6 +208,9 @@ impl AffinitySelection {
         }
         match selection {
             PreferredAccountSelection::Hit => {}
+            PreferredAccountSelection::OverriddenByPolicy => {
+                self.escape(AffinityEscapeReason::SchedulingPolicy);
+            }
             PreferredAccountSelection::Blocked(AccountSchedulingBlocker::ConcurrencyLimit) => {
                 self.escape(AffinityEscapeReason::LeaseSaturated);
             }
@@ -319,6 +324,42 @@ impl CodexCredentialSelector {
             Some(request.upstream_model),
         )
         .await
+    }
+
+    /// 中间件完成请求改写后，用真实 OpenAI 会话事实复验已持有的租约。
+    ///
+    /// 此处只复用既有亲和与 cyber-policy 端口，不再次选号；冲突必须在发送前失败，
+    /// 避免同一 attempt 持有旧租约时重入账号选择。
+    pub(crate) async fn validate_translated_selection(
+        &self,
+        lease: &mut CodexCredentialLease,
+        session_affinity: Option<&CodexSessionAffinity>,
+        cyber_policy_session_key: Option<&ProviderSessionAffinityKey>,
+    ) -> Result<(), CredentialSelectionError> {
+        let selected_account = lease.account.id().clone();
+        if let Some(affinity) = session_affinity {
+            if self
+                .claim_initial_session_affinity(affinity.key(), &selected_account)
+                .await
+                .is_some_and(|effective| effective != selected_account)
+            {
+                return Err(CredentialSelectionError::NoEligibleCredential);
+            }
+            lease.affinity_expected_account_id = selected_account.clone();
+        }
+
+        let cyber_policy_scope = self
+            .prepare_cyber_policy_scope(cyber_policy_session_key)
+            .await;
+        if cyber_policy_scope
+            .as_ref()
+            .and_then(|scope| scope.state.as_ref())
+            .is_some_and(|state| state.excluded_accounts().contains(&selected_account))
+        {
+            return Err(CredentialSelectionError::NoEligibleCredential);
+        }
+        lease.cyber_policy_scope = cyber_policy_scope;
+        Ok(())
     }
 
     /// 为不属于 Responses 文本模型目录的 Provider 原生端点选择账号。
@@ -573,7 +614,20 @@ impl CodexCredentialSelector {
                             .insert(candidate.account.id().clone());
                     }
                 }
-                let selection = AccountSelector.select(&candidates, &context);
+                let selection = match request
+                    .attempt
+                    .select_account(&self.provider_kind, upstream_model, &candidates, &context)
+                    .await
+                {
+                    Ok(selection) => selection,
+                    Err(AccountPolicyError::StaleCandidate) => continue 'capacity,
+                    Err(AccountPolicyError::Rejected) => {
+                        return Err(CredentialSelectionError::PolicyRejected);
+                    }
+                    Err(AccountPolicyError::Fault) => {
+                        return Err(CredentialSelectionError::PolicyUnavailable);
+                    }
+                };
                 request.attempt.trace().account_selection(
                     &candidates,
                     &context,
@@ -1527,6 +1581,10 @@ pub enum CredentialSelectionError {
     Coordinator,
     #[error("Codex Cookie policy rejected the value")]
     CookiePolicy,
+    #[error("account scheduling policy rejected the request")]
+    PolicyRejected,
+    #[error("account scheduling policy is unavailable")]
+    PolicyUnavailable,
 }
 
 impl From<CredentialRepositoryError> for CredentialSelectionError {

@@ -2,10 +2,8 @@
 import type { EChartsOption, LineSeriesOption } from 'echarts'
 import type { getUsageRecordInsightsOverview } from '@/api'
 
+import { BaseCard, BaseEmpty, BaseSegmented } from '@codex-proxy/ui'
 import { computed, shallowRef } from 'vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import {
   requestActivityByBucket,

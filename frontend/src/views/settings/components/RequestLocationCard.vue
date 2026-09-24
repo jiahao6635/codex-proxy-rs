@@ -1,8 +1,6 @@
 <script setup lang="ts">
 import type { RequestLocation } from '@/api'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseForm from '@/components/base/BaseForm/index.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
+import { BaseCard, BaseForm, BaseSwitch } from '@codex-proxy/ui'
 import RequestLocationFields from '@/components/RequestLocationFields.vue'
 
 defineProps<{ disabled: boolean }>()

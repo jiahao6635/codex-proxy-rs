@@ -1,11 +1,8 @@
 <script setup lang="ts">
+import { BaseButton, BaseIconButton, BasePageHeader, BaseSelect } from '@codex-proxy/ui'
 import { Info, KeyRound, LogOut, Moon, RefreshCw, Sun, Terminal } from '@lucide/vue'
 import { shallowRef } from 'vue'
 import { useRouter } from 'vue-router'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BasePageHeader from '@/components/base/BasePageHeader.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
 import { useAuthStore } from '@/stores/modules/auth'
 import { useThemeStore } from '@/stores/modules/theme'
 

@@ -1,9 +1,120 @@
-use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+use axum::http::{
+    HeaderMap, HeaderValue, Method, StatusCode,
+    header::{self, AUTHORIZATION},
+};
+use futures::future::BoxFuture;
 
 use gateway_api::openai::auth::{
     ClientApiKeyAuthError, bearer_client_api_key, identify_codex_client,
 };
-use gateway_core::policy::CodexClientKind;
+use gateway_core::{
+    engine::{
+        authentication::ClientAuthenticationRequest,
+        execution::{
+            AuthenticatedClient, ClientAuthenticationError, ExecutionService, StartExecution,
+            StartProviderExecution, StartedExecution,
+        },
+    },
+    error::{GatewayError, GatewayErrorKind},
+    policy::CodexClientKind,
+    routing::PublicModelId,
+};
+use tower::ServiceExt as _;
+
+struct EnvelopeAuthentication {
+    client: AuthenticatedClient,
+    calls: AtomicUsize,
+}
+
+impl ExecutionService for EnvelopeAuthentication {
+    fn authenticate(&self, _: &str) -> Result<AuthenticatedClient, ClientAuthenticationError> {
+        Err(ClientAuthenticationError::InvalidKey)
+    }
+
+    fn authenticate_request(
+        &self,
+        request: ClientAuthenticationRequest,
+    ) -> BoxFuture<'_, Result<AuthenticatedClient, ClientAuthenticationError>> {
+        assert_eq!(request.authorization(), "External controlled-credential");
+        let debug = format!("{request:?}");
+        for private in [
+            "controlled-credential",
+            "controlled-fixture",
+            "private-client",
+            "192.0.2.9",
+        ] {
+            assert!(!debug.contains(private));
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let client = self.client.clone();
+        Box::pin(async move { Ok(client) })
+    }
+
+    fn public_models(&self, _: &AuthenticatedClient) -> Vec<PublicModelId> {
+        Vec::new()
+    }
+
+    fn contains_public_model(&self, _: &AuthenticatedClient, _: &PublicModelId) -> bool {
+        false
+    }
+
+    fn start(&self, _: StartExecution) -> BoxFuture<'_, Result<StartedExecution, GatewayError>> {
+        Box::pin(async {
+            Err(GatewayError::new(
+                GatewayErrorKind::Internal,
+                "authentication envelope test must not execute",
+            ))
+        })
+    }
+
+    fn start_provider_endpoint(
+        &self,
+        _: StartProviderExecution,
+    ) -> BoxFuture<'_, Result<StartedExecution, GatewayError>> {
+        Box::pin(async {
+            Err(GatewayError::new(
+                GatewayErrorKind::Internal,
+                "authentication envelope test must not execute",
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn plugin_authentication_envelope_contains_only_authorization() {
+    let fixture = crate::admin::AdminTestFixture::new().await;
+    let execution = Arc::new(EnvelopeAuthentication {
+        client: super::authenticated_client("unused-native-key"),
+        calls: AtomicUsize::new(0),
+    });
+    let app = super::api_router_with_admin_and_execution(fixture.services, execution.clone());
+    let mut request = crate::support::empty_request(Method::GET, "/v1/models");
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("External controlled-credential"),
+    );
+    request.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("admin_session=controlled-fixture"),
+    );
+    request.headers_mut().insert(
+        header::USER_AGENT,
+        HeaderValue::from_static("private-client"),
+    );
+    request
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("192.0.2.9"));
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(execution.calls.load(Ordering::SeqCst), 1);
+}
 
 #[test]
 fn bearer_client_api_key_should_reject_missing_authorization() {

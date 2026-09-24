@@ -1,12 +1,13 @@
 import type { RequestOptions } from '../request'
 import type { AccountGroupRef } from './account-groups'
-import type { ClientProfileSelection, XaiClientProfileSelection } from './client-profiles'
+import type { ClientProfileSelection, ProviderRequestProfile, ProviderRequestProfiles, XaiClientProfileSelection } from './client-profiles'
 import request from '../request'
 
 export type ApiKeyRoutingScope = 'all' | 'groups'
 export type ApiKeyBudgetPeriod = 'daily' | 'weekly' | 'all'
 
 export interface ApiKey {
+  providerRequestProfileOverrides: ProviderRequestProfiles
   openaiClientProfileOverride: ClientProfileSelection | null
   xaiClientProfileOverride: XaiClientProfileSelection | null
 
@@ -62,9 +63,6 @@ interface ApiKeyListParams {
 }
 
 export interface ApiKeyWriteParam {
-  openaiClientProfileOverride: ClientProfileSelection | null
-  xaiClientProfileOverride: XaiClientProfileSelection | null
-
   name: string
   label: string | null
   groupIds: string[]
@@ -76,9 +74,11 @@ export interface ApiKeyWriteParam {
 
 interface ApiKeyUpdateParam extends ApiKeyWriteParam {
   id: string
+  providerRequestProfileOverrides: Record<string, ProviderRequestProfile | null>
 }
 
 interface ApiKeyCreateParam extends ApiKeyWriteParam {
+  providerRequestProfileOverrides: ProviderRequestProfiles
   customKey?: string
 }
 

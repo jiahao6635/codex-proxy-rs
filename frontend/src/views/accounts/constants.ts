@@ -1,5 +1,5 @@
 import type { AccountErrorReason, AccountStatus, getAccounts } from '@/api'
-import { defineTableColumns } from '@/components/base/BaseTable/columns'
+import { defineTableColumns } from '@codex-proxy/ui'
 import { formatProviderLabel } from '@/utils/providers'
 
 export type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]

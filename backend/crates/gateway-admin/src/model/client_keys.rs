@@ -1,6 +1,6 @@
 //! Client API Key 的 Command、Result 与安全秘密类型。
 
-use std::{fmt, num::NonZeroU16};
+use std::{collections::BTreeMap, fmt, num::NonZeroU16};
 
 use chrono::{DateTime, Utc};
 
@@ -11,6 +11,11 @@ use gateway_core::{
 };
 
 use super::{AdminModelError, Revision, account_groups::AccountGroupRef};
+
+pub type ProviderRequestProfileOverrides =
+    BTreeMap<ProviderKind, gateway_core::account::OpaqueProviderData>;
+pub type ProviderRequestProfileOverrideUpdates =
+    BTreeMap<ProviderKind, Option<gateway_core::account::OpaqueProviderData>>;
 
 /// Client Key 列表保持旧 HTTP 合同允许的完整非零 `u16` 页大小。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -86,8 +91,7 @@ pub struct ClientKeyListQuery {
 /// 不含完整明文 Key 的管理投影。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientKeyRecord {
-    pub openai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
-    pub xai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub request_profile_overrides: ProviderRequestProfileOverrides,
     pub id: ClientApiKeyId,
     pub name: String,
     pub label: Option<String>,
@@ -146,8 +150,7 @@ impl fmt::Debug for ClientKeySecret {
 /// API 提交的 Client Key 创建命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateClientKey {
-    pub openai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
-    pub xai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub request_profile_overrides: ProviderRequestProfileOverrides,
     pub custom_key: Option<PlaintextClientApiKey>,
     pub name: String,
     pub label: Option<String>,
@@ -159,8 +162,7 @@ pub struct CreateClientKey {
 /// 管理用例生成 ID 与明文后的持久化命令。
 #[derive(Clone, PartialEq, Eq)]
 pub struct NewClientKey {
-    pub openai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
-    pub xai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub request_profile_overrides: ProviderRequestProfileOverrides,
     pub id: ClientApiKeyId,
     pub name: String,
     pub label: Option<String>,
@@ -185,8 +187,7 @@ impl fmt::Debug for NewClientKey {
 /// 修改 Client Key 的公开策略字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateClientKey {
-    pub openai_client_profile_override: Option<Option<gateway_core::account::OpaqueProviderData>>,
-    pub xai_client_profile_override: Option<Option<gateway_core::account::OpaqueProviderData>>,
+    pub request_profile_override_updates: ProviderRequestProfileOverrideUpdates,
     pub id: ClientApiKeyId,
     pub name: String,
     pub label: Option<String>,

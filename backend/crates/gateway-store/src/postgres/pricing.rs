@@ -1,7 +1,10 @@
 //! 价格覆盖与请求费用明细的持久化。
 
 use gateway_admin::model::pricing::{PricingChange, PricingSyncChanges, UpdatePricing};
-use gateway_core::metering::{ModelPriceOverride, PricingOverrides};
+use gateway_core::{
+    metering::{ModelPriceOverride, PricingOverrides},
+    routing::ProviderKind,
+};
 use sqlx::types::Json;
 
 use super::{
@@ -110,7 +113,7 @@ pub(crate) fn validate_pricing(pricing: &PricingOverrides) -> StoreResult<()> {
         return Err(invalid_pricing());
     }
     for (provider, models) in pricing {
-        if !matches!(provider.as_str(), "openai" | "xai") {
+        if ProviderKind::new(provider.clone()).is_err() {
             return Err(invalid_pricing());
         }
         for (model, pricing) in models {

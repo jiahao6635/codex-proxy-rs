@@ -247,6 +247,8 @@ pub struct ImportProviderAccounts {
 pub struct ProviderAccountAdminImport {
     pub config_revision: Revision,
     pub account_ids: Vec<String>,
+    /// 与导入同一事务返回的最终凭据版本，避免提交后再查到另一轮写入。
+    pub credential_revisions: std::collections::BTreeMap<String, Revision>,
 }
 
 impl fmt::Debug for ImportProviderAccounts {

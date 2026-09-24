@@ -1,13 +1,8 @@
 <script setup lang="ts">
 import type { AccountImportTask, AccountImportTaskDetail } from '@/api'
+import { BaseButton, BaseEmpty, BaseIconButton, BaseModal, BasePopover, BaseSelect } from '@codex-proxy/ui'
 import { CircleAlert, ListTodo } from '@lucide/vue'
 import { computed, shallowRef, useId, watch } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BasePopover from '@/components/base/BasePopover.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
 import { taskLabel, taskTime } from './presenter'
 import TaskDetail from './TaskDetail.vue'
 

@@ -1,5 +1,6 @@
 import type { BackupSettingsView, UpdateBackupStoragePayload } from '@/api'
 
+import { toast } from '@codex-proxy/ui'
 import { reactive, shallowRef } from 'vue'
 import {
   getBackupSettings,
@@ -7,7 +8,6 @@ import {
   updateBackupSchedule,
   updateBackupStorage,
 } from '@/api'
-import { toast } from '@/components/base/BaseToast'
 import { errorMessage } from '@/utils/async'
 
 /** 存储与计划配置共用的加载/保存/测试 composable。 */

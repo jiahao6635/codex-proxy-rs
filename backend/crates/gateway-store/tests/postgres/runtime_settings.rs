@@ -9,8 +9,7 @@ use super::TestDatabase;
 
 fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
     RuntimeSettingsUpdate {
-        openai_client_profile: None,
-        xai_client_profile: None,
+        request_profile_updates: BTreeMap::new(),
         request_location_enabled: false,
         request_location: Default::default(),
         admin_api_key: None,
@@ -527,11 +526,14 @@ async fn request_profile_initialization_is_idempotent_and_old_updates_preserve_i
             .load_runtime_settings()
             .await
             .unwrap()
-            .openai_client_profile,
-        Some(initial)
+            .request_profiles
+            .get(&provider),
+        Some(&initial)
     );
     let mut update = settings_with_margin(3600);
-    update.openai_client_profile = Some(document("edited"));
+    update
+        .request_profile_updates
+        .insert(provider.clone(), Some(document("edited")));
     repository.update_runtime_settings(update).await.unwrap();
     assert_eq!(
         repository
@@ -539,6 +541,50 @@ async fn request_profile_initialization_is_idempotent_and_old_updates_preserve_i
             .await
             .unwrap(),
         document("edited")
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn request_profile_deletion_is_explicit_and_preserves_other_profiles() {
+    use gateway_core::{
+        account::OpaqueProviderData, provider_ports::ProviderRuntimePolicyPort,
+        routing::ProviderKind,
+    };
+    let Some(database) = TestDatabase::create("request_profile_deletion").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let kept = ProviderKind::new("provider.kept").unwrap();
+    let removed = ProviderKind::new("provider.removed").unwrap();
+    let profile = |marker: &str| {
+        OpaqueProviderData::new(
+            serde_json::json!({"marker":marker})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    };
+    repository
+        .initialize_request_profile(&kept, profile("kept"))
+        .await
+        .unwrap();
+    repository
+        .initialize_request_profile(&removed, profile("removed"))
+        .await
+        .unwrap();
+
+    let mut update = settings_with_margin(3_600);
+    update.request_profile_updates.insert(removed.clone(), None);
+    repository.update_runtime_settings(update).await.unwrap();
+    let settings = repository.load_runtime_settings().await.unwrap();
+
+    assert_eq!(
+        (
+            settings.request_profiles.get(&kept),
+            settings.request_profiles.get(&removed),
+        ),
+        (Some(&profile("kept")), None),
     );
     database.close().await;
 }
@@ -574,15 +620,30 @@ async fn xai_profile_initialization_and_updates_preserve_other_providers() {
         document("initial")
     );
     let mut update = settings_with_margin(3600);
-    update.openai_client_profile = Some(document("openai"));
-    update.xai_client_profile = Some(document("xai"));
+    update.request_profile_updates.insert(
+        ProviderKind::new("openai").unwrap(),
+        Some(document("openai")),
+    );
+    update
+        .request_profile_updates
+        .insert(provider.clone(), Some(document("xai")));
     repository.update_runtime_settings(update).await.unwrap();
     let mut update = settings_with_margin(3600);
-    update.xai_client_profile = Some(document("edited"));
+    update
+        .request_profile_updates
+        .insert(provider.clone(), Some(document("edited")));
     repository.update_runtime_settings(update).await.unwrap();
     let settings = repository.load_runtime_settings().await.unwrap();
-    assert_eq!(settings.openai_client_profile, Some(document("openai")));
-    assert_eq!(settings.xai_client_profile, Some(document("edited")));
+    assert_eq!(
+        settings
+            .request_profiles
+            .get(&ProviderKind::new("openai").unwrap()),
+        Some(&document("openai"))
+    );
+    assert_eq!(
+        settings.request_profiles.get(&provider),
+        Some(&document("edited"))
+    );
     assert_eq!(
         repository
             .initialize_request_profile(&provider, document("old-yaml"))
@@ -590,5 +651,71 @@ async fn xai_profile_initialization_and_updates_preserve_other_providers() {
             .unwrap(),
         document("edited")
     );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn request_profile_projection_is_revision_consistent_and_includes_key_overrides() {
+    use gateway_core::{
+        account::OpaqueProviderData,
+        provider_ports::{ProviderRuntimePolicyPort, ProviderStoreErrorKind},
+        routing::ProviderKind,
+    };
+    let Some(database) = TestDatabase::create("request_profile_projection").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let provider = ProviderKind::new("provider.example").unwrap();
+    let document = |marker: &str| {
+        OpaqueProviderData::new(
+            serde_json::json!({"marker":marker})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    };
+    let mut update = settings_with_margin(3600);
+    update
+        .request_profile_updates
+        .insert(provider.clone(), Some(document("global")));
+    repository.update_runtime_settings(update).await.unwrap();
+    sqlx::query(
+        "insert into client_api_keys (
+           id, name, key, enabled, max_concurrency, requests_per_minute,
+           provider_request_profiles_json, created_at, updated_at
+         ) values ($1, $2, $3, true, 0, 0, $4::jsonb, now(), now())",
+    )
+    .bind("key_profile_projection")
+    .bind("profile projection")
+    .bind("synthetic-profile-projection-secret")
+    .bind(sqlx::types::Json(serde_json::json!({
+        "provider.example":{"marker":"key"}
+    })))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let revision = repository
+        .load_runtime_settings()
+        .await
+        .unwrap()
+        .config_revision;
+    let revision = gateway_core::routing::ConfigRevision::new(revision.get()).unwrap();
+    let profiles = repository
+        .load_request_profile_configurations(revision, &provider)
+        .await
+        .unwrap();
+    assert_eq!(profiles.len(), 2);
+    assert!(profiles.contains(&document("global")));
+    assert!(profiles.contains(&document("key")));
+
+    repository
+        .update_runtime_settings(settings_with_margin(7200))
+        .await
+        .unwrap();
+    let error = repository
+        .load_request_profile_configurations(revision, &provider)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ProviderStoreErrorKind::Conflict);
     database.close().await;
 }

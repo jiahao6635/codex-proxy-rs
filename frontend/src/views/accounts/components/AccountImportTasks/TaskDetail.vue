@@ -1,11 +1,8 @@
 <script setup lang="ts">
 import type { AccountImportTaskDetail } from '@/api'
+import { BaseButton, BaseEmpty, BaseScrollbar, BaseSegmented } from '@codex-proxy/ui'
 import { ArrowUpRight, Check, CircleAlert, Square, X } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { itemDescription, itemStates, outcomeOrder, processed, taskLabel, taskTime } from './presenter'
 

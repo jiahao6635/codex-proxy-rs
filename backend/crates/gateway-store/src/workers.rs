@@ -1,6 +1,101 @@
 //! Worker 贡献、调度定义与健康探针。
 
 use super::*;
+use gateway_core::task::DaemonTask;
+
+const COMMAND_DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
+
+pub(crate) struct CommandStoreWriters {
+    pub(crate) execution: postgres::ExecutionObservationWriter<postgres::PgExecutionStore>,
+    pub(crate) client_key_usage: postgres::PgClientApiKeyUsageWriter,
+    pub(crate) admission_release: redis::ClientAdmissionReleaseWriter,
+    pub(crate) circuit_feedback: redis::ProviderCircuitFeedbackWriter,
+}
+
+/// 短生命周期 CLI 只运行数据面必需的四个写泵，不注册恢复、保留或维护 Worker。
+pub struct CommandStoreDrain {
+    cancellation: gateway_core::lifecycle::CancellationToken,
+    tasks: Vec<tokio::task::JoinHandle<Result<(), WorkerTaskError>>>,
+    execution_idle: postgres::ExecutionBufferIdle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("command store writes could not be drained")]
+pub struct CommandStoreDrainError;
+
+impl CommandStoreWriters {
+    pub(crate) fn start(self) -> CommandStoreDrain {
+        let cancellation = gateway_core::lifecycle::CancellationToken::new();
+        let Self {
+            execution,
+            client_key_usage,
+            admission_release,
+            circuit_feedback,
+        } = self;
+        let execution_idle = execution.idle();
+        let tasks = vec![
+            spawn_command_writer(execution, cancellation.child_token()),
+            spawn_command_writer(client_key_usage, cancellation.child_token()),
+            spawn_command_writer(admission_release, cancellation.child_token()),
+            spawn_command_writer(circuit_feedback, cancellation.child_token()),
+        ];
+        CommandStoreDrain {
+            cancellation,
+            tasks,
+            execution_idle,
+        }
+    }
+}
+
+fn spawn_command_writer<T>(
+    writer: T,
+    cancellation: gateway_core::lifecycle::CancellationToken,
+) -> tokio::task::JoinHandle<Result<(), WorkerTaskError>>
+where
+    T: DaemonTask + Send + 'static,
+{
+    tokio::spawn(async move { writer.run(cancellation).await })
+}
+
+impl CommandStoreDrain {
+    pub(crate) async fn shutdown(mut self) -> Result<(), CommandStoreDrainError> {
+        let deadline = std::time::Instant::now() + COMMAND_DRAIN_TIMEOUT;
+        // CLI 调用方已结束数据面会话；先让已接收的 execution 写入在正常 writer
+        // 路径完成，避免立即取消后落入更短的常驻进程关闭丢弃窗口。
+        let mut failed = !self.execution_idle.wait_until(deadline).await;
+        self.cancellation.cancel();
+        for mut task in self.tasks.drain(..) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                task.abort();
+                failed = true;
+                continue;
+            }
+            match tokio::time::timeout(remaining, &mut task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(_))) | Ok(Err(_)) => failed = true,
+                Err(_) => {
+                    task.abort();
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            Err(CommandStoreDrainError)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for CommandStoreDrain {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
 
 pub(crate) fn store_worker_contributions(
     execution: Arc<postgres::PgExecutionStore>,

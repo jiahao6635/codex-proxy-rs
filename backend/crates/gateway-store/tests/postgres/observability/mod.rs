@@ -35,6 +35,54 @@ fn observability_range_rejects_empty_window() {
     assert!(ObservabilityRange::new(now, now).is_err());
 }
 
+#[tokio::test]
+async fn usage_provider_filters_preserve_deleted_accounts_and_late_errors_within_range() {
+    let Some(database) = TestDatabase::create("usage_provider_filters").await else {
+        return;
+    };
+    let now = Utc::now();
+    seed_observability_facts(&database.pool, now).await.unwrap();
+    sqlx::query("update model_requests set provider_kind = 'outside-range', started_at = $1 - interval '3 hours', completed_at = $1 - interval '2 hours'")
+        .bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("update model_requests set provider_kind = 'retired-plugin', started_at = $1 - interval '5 minutes', completed_at = $1 - interval '4 minutes' where id = 'req_observe_success'")
+        .bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("update model_requests set provider_kind = 'late-error', completed_at = $1 - interval '3 minutes' where id = 'req_observe_failed'")
+        .bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query("update model_requests set provider_kind = 'end-boundary', started_at = $1, completed_at = $1 where id = 'req_observe_uncommitted'")
+        .bind(now).execute(&database.pool).await.unwrap();
+    sqlx::query(
+        "update ops_events set provider_kind = 'ops-only', created_at = $1 - interval '2 minutes'",
+    )
+    .bind(now)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query("delete from provider_accounts")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let store = admin_observability_store(&database.pool);
+    let providers = store
+        .usage_provider_kinds(
+            admin_observability::TimeRange::new(now - TimeDelta::hours(1), now).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(providers, ["late-error", "ops-only", "retired-plugin"]);
+    let empty = store
+        .usage_provider_kinds(
+            admin_observability::TimeRange::new(
+                now + TimeDelta::hours(1),
+                now + TimeDelta::hours(2),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(empty.is_empty());
+    database.close().await;
+}
+
 #[test]
 fn observability_range_accepts_full_configured_retention_window() {
     let now = Utc::now();

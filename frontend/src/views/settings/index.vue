@@ -1,13 +1,9 @@
 <script setup lang="ts">
+import { BaseButton, BaseIconButton, BasePageHeader, BaseSegmented, BaseSelect } from '@codex-proxy/ui'
+
 import { Save, Undo2 } from '@lucide/vue'
 import { computed, reactive, shallowRef, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BasePageHeader from '@/components/base/BasePageHeader.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
 
 import AccountAutoFreezeCard from './components/AccountAutoFreezeCard.vue'
 import SettingsBackupSection from './components/backup/SettingsBackupSection.vue'
@@ -170,8 +166,7 @@ watch(section, (value) => {
         <div v-if="visited.has('upstream')" v-show="section === 'upstream'" class="grid min-w-0 gap-5">
           <TokenRefreshCard v-model:refresh-margin-seconds="refreshMarginSecondsValue" v-model:refresh-concurrency="refreshConcurrencyValue" />
           <ClientProfileCard
-            v-model:openai="form.openaiClientProfile"
-            v-model:xai="form.xaiClientProfile"
+            v-model="form.providerRequestProfiles"
             :active="section === 'upstream'"
             :disabled="disabled"
           />

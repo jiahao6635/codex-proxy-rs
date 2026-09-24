@@ -1,9 +1,8 @@
 <script setup lang="ts">
 import type { OpsError } from '@/api'
 
+import { BaseButton, BaseModal } from '@codex-proxy/ui'
 import { computed } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
 import { failureClassText } from '../utils/opsErrorPresentation'
 import RequestDiagnosticsPanel from './RequestDiagnosticsPanel.vue'
 import UsageDetailCodePanel from './UsageDetailCodePanel.vue'

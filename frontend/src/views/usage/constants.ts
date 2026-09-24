@@ -1,6 +1,6 @@
 import type { UsageDisplayRecord } from './utils/records'
 import type { OpsError } from '@/api'
-import { defineTableColumns } from '@/components/base/BaseTable/columns'
+import { defineTableColumns } from '@codex-proxy/ui'
 import { formatProvider } from './utils/format'
 
 type OpsErrorRow = OpsError

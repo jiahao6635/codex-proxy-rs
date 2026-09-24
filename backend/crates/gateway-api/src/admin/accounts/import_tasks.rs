@@ -152,11 +152,6 @@ where
         .into_iter()
         .map(|item| {
             let (provider, command) = item.into_command(context.clone())?;
-            let provider = ProviderKind::new(match provider {
-                AccountProvider::OpenAi => "openai",
-                AccountProvider::Xai => "xai",
-            })
-            .map_err(|_| WireValidationError::new("provider"))?;
             Ok(ImportTaskInput { provider, command })
         })
         .collect::<Result<Vec<_>, WireValidationError>>()

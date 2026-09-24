@@ -3,8 +3,11 @@
 //! Continuation affinity 决定下一轮 Provider 与账号，必须在响应 ID 可复用前
 //! 获得 Redis 确认，因此不属于本模块的可丢失副作用。
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::{
+    num::NonZeroUsize,
+    time::{Duration, Instant},
+};
 
 use futures::future::{BoxFuture, ready};
 use gateway_core::engine::ModelRequestId;
@@ -22,6 +25,7 @@ use gateway_core::task::{DaemonTask, WorkerTaskError};
 use tokio::sync::{Mutex, mpsc};
 
 const DEFAULT_QUEUE_CAPACITY: usize = 4_096;
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 准入读取保持强一致；终态释放只做有界入队，Redis 失败由 worker 吸收。
 #[derive(Clone)]
@@ -127,7 +131,10 @@ impl DaemonTask for ClientAdmissionReleaseWriter {
             let mut receiver = self.receiver.lock().await;
             loop {
                 let release = tokio::select! {
-                    () = cancellation.cancelled() => return Ok(()),
+                    () = cancellation.cancelled() => {
+                        drain_admission_releases(&mut receiver, self.inner.as_ref()).await;
+                        return Ok(());
+                    },
                     release = receiver.recv() => release,
                 };
                 let Some(release) = release else {
@@ -237,7 +244,10 @@ impl DaemonTask for ProviderCircuitFeedbackWriter {
             let mut receiver = self.receiver.lock().await;
             loop {
                 let feedback = tokio::select! {
-                    () = cancellation.cancelled() => return Ok(()),
+                    () = cancellation.cancelled() => {
+                        drain_circuit_feedback(&mut receiver, self.inner.as_ref()).await;
+                        return Ok(());
+                    },
                     feedback = receiver.recv() => feedback,
                 };
                 let Some(feedback) = feedback else {
@@ -258,5 +268,54 @@ impl DaemonTask for ProviderCircuitFeedbackWriter {
                 }
             }
         })
+    }
+}
+
+async fn drain_admission_releases(
+    receiver: &mut mpsc::Receiver<AdmissionRelease>,
+    port: &dyn ClientAdmissionPort,
+) {
+    receiver.close();
+    let started_at = Instant::now();
+    while let Some(release) = receiver.recv().await {
+        let remaining = SHUTDOWN_DRAIN_TIMEOUT.saturating_sub(started_at.elapsed());
+        if remaining.is_zero()
+            || tokio::time::timeout(
+                remaining,
+                port.release(&release.client_api_key_id, &release.model_request_id),
+            )
+            .await
+            .is_err()
+        {
+            tracing::warn!("Client admission 关闭排空超时，剩余租约依赖 TTL 收敛");
+            break;
+        }
+    }
+}
+
+async fn drain_circuit_feedback(
+    receiver: &mut mpsc::Receiver<CircuitFeedback>,
+    port: &dyn ProviderCircuitPort,
+) {
+    receiver.close();
+    let started_at = Instant::now();
+    while let Some(feedback) = receiver.recv().await {
+        let remaining = SHUTDOWN_DRAIN_TIMEOUT.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            tracing::warn!("Provider circuit 关闭排空超时，剩余反馈已丢弃");
+            break;
+        }
+        let result = match feedback {
+            CircuitFeedback::Failure(provider) => {
+                tokio::time::timeout(remaining, port.observe_failure(&provider)).await
+            }
+            CircuitFeedback::Success(provider) => {
+                tokio::time::timeout(remaining, port.observe_success(&provider)).await
+            }
+        };
+        if result.is_err() {
+            tracing::warn!("Provider circuit 关闭排空超时，剩余反馈已丢弃");
+            break;
+        }
     }
 }

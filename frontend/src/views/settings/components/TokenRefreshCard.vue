@@ -1,9 +1,6 @@
 <script setup lang="ts">
+import { BaseCard, BaseForm, BaseFormItem, BaseInput } from '@codex-proxy/ui'
 import { Timer, Zap } from '@lucide/vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseForm from '@/components/base/BaseForm/index.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
 
 const refreshMarginSeconds = defineModel<string>('refreshMarginSeconds', { required: true })
 const refreshConcurrency = defineModel<string>('refreshConcurrency', { required: true })

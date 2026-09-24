@@ -19,8 +19,8 @@ use crate::{Revision, StoreError, StoreResult, postgres_unavailable};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeSettings {
-    pub openai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
-    pub xai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
+    pub request_profiles:
+        BTreeMap<gateway_core::routing::ProviderKind, gateway_core::account::OpaqueProviderData>,
     pub config_revision: Revision,
     pub admin_api_key: Option<String>,
     pub refresh_margin_seconds: u64,
@@ -54,6 +54,7 @@ impl fmt::Debug for RuntimeSettings {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RuntimeSettings")
+            .field("request_profile_count", &self.request_profiles.len())
             .field("config_revision", &self.config_revision)
             .field(
                 "admin_api_key",
@@ -110,8 +111,10 @@ impl fmt::Debug for RuntimeSettings {
 
 #[derive(Clone)]
 pub struct RuntimeSettingsUpdate {
-    pub openai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
-    pub xai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
+    pub request_profile_updates: BTreeMap<
+        gateway_core::routing::ProviderKind,
+        Option<gateway_core::account::OpaqueProviderData>,
+    >,
     pub admin_api_key: Option<String>,
     pub refresh_margin_seconds: u64,
     pub refresh_concurrency: u32,
@@ -176,6 +179,15 @@ impl RuntimeSettingsUpdate {
             || !valid_client_version(self.min_codex_cli_version.as_deref())
             || !valid_probe_model(self.account_auto_freeze_probe_model.as_deref())
             || RotationStrategy::parse(&self.rotation_strategy).is_none()
+            || self.request_profile_updates.len() > 256
+            || self
+                .request_profile_updates
+                .values()
+                .flatten()
+                .any(|profile| {
+                    serde_json::to_vec(profile.expose_to_provider())
+                        .map_or(true, |encoded| encoded.len() > 64 * 1024)
+                })
         {
             return Err(StoreError::InvalidData {
                 entity: "runtime settings",
@@ -278,6 +290,56 @@ impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
         })
     }
 
+    fn load_request_profile_configurations<'a>(
+        &'a self,
+        revision: gateway_core::routing::ConfigRevision,
+        provider: &'a gateway_core::routing::ProviderKind,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<Vec<gateway_core::account::OpaqueProviderData>, ProviderStoreError>,
+    > {
+        Box::pin(async move {
+            // 单条语句共享一个 MVCC 快照：先核对候选 revision，再只投影配置对象；
+            // Client Key 明文与其它策略字段不会进入插件准备边界。
+            let rows = sqlx::query_as::<_, (i64, Option<sqlx::types::Json<serde_json::Value>>)>(
+                "select settings.config_revision, profiles.profile
+                 from runtime_settings settings
+                 cross join lateral (
+                   select settings.provider_request_profiles_json -> $1 as profile
+                   union
+                   select keys.provider_request_profiles_json -> $1
+                   from client_api_keys keys
+                   where keys.provider_request_profiles_json ? $1
+                 ) profiles
+                 where settings.id = 1",
+            )
+            .bind(provider.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| provider_unavailable("load Provider request profile configurations"))?;
+            let expected_revision = i64::try_from(revision.get())
+                .map_err(|_| provider_invalid("validate Provider request profile revision"))?;
+            if rows.is_empty()
+                || rows
+                    .iter()
+                    .any(|(actual_revision, _)| *actual_revision != expected_revision)
+            {
+                return Err(provider_conflict(
+                    "validate Provider request profile revision",
+                ));
+            }
+            rows.into_iter()
+                .filter_map(|(_, profile)| profile)
+                .map(|profile| {
+                    let serde_json::Value::Object(profile) = profile.0 else {
+                        return Err(provider_invalid("decode Provider request profile"));
+                    };
+                    Ok(gateway_core::account::OpaqueProviderData::new(profile))
+                })
+                .collect()
+        })
+    }
+
     fn load_refresh_policy(
         &self,
     ) -> futures::future::BoxFuture<'_, Result<ProviderRefreshPolicy, ProviderStoreError>> {
@@ -346,6 +408,24 @@ pub(crate) async fn update_runtime_settings_in_transaction(
     update.validate()?;
     let refresh_margin_seconds =
         i64::try_from(update.refresh_margin_seconds).map_err(|_| invalid_numeric())?;
+    let request_profile_updates = update
+        .request_profile_updates
+        .iter()
+        .filter_map(|(provider, profile)| {
+            profile.as_ref().map(|profile| {
+                (
+                    provider.as_str().to_owned(),
+                    serde_json::Value::Object(profile.expose_to_provider().clone()),
+                )
+            })
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let request_profile_deletions = update
+        .request_profile_updates
+        .iter()
+        .filter(|(_, profile)| profile.is_none())
+        .map(|(provider, _)| provider.as_str().to_owned())
+        .collect::<Vec<_>>();
     let next = sqlx::query_scalar::<_, i64>(
         "update runtime_settings
              set config_revision = config_revision + 1,
@@ -374,9 +454,7 @@ pub(crate) async fn update_runtime_settings_in_transaction(
                      request_location_json = $23,
                      request_location_enabled = $24,
                      responses_max_decompressed_body_bytes = $25,
-                     provider_request_profiles_json = provider_request_profiles_json
-                         || case when $26::jsonb is null then '{}'::jsonb else jsonb_build_object('openai', $26::jsonb) end
-                         || case when $27::jsonb is null then '{}'::jsonb else jsonb_build_object('xai', $27::jsonb) end,
+	                 provider_request_profiles_json = (provider_request_profiles_json - $26::text[]) || $27::jsonb,
 	                 updated_at = now()
 	             where id = 1
 	             returning config_revision",
@@ -418,8 +496,8 @@ pub(crate) async fn update_runtime_settings_in_transaction(
         i64::try_from(update.responses_max_decompressed_body_bytes)
             .map_err(|_| invalid_numeric())?,
     )
-    .bind(update.openai_client_profile.as_ref().map(|profile| sqlx::types::Json(profile.expose_to_provider())))
-    .bind(update.xai_client_profile.as_ref().map(|profile| sqlx::types::Json(profile.expose_to_provider())))
+    .bind(request_profile_deletions)
+    .bind(sqlx::types::Json(request_profile_updates))
     .fetch_optional(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("update runtime settings in transaction"))?
@@ -501,18 +579,22 @@ struct RuntimeSettingsRow {
     account_auto_freeze_adaptive_concurrency: bool,
 }
 
-fn runtime_settings_from_row(mut row: RuntimeSettingsRow) -> StoreResult<RuntimeSettings> {
+fn runtime_settings_from_row(row: RuntimeSettingsRow) -> StoreResult<RuntimeSettings> {
+    let request_profiles = row
+        .provider_request_profiles_json
+        .0
+        .into_iter()
+        .map(|(provider, profile)| {
+            let provider = gateway_core::routing::ProviderKind::new(provider)
+                .map_err(|_| invalid_request_profile())?;
+            Ok((
+                provider,
+                gateway_core::account::OpaqueProviderData::new(profile),
+            ))
+        })
+        .collect::<StoreResult<BTreeMap<_, _>>>()?;
     Ok(RuntimeSettings {
-        openai_client_profile: row
-            .provider_request_profiles_json
-            .0
-            .remove("openai")
-            .map(gateway_core::account::OpaqueProviderData::new),
-        xai_client_profile: row
-            .provider_request_profiles_json
-            .0
-            .remove("xai")
-            .map(gateway_core::account::OpaqueProviderData::new),
+        request_profiles,
         config_revision: Revision::new(to_u64(row.config_revision)?)?,
         admin_api_key: row.admin_api_key,
         refresh_margin_seconds: to_u64(row.refresh_margin_seconds)?,
@@ -562,6 +644,13 @@ fn invalid_location() -> StoreError {
     }
 }
 
+fn invalid_request_profile() -> StoreError {
+    StoreError::InvalidData {
+        entity: "runtime settings",
+        message: "Provider request profile key is invalid".to_owned(),
+    }
+}
+
 fn invalid_numeric() -> StoreError {
     StoreError::InvalidData {
         entity: "runtime settings",
@@ -575,6 +664,10 @@ fn provider_unavailable(operation: &'static str) -> ProviderStoreError {
 
 fn provider_invalid(operation: &'static str) -> ProviderStoreError {
     ProviderStoreError::new(ProviderStoreErrorKind::InvalidData, operation)
+}
+
+fn provider_conflict(operation: &'static str) -> ProviderStoreError {
+    ProviderStoreError::new(ProviderStoreErrorKind::Conflict, operation)
 }
 
 fn valid_model_mappings(mappings: &BTreeMap<String, String>) -> bool {

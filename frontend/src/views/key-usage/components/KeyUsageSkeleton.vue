@@ -1,7 +1,6 @@
 <script setup lang="ts">
+import { BaseCard, BaseSkeleton } from '@codex-proxy/ui'
 import { Gauge, Zap } from '@lucide/vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseSkeleton from '@/components/base/BaseSkeleton.vue'
 import { keyUsageTokenMetrics } from '../utils/metrics'
 
 const metrics = [

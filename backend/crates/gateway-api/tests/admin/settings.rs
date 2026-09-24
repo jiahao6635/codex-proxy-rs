@@ -67,6 +67,24 @@ fn update_body() -> Value {
     })
 }
 
+fn insert_orphan_profile(fixture: &AdminTestFixture) {
+    fixture
+        .settings
+        .settings
+        .lock()
+        .expect("settings")
+        .request_profiles
+        .insert(
+            gateway_core::routing::ProviderKind::new("plugin.orphan").expect("provider kind"),
+            gateway_core::account::OpaqueProviderData::new(
+                json!({"preset":"legacy"})
+                    .as_object()
+                    .expect("profile object")
+                    .clone(),
+            ),
+        );
+}
+
 #[test]
 fn settings_request_should_reject_unknown_rotation_strategy() {
     let mut body = update_body();
@@ -111,8 +129,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
     use gateway_core::routing::{PublicModelId, UpstreamModelId};
 
     let settings = RuntimeSettings {
-        openai_client_profile: None,
-        xai_client_profile: None,
+        request_profiles: Default::default(),
         request_location_enabled: false,
         request_location: Default::default(),
         config_revision: Revision::new(7).expect("revision"),
@@ -157,6 +174,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
     assert_eq!(
         value,
         json!({
+            "providerRequestProfiles": {},
             "openaiClientProfile": null,
             "xaiClientProfile": null,
         "requestLocationEnabled": false,
@@ -212,8 +230,7 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         .cloned()
         .collect();
     let settings = RuntimeSettings {
-        openai_client_profile: None,
-        xai_client_profile: None,
+        request_profiles: Default::default(),
         request_location_enabled: false,
         request_location: Default::default(),
         config_revision: Revision::new(7).expect("revision"),
@@ -262,6 +279,7 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
             .cloned()
             .collect();
     let mut expected_fields = request_fields;
+    expected_fields.insert("providerRequestProfiles".to_owned());
     expected_fields.insert("openaiClientProfile".to_owned());
     expected_fields.insert("xaiClientProfile".to_owned());
     expected_fields.insert("updatedAt".to_owned());
@@ -302,6 +320,26 @@ async fn settings_get_should_preserve_global_model_mappings() {
             data["rotationStrategy"].as_str()
         ),
         (Some("gpt-5.4"), Some("grok-4.5"), Some("smart"))
+    );
+}
+
+#[tokio::test]
+async fn client_profile_providers_should_come_from_provider_capabilities() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::GET,
+            "/api/admin/settings/client-profiles",
+            None,
+        ))
+        .await
+        .expect("client profile providers response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await["data"],
+        json!({"providers": []})
     );
 }
 
@@ -662,6 +700,130 @@ fn global_profile_can_be_omitted_but_cannot_be_cleared() {
         body[field] = json!({"versionMode":"latest"});
         assert!(serde_json::from_value::<UpdateRuntimeSettingsRequest>(body).is_ok());
     }
+}
+
+#[tokio::test]
+async fn generic_global_profiles_decode_dynamic_providers_and_reject_legacy_conflicts() {
+    let mut body = update_body();
+    body["providerRequestProfiles"] = json!({
+        "openai":{"preset":"desktop"},
+        "provider.example":{"preset":"managed"},
+    });
+    body["openaiClientProfile"] = json!({"preset":"desktop"});
+    let decoded = serde_json::from_value::<UpdateRuntimeSettingsRequest>(body.clone()).unwrap();
+    assert!(
+        decoded
+            .provider_request_profiles
+            .contains_key("provider.example")
+    );
+
+    body["openaiClientProfile"] = json!({"preset":"cli"});
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn settings_update_preserves_an_unchanged_orphan_profile() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    insert_orphan_profile(&fixture);
+    let mut body = update_body();
+    body["providerRequestProfiles"] = json!({
+        "plugin.orphan":{"preset":"legacy"}
+    });
+
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let data = response_json(response).await["data"].clone();
+
+    assert_eq!(
+        (status, &data["providerRequestProfiles"]["plugin.orphan"]),
+        (StatusCode::OK, &json!({"preset":"legacy"})),
+    );
+}
+
+#[tokio::test]
+async fn settings_update_rejects_a_modified_orphan_profile() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    insert_orphan_profile(&fixture);
+    let mut body = update_body();
+    body["providerRequestProfiles"] = json!({
+        "plugin.orphan":{"preset":"changed"}
+    });
+
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn settings_update_rejects_a_new_unknown_profile() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let mut body = update_body();
+    body["providerRequestProfiles"] = json!({
+        "plugin.unknown":{"preset":"new"}
+    });
+
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn settings_update_explicitly_removes_an_orphan_profile() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    insert_orphan_profile(&fixture);
+    let mut body = update_body();
+    body["providerRequestProfiles"] = json!({"plugin.orphan":null});
+
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let data = response_json(response).await["data"].clone();
+
+    assert_eq!(
+        (status, data["providerRequestProfiles"].get("plugin.orphan"),),
+        (StatusCode::OK, None),
+    );
 }
 
 fn custom_pricing() -> Value {

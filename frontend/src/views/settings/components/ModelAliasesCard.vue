@@ -1,10 +1,7 @@
 <script setup lang="ts">
-import { Plus, Trash2 } from '@lucide/vue'
+import { BaseButton, BaseCard, BaseIconButton, BaseInput } from '@codex-proxy/ui'
 
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
+import { Plus, Trash2 } from '@lucide/vue'
 
 withDefaults(defineProps<{
   mappings: Array<{ requestedModel: string, upstreamModel: string }>

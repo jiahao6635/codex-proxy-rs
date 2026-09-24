@@ -65,6 +65,29 @@ const COMPLETED_SESSION_SSE: &str = concat!(
 );
 
 #[tokio::test]
+async fn account_capabilities_distinguish_oauth_from_api_key_and_unknown_credentials() {
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let provider = bundle.admin_provider();
+    let id = ProviderAccountId::new("acct_capabilities").unwrap();
+    let oauth = provider.account_capabilities(&id, "oauth");
+    assert!(
+        oauth.quota
+            && oauth.quota_refresh
+            && oauth.profile
+            && oauth.subscription
+            && oauth.avatar
+            && oauth.reset_credits
+            && oauth.consume_reset_credit
+    );
+    for kind in ["api_key", "unknown"] {
+        assert_eq!(provider.account_capabilities(&id, kind), Default::default());
+    }
+}
+
+#[tokio::test]
 async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions_once() {
     let config = valid_config();
     let mut bundle = provider_openai::initialize(config.config.clone(), provider_ports())
@@ -265,7 +288,7 @@ async fn initialized_provider_keeps_thread_spawn_transport_conversations_distinc
         .expect("OpenAI payload")
         .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
         let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 initialized_provider_request(operation, account_id),
                 initialized_attempt_context(request_id, account_id),
@@ -525,13 +548,20 @@ async fn openai_admin_provider_persists_the_full_pending_envelope_and_binds_owne
     };
     let started = bundle
         .admin_provider()
-        .start_authorization(PendingAuthorizationMutation::new(
-            ProviderKind::new("openai").expect("provider"),
-            AuthorizationMutationTarget::Create {
-                name: "OAuth account".to_owned(),
+        .start_authorization(
+            gateway_admin::model::provider_credentials::PrepareAuthorization {
+                input: gateway_admin::model::provider_credentials::ProviderDocument::new(
+                    gateway_core::account::OpaqueProviderData::new(serde_json::Map::new()),
+                ),
+                pending: PendingAuthorizationMutation::new(
+                    ProviderKind::new("openai").expect("provider"),
+                    AuthorizationMutationTarget::Create {
+                        name: "OAuth account".to_owned(),
+                    },
+                    AuthorizationOwnerBinding::from_context(&start_context),
+                ),
             },
-            AuthorizationOwnerBinding::from_context(&start_context),
-        ))
+        )
         .await
         .expect("start authorization");
     {
@@ -627,11 +657,18 @@ async fn openai_reauthorization_pending_payload_reuses_the_account_installation_
 
     bundle
         .admin_provider()
-        .start_authorization(PendingAuthorizationMutation::new(
-            ProviderKind::new("openai").expect("provider"),
-            AuthorizationMutationTarget::Reauthorize { account_id },
-            AuthorizationOwnerBinding::from_context(&context),
-        ))
+        .start_authorization(
+            gateway_admin::model::provider_credentials::PrepareAuthorization {
+                input: gateway_admin::model::provider_credentials::ProviderDocument::new(
+                    gateway_core::account::OpaqueProviderData::new(serde_json::Map::new()),
+                ),
+                pending: PendingAuthorizationMutation::new(
+                    ProviderKind::new("openai").expect("provider"),
+                    AuthorizationMutationTarget::Reauthorize { account_id },
+                    AuthorizationOwnerBinding::from_context(&context),
+                ),
+            },
+        )
         .await
         .expect("start reauthorization");
 
@@ -715,6 +752,7 @@ async fn openai_admin_provider_projects_cached_quota_models_and_canonical_export
             &UpstreamModelId::new("gpt-5.4").expect("upstream model"),
             "Reply with exactly OK.",
         )
+        .await
         .expect("connection test operation");
     let Operation::Generate(request) = operation else {
         panic!("connection test must be a generate operation");
@@ -2322,4 +2360,49 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         admin.reset_credits(account.id()).await.unwrap_err().kind(),
         ProviderAdminErrorKind::Unsupported
     );
+}
+
+#[tokio::test]
+async fn browser_authorization_declares_callback_and_rejects_extra_login_inputs() {
+    use gateway_admin::model::{
+        provider_capabilities::AuthorizationCompletion,
+        provider_credentials::{
+            AuthorizationMutationTarget, AuthorizationOwnerBinding, PendingAuthorizationMutation,
+            PrepareAuthorization,
+        },
+    };
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let provider = bundle.admin_provider();
+    let login = provider.credential_capabilities().login.unwrap();
+    assert_eq!(login.completion, AuthorizationCompletion::Callback);
+    assert_eq!(
+        login.input_schema,
+        json!({"type":"object", "additionalProperties":false})
+    );
+    let error = provider
+        .start_authorization(PrepareAuthorization {
+            pending: PendingAuthorizationMutation::new(
+                ProviderKind::new("openai").unwrap(),
+                AuthorizationMutationTarget::Create {
+                    name: "form account".into(),
+                },
+                AuthorizationOwnerBinding::from_context(&MutationContext {
+                    actor: MutationActor::System,
+                    request_id: "login-input-test".into(),
+                }),
+            ),
+            input: ProviderDocument::new(OpaqueProviderData::new(
+                json!({"token":"unexpected-fixture-secret"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ProviderAdminErrorKind::Invalid);
+    assert!(!format!("{error:?}").contains("unexpected-fixture-secret"));
 }

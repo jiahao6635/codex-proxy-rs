@@ -49,7 +49,7 @@ impl Provider for NamedProvider {
     }
 
     async fn execute(
-        &self,
+        self: Arc<Self>,
         _request: ProviderRequest,
         _context: AttemptContext,
     ) -> Result<ProviderStream, ProviderError> {
@@ -127,7 +127,7 @@ impl Provider for CatalogProvider {
     }
 
     async fn execute(
-        &self,
+        self: Arc<Self>,
         _: ProviderRequest,
         _: AttemptContext,
     ) -> Result<ProviderStream, ProviderError> {

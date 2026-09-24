@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { AccountProfileStatisticsResponse } from '@/api'
+import { BaseSkeleton } from '@codex-proxy/ui'
 import { computed } from 'vue'
-import BaseSkeleton from '@/components/base/BaseSkeleton.vue'
 import { formatCompactNumber, formatInteger } from '@/utils/number'
 
 const props = defineProps<{

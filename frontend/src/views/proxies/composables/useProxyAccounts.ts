@@ -1,7 +1,7 @@
+import { toast } from '@codex-proxy/ui'
 import { watchDebounced } from '@vueuse/core'
 import { computed, shallowRef, watch } from 'vue'
 import { getProxyAccounts, removeProxyAccount } from '@/api'
-import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { usePagedQuery } from '@/composables/usePagedQuery'
 

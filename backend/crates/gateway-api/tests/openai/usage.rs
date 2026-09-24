@@ -1,12 +1,27 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use axum::{
     Router,
     http::{Method, StatusCode, header},
     response::Response,
 };
 use chrono::{Duration, Utc};
+use futures::future::BoxFuture;
 use gateway_core::{
     engine::budget::{ClientBudgetLimits, ClientBudgetStatus},
+    engine::{
+        authentication::ClientAuthenticationRequest,
+        execution::{
+            AuthenticatedClient, ClientAuthenticationError, ExecutionService, StartExecution,
+            StartProviderExecution, StartedExecution,
+        },
+    },
+    error::{GatewayError, GatewayErrorKind},
     policy::ClientApiKeyId,
+    routing::PublicModelId,
 };
 use serde_json::json;
 use tower::ServiceExt as _;
@@ -41,7 +56,7 @@ async fn fixture() -> (AdminTestFixture, Router) {
         weekly_resets_at: Some((Utc::now() + Duration::days(7)).into()),
     };
     *fixture.client_key.lock().unwrap() = Some(key);
-    let app = super::api_router_with_admin(fixture.services.clone());
+    let app = super::api_router_with_admin_and_client(fixture.services.clone(), KEY, "key-42");
     (fixture, app)
 }
 
@@ -81,6 +96,106 @@ async fn usage_returns_current_key_budget_without_exposing_private_data_or_writi
     assert!(!body.to_string().contains("private-usage-sentinel"));
     assert_eq!(fixture.client_key.lock().unwrap().as_ref(), Some(&before));
     assert!(fixture.observations.lock().unwrap().summaries.is_empty());
+}
+
+struct FrontendUsageAuthentication {
+    client: AuthenticatedClient,
+    authentication_calls: AtomicUsize,
+    verification_calls: AtomicUsize,
+    middleware: Arc<crate::openai::middleware::RequestMiddleware>,
+}
+
+impl ExecutionService for FrontendUsageAuthentication {
+    fn middleware_plan(
+        &self,
+        _: &gateway_core::engine::execution::PreparedRootExecution,
+    ) -> Option<gateway_core::engine::middleware::FrozenMiddlewarePlan> {
+        Some(self.middleware.frozen())
+    }
+
+    fn authenticate(&self, _: &str) -> Result<AuthenticatedClient, ClientAuthenticationError> {
+        Err(ClientAuthenticationError::InvalidKey)
+    }
+
+    fn authenticate_request(
+        &self,
+        _: ClientAuthenticationRequest,
+    ) -> BoxFuture<'_, Result<AuthenticatedClient, ClientAuthenticationError>> {
+        self.authentication_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(ClientAuthenticationError::InvalidKey) })
+    }
+
+    fn verify_request(
+        &self,
+        request: ClientAuthenticationRequest,
+    ) -> BoxFuture<'_, Result<AuthenticatedClient, ClientAuthenticationError>> {
+        assert_eq!(request.authorization(), "External controlled-fixture");
+        self.verification_calls.fetch_add(1, Ordering::SeqCst);
+        let client = self.client.clone();
+        Box::pin(async move { Ok(client) })
+    }
+
+    fn public_models(&self, _: &AuthenticatedClient) -> Vec<PublicModelId> {
+        Vec::new()
+    }
+
+    fn contains_public_model(&self, _: &AuthenticatedClient, _: &PublicModelId) -> bool {
+        false
+    }
+
+    fn start(&self, _: StartExecution) -> BoxFuture<'_, Result<StartedExecution, GatewayError>> {
+        Box::pin(async {
+            Err(GatewayError::new(
+                GatewayErrorKind::Internal,
+                "usage route must not start an execution",
+            ))
+        })
+    }
+
+    fn start_provider_endpoint(
+        &self,
+        _: StartProviderExecution,
+    ) -> BoxFuture<'_, Result<StartedExecution, GatewayError>> {
+        Box::pin(async {
+            Err(GatewayError::new(
+                GatewayErrorKind::Internal,
+                "usage route must not start a provider execution",
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn usage_uses_the_entry_authentication_identity_without_recording_request_usage() {
+    let fixture = key_fixture().await;
+    let id = ClientApiKeyId::new("key_api_test").unwrap();
+    let key = fixture
+        .services
+        .client_keys()
+        .reveal(&id)
+        .await
+        .unwrap()
+        .record;
+    *fixture.client_key.lock().unwrap() = Some(key);
+    let execution = Arc::new(FrontendUsageAuthentication {
+        client: super::authenticated_client("unused-native-key"),
+        authentication_calls: AtomicUsize::new(0),
+        verification_calls: AtomicUsize::new(0),
+        middleware: Arc::new(crate::openai::middleware::RequestMiddleware::default()),
+    });
+    let app =
+        super::api_router_with_admin_and_execution(fixture.services.clone(), execution.clone());
+
+    let response = query(&app, "/v1/usage", Some("External controlled-fixture")).await;
+    assert_eq!(response.headers()["x-request-middleware"], "applied");
+    assert_eq!(
+        *execution.middleware.endpoints.lock().unwrap(),
+        ["/v1/usage"]
+    );
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(execution.verification_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(execution.authentication_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

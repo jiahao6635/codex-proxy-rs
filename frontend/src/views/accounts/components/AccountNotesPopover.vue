@@ -1,9 +1,8 @@
 <script setup lang="ts">
+import { BasePopover, BaseScrollbar } from '@codex-proxy/ui'
+
 import { useEventListener } from '@vueuse/core'
 import { computed, shallowRef, useId, useTemplateRef, watch } from 'vue'
-
-import BasePopover from '@/components/base/BasePopover.vue'
-import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
 
 const props = defineProps<{
   notes: string

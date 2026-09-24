@@ -1,14 +1,8 @@
 <script setup lang="ts">
+import { BaseButton, BaseCard, BaseCheckbox, BaseForm, BaseFormItem, BaseIconButton, BaseInput } from '@codex-proxy/ui'
+
 import { CircleAlert, CircleCheck, DatabaseZap, Eye, EyeOff, Save } from '@lucide/vue'
 import { computed, shallowRef } from 'vue'
-
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseForm from '@/components/base/BaseForm/index.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
 
 interface StorageForm {
   endpoint: string

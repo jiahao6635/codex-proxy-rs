@@ -1,10 +1,9 @@
 <script setup lang="ts">
 import type { dashboardSnapshotView, MetricTone } from '../composables/useDashboard'
-import { CircleCheck, RefreshCw, ShieldAlert, TriangleAlert } from '@lucide/vue'
+import { BaseCard, BaseEmpty } from '@codex-proxy/ui'
 
+import { CircleCheck, RefreshCw, ShieldAlert, TriangleAlert } from '@lucide/vue'
 import { computed } from 'vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
 import { formatCompactNumber } from '@/utils/number'
 import AccountUsageWindow from '@/views/accounts/components/AccountUsageWindow/index.vue'
 import { metricToneIconClasses, metricToneValueClasses } from '../constants'

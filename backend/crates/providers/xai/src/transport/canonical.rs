@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use gateway_core::engine::provider::NativeResponseTranslator;
 use gateway_core::error::{
     ClientVisibleUpstreamError, OpaqueUpstreamValue, ProviderError, ProviderErrorKind,
 };
@@ -26,6 +27,23 @@ use super::{classify_grok_quota_failure, scrub_account_fingerprints};
 const CONTENTS_PER_OUTPUT: u32 = 1_024;
 const LONG_CONTEXT_THRESHOLD: u64 = 200_000;
 const GROK_PING_SSE_COMMENT: &[u8] = b": ping\n\n";
+const XAI_RESPONSE_PROTOCOL: &str = "xai";
+const OPENAI_RESPONSE_PROTOCOL: &str = "openai";
+
+pub(crate) struct GrokDecodedResponseBatch {
+    pub(crate) source_events: Vec<ProviderEvent>,
+    pub(crate) projected_events: Vec<ProviderEvent>,
+}
+
+struct ProjectedWireEvent {
+    event_type: String,
+    wire: ProtocolWireEvent,
+}
+
+/// 单次 xAI stream 独占的原生响应交付转换状态。
+pub(crate) struct GrokNativeResponseTranslator {
+    response_transform: GrokResponseTransform,
+}
 
 #[derive(Clone, Copy)]
 struct TokenRates {
@@ -278,6 +296,64 @@ pub struct GrokCanonicalDecoder {
     requires_provider_cost: bool,
 }
 
+impl GrokNativeResponseTranslator {
+    #[must_use]
+    pub(crate) fn for_request(request: &GrokResponsesRequest) -> Self {
+        Self {
+            response_transform: request.response_transform(),
+        }
+    }
+}
+
+impl NativeResponseTranslator for GrokNativeResponseTranslator {
+    fn source_protocol(&self) -> &str {
+        XAI_RESPONSE_PROTOCOL
+    }
+
+    fn target_protocol(&self) -> &str {
+        OPENAI_RESPONSE_PROTOCOL
+    }
+
+    fn translate(
+        &mut self,
+        event: &ProtocolWireEvent,
+    ) -> Result<Vec<ProtocolWireEvent>, ProviderError> {
+        if event.protocol() != XAI_RESPONSE_PROTOCOL {
+            return Err(protocol_error_marker());
+        }
+        if event.has_json_data() {
+            let value = event.data().clone();
+            let event_type = value
+                .get("type")
+                .and_then(Value::as_str)
+                .or_else(|| event.event_type())
+                .unwrap_or_default()
+                .to_owned();
+            return project_response_event(
+                &mut self.response_transform,
+                &event_type,
+                value,
+                event.event_type(),
+                event.sse_id(),
+                event.sse_retry(),
+            )
+            .map(|events| events.into_iter().map(|event| event.wire).collect());
+        }
+        if event
+            .raw_sse_frame()
+            .is_some_and(|frame| frame.as_ref() == GROK_PING_SSE_COMMENT)
+        {
+            return ProtocolWireEvent::raw_sse(
+                OPENAI_RESPONSE_PROTOCOL,
+                bytes::Bytes::from_static(GROK_PING_SSE_COMMENT),
+            )
+            .map(|wire| vec![wire])
+            .map_err(protocol_error);
+        }
+        Err(protocol_error_marker())
+    }
+}
+
 impl GrokCanonicalDecoder {
     /// 使用路由后最终发往上游的请求模型计价，并在响应缺少模型时用于 canonical 兜底。
     pub fn new(upstream_model: impl Into<String>) -> Self {
@@ -346,10 +422,30 @@ impl GrokCanonicalDecoder {
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<ProviderEvent>, ProviderError> {
         let events = self.decoder.push(chunk).map_err(protocol_error)?;
+        self.decode(events).map(|batch| batch.projected_events)
+    }
+
+    /// 解码同一批上游事件，同时返回转换前 xAI wire 与独立生成的 OpenAI 投影。
+    pub(crate) fn push_before_translation(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<GrokDecodedResponseBatch, ProviderError> {
+        let events = self.decoder.push(chunk).map_err(protocol_error)?;
         self.decode(events)
     }
 
     pub fn finish(&mut self) -> Result<Vec<ProviderEvent>, ProviderError> {
+        let events = self.decoder.finish().map_err(protocol_error)?;
+        let output = self.decode(events)?.projected_events;
+        if !self.completed {
+            return Err(protocol_error_marker());
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn finish_before_translation(
+        &mut self,
+    ) -> Result<GrokDecodedResponseBatch, ProviderError> {
         let events = self.decoder.finish().map_err(protocol_error)?;
         let output = self.decode(events)?;
         if !self.completed {
@@ -360,7 +456,7 @@ impl GrokCanonicalDecoder {
 
     pub(crate) fn finish_without_terminal(&mut self) -> Result<Vec<ProviderEvent>, ProviderError> {
         let events = self.decoder.finish().map_err(protocol_error)?;
-        self.decode(events)
+        self.decode(events).map(|batch| batch.projected_events)
     }
 
     /// 取走本批解码帧里是否已出现首个非前导输出事件（结构帧也算），用于首字计时。
@@ -368,8 +464,9 @@ impl GrokCanonicalDecoder {
         std::mem::take(&mut self.output_start_seen)
     }
 
-    fn decode(&mut self, events: Vec<SseEvent>) -> Result<Vec<ProviderEvent>, ProviderError> {
-        let mut output = Vec::new();
+    fn decode(&mut self, events: Vec<SseEvent>) -> Result<GrokDecodedResponseBatch, ProviderError> {
+        let mut source_events = Vec::new();
+        let mut projected_events = Vec::new();
         for event in events {
             if event
                 .event
@@ -395,12 +492,18 @@ impl GrokCanonicalDecoder {
                     .and_then(|value| value.get("type").and_then(Value::as_str))
                     .is_none_or(|event_type| event_type == "ping")
             {
-                let wire = ProtocolWireEvent::raw_sse(
-                    "openai",
+                let source_wire = ProtocolWireEvent::raw_sse(
+                    XAI_RESPONSE_PROTOCOL,
                     bytes::Bytes::from_static(GROK_PING_SSE_COMMENT),
                 )
                 .map_err(|_| protocol_error_marker())?;
-                output.push(ProviderEvent::wire(wire));
+                let projected_wire = ProtocolWireEvent::raw_sse(
+                    OPENAI_RESPONSE_PROTOCOL,
+                    bytes::Bytes::from_static(GROK_PING_SSE_COMMENT),
+                )
+                .map_err(|_| protocol_error_marker())?;
+                source_events.push(ProviderEvent::wire(source_wire));
+                projected_events.push(ProviderEvent::wire(projected_wire));
                 continue;
             }
             let Ok(value) = parsed else {
@@ -410,28 +513,21 @@ impl GrokCanonicalDecoder {
             if body_type == Some("response.doom_loop_check") {
                 continue;
             }
-            let Some(event_type) = body_type.or(event.event.as_deref()) else {
-                let transformed = self
-                    .response_transform
-                    .rewrite_stream_event("", value)
-                    .map_err(|_| protocol_error_marker())?;
-                for (index, transformed) in transformed.into_iter().enumerate() {
-                    let mut value = transformed.into_value();
-                    self.response_transform.resequence_stream_value(&mut value);
-                    let wire = ProtocolWireEvent::json_with_sse_metadata(
-                        "openai",
-                        None,
-                        value,
-                        (index == 0).then(|| event.id.clone()).flatten(),
-                        (index == 0).then_some(event.retry).flatten(),
-                    )
-                    .map_err(|_| protocol_error_marker())?;
-                    output.push(ProviderEvent::wire(wire));
-                }
-                continue;
-            };
-            let event_type = event_type.to_owned();
-            self.response_model.observe(Some(&event_type), &value);
+            let event_type = body_type
+                .or(event.event.as_deref())
+                .unwrap_or_default()
+                .to_owned();
+            let source_wire = ProtocolWireEvent::json_with_sse_metadata(
+                XAI_RESPONSE_PROTOCOL,
+                event.event.clone(),
+                value.clone(),
+                event.id.clone(),
+                event.retry,
+            )
+            .map_err(|_| protocol_error_marker())?;
+            if !event_type.is_empty() {
+                self.response_model.observe(Some(&event_type), &value);
+            }
             // 工具转换可能隐藏注入的调用，计费事实必须从转换前的上游事件读取。
             if let Some(response) = value.get("response") {
                 if let Some(tier) = response.get("service_tier").and_then(Value::as_str) {
@@ -443,22 +539,23 @@ impl GrokCanonicalDecoder {
                 self.requires_provider_cost |= !token_only_output(item);
             }
             // 转换失败必须终止，不能丢弃工具参数后仍向客户端报告成功。
-            let transformed = self
-                .response_transform
-                .rewrite_stream_event(&event_type, value)
-                .map_err(|_| protocol_error_marker())?;
-            for (index, transformed) in transformed.into_iter().enumerate() {
-                let transformed_type = transformed.event_type().to_owned();
-                if !client_visible_event(&transformed_type) {
-                    continue;
-                }
+            let projected = project_response_event(
+                &mut self.response_transform,
+                &event_type,
+                value,
+                event.event.as_deref(),
+                event.id.as_deref(),
+                event.retry,
+            )?;
+            let mut source_canonical = Vec::new();
+            for projected in projected {
+                let transformed_type = projected.event_type;
                 // 首个非前导、非失败事件（结构帧也算）开启首字计时。
                 self.output_start_seen |= !matches!(
                     transformed_type.as_str(),
                     "response.created" | "response.in_progress" | "response.failed" | "error"
                 );
-                let mut value = transformed.into_value();
-                self.response_transform.resequence_stream_value(&mut value);
+                let value = projected.wire.data();
                 let mut canonical = Vec::new();
                 // 终态事件（completed/incomplete）fail-closed：用量/计费校验失败即断流。
                 // 其余内容事件容忍字段校验失败——正常上游变体（空 delta、重复 index、
@@ -468,7 +565,7 @@ impl GrokCanonicalDecoder {
                     transformed_type.as_str(),
                     "response.completed" | "response.incomplete"
                 );
-                match self.decode_event(&transformed_type, &value, &mut canonical) {
+                match self.decode_event(&transformed_type, value, &mut canonical) {
                     Ok(()) => {}
                     Err(error)
                         if !terminal_event && error.kind() == ProviderErrorKind::Protocol =>
@@ -477,27 +574,23 @@ impl GrokCanonicalDecoder {
                     }
                     Err(error) => return Err(error),
                 }
-                let wire_event = if transformed_type == event_type {
-                    event.event.clone()
+                source_canonical.extend(canonical.iter().cloned());
+                projected_events.push(if canonical.is_empty() {
+                    ProviderEvent::wire(projected.wire)
                 } else {
-                    Some(transformed_type)
-                };
-                let wire = ProtocolWireEvent::json_with_sse_metadata(
-                    "openai",
-                    wire_event,
-                    value,
-                    (index == 0).then(|| event.id.clone()).flatten(),
-                    (index == 0).then_some(event.retry).flatten(),
-                )
-                .map_err(|_| protocol_error_marker())?;
-                output.push(if canonical.is_empty() {
-                    ProviderEvent::wire(wire)
-                } else {
-                    ProviderEvent::canonical_with_wire(canonical, wire)
+                    ProviderEvent::canonical_with_wire(canonical, projected.wire)
                 });
             }
+            source_events.push(if source_canonical.is_empty() {
+                ProviderEvent::wire(source_wire)
+            } else {
+                ProviderEvent::canonical_with_wire(source_canonical, source_wire)
+            });
         }
-        Ok(output)
+        Ok(GrokDecodedResponseBatch {
+            source_events,
+            projected_events,
+        })
     }
 
     fn decode_event(
@@ -838,6 +931,46 @@ impl GrokCanonicalDecoder {
             Err(protocol_error_marker())
         }
     }
+}
+
+fn project_response_event(
+    response_transform: &mut GrokResponseTransform,
+    event_type: &str,
+    value: Value,
+    source_event_type: Option<&str>,
+    sse_id: Option<&str>,
+    sse_retry: Option<u64>,
+) -> Result<Vec<ProjectedWireEvent>, ProviderError> {
+    let transformed = response_transform
+        .rewrite_stream_event(event_type, value)
+        .map_err(protocol_error)?;
+    let mut projected = Vec::with_capacity(transformed.len());
+    for (index, transformed) in transformed.into_iter().enumerate() {
+        let transformed_type = transformed.event_type().to_owned();
+        if !event_type.is_empty() && !client_visible_event(&transformed_type) {
+            continue;
+        }
+        let mut value = transformed.into_value();
+        response_transform.resequence_stream_value(&mut value);
+        let wire_event = if transformed_type == event_type {
+            source_event_type.map(str::to_owned)
+        } else {
+            Some(transformed_type.clone())
+        };
+        let wire = ProtocolWireEvent::json_with_sse_metadata(
+            OPENAI_RESPONSE_PROTOCOL,
+            wire_event,
+            value,
+            (index == 0).then(|| sse_id.map(str::to_owned)).flatten(),
+            (index == 0).then_some(sse_retry).flatten(),
+        )
+        .map_err(protocol_error)?;
+        projected.push(ProjectedWireEvent {
+            event_type: transformed_type,
+            wire,
+        });
+    }
+    Ok(projected)
 }
 
 fn client_visible_event(event_type: &str) -> bool {

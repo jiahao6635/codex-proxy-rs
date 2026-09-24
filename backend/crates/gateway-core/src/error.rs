@@ -28,6 +28,8 @@ pub enum ProviderErrorKind {
     Unauthorized,
     /// Credential 没有权限。
     PermissionDenied,
+    /// 冻结的请求策略在 Provider 发送前明确拒绝本次请求。
+    RequestPolicyDenied,
     /// Provider 限流。
     RateLimited,
     /// Credential 配额耗尽。
@@ -66,6 +68,7 @@ impl ProviderErrorKind {
             Self::Unsupported => "unsupported",
             Self::Unauthorized => "unauthorized",
             Self::PermissionDenied => "permission_denied",
+            Self::RequestPolicyDenied => "request_policy_denied",
             Self::RateLimited => "rate_limited",
             Self::QuotaExhausted => "quota_exhausted",
             Self::AccountCapacityUnavailable => "account_capacity_unavailable",
@@ -1078,6 +1081,10 @@ impl GatewayError {
             ProviderErrorKind::Unauthorized | ProviderErrorKind::PermissionDenied => Self::new(
                 GatewayErrorKind::UpstreamUnavailable,
                 "upstream authentication resource is unavailable",
+            ),
+            ProviderErrorKind::RequestPolicyDenied => Self::new(
+                GatewayErrorKind::PolicyDenied,
+                "request policy rejected the request",
             ),
             ProviderErrorKind::RateLimited | ProviderErrorKind::QuotaExhausted => Self::new(
                 GatewayErrorKind::RateLimited,

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { Info } from '@lucide/vue'
+import { BasePopover } from '@codex-proxy/ui'
 
-import BasePopover from '@/components/base/BasePopover.vue'
+import { Info } from '@lucide/vue'
 
 // 表格单元格的“信息点”悬浮明细：统一触发按钮与面板壳。
 defineProps<{

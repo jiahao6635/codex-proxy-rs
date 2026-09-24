@@ -1,12 +1,11 @@
 <script setup lang="ts">
 import type { KeyUsageVersion } from '@/api/modules/key-usage'
+import { BaseInput, BaseScrollbar } from '@codex-proxy/ui'
 import { Search } from '@lucide/vue'
 import { shallowRef } from 'vue'
 import { getKeyUsageVersion } from '@/api/modules/key-usage'
 import ApiKeyConfigModal from '@/components/ApiKeyConfigModal.vue'
 import AppAboutModal from '@/components/AppAboutModal.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
 import RequestHealthTimelineCard from '@/views/dashboard/components/RequestHealthTimelineCard.vue'
 import KeyUsageBudget from './components/KeyUsageBudget.vue'
 import KeyUsageHeader from './components/KeyUsageHeader.vue'

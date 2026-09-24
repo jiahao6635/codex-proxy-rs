@@ -54,8 +54,8 @@
 
 | 场景 | 参考入口 | 关注点 |
 | --- | --- | --- |
-| 页面头部 | [BasePageHeader](../frontend/src/components/base/BasePageHeader.vue)、[系统概览](../frontend/src/views/dashboard/components/DashboardContent.vue) | 简短标题、必要的统计范围或状态、就近操作 |
-| 内容与指标 | [BaseCard](../frontend/src/components/base/BaseCard.vue)、[用量概览卡片](../frontend/src/views/usage/components/UsageSummaryCards.vue) | 可选说明、紧凑摘要、数值与辅助信息的主次 |
+| 页面头部 | `@codex-proxy/ui` 的 `BasePageHeader`、[系统概览](../frontend/src/views/dashboard/components/DashboardContent.vue) | 简短标题、必要的统计范围或状态、就近操作 |
+| 内容与指标 | `@codex-proxy/ui` 的 `BaseCard`、[用量概览卡片](../frontend/src/views/usage/components/UsageSummaryCards.vue) | 可选说明、紧凑摘要、数值与辅助信息的主次 |
 | 表单帮助 | [API Key 账号字段](../frontend/src/views/accounts/components/AccountApiKeyFields.vue) | 直接命名字段，在对应位置提供短提示和示例 |
 
 ## 架构概览
@@ -77,24 +77,18 @@ flowchart LR
 
 核心职责保持分离：
 
-| 层 | 文件 | 职责 |
+| 层 | 入口 | 职责 |
 | --- | --- | --- |
-| 公开入口 | [`theme/index.ts`](../frontend/src/theme/index.ts) | 只汇总稳定的外部 API，不承载实现 |
-| 领域类型 | [`theme/types.ts`](../frontend/src/theme/types.ts) | 唯一类型文件，包含持久化模型、解析结果与内部 Map 契约 |
-| 设计输入 | [`theme/core/constants.ts`](../frontend/src/theme/core/constants.ts) | 默认 Seed、预置主题元数据、尺寸与可编辑白名单 |
-| 颜色算法 | [`theme/core/color.ts`](../frontend/src/theme/core/color.ts) | Ant Design 色板角色、色调混合、透明度与对比度 |
-| Map 派生 | [`theme/derive/colors.ts`](../frontend/src/theme/derive/colors.ts) | Surface、Primary、Semantic、Preset 与数据色 Map |
-| Component 派生 | [`theme/derive/components.ts`](../frontend/src/theme/derive/components.ts) | 尺寸、阴影和 Component Token Map |
-| 输入边界 | [`theme/core/normalize.ts`](../frontend/src/theme/core/normalize.ts) | 持久化配置与直接覆盖值的规范化 |
-| 解析编排 | [`theme/core/resolve.ts`](../frontend/src/theme/core/resolve.ts) | 串联 Seed → Map → Alias → Component |
-| Token 编译 | [`theme/core/tokens.ts`](../frontend/src/theme/core/tokens.ts) | 从类型化 Map 和短角色表生成 CSS Variables |
-| 浏览器适配 | [`theme/runtime/browser.ts`](../frontend/src/theme/runtime/browser.ts) | 将解析结果提交为根作用域运行时样式表 |
+| 基础组件 | `@codex-proxy/ui` | 稳定组件与通用函数，不承载业务状态 |
+| 主题算法 | `@codex-proxy/ui/theme` | 规范化配置，派生 Seed → Map → Alias → Component，生成并提交 CSS Variables |
+| 样式 | `@codex-proxy/ui/styles.css` | 基线、组件样式与完整工具类样式 |
+| Tailwind 合同 | `@codex-proxy/ui/tailwind.css` | 公开 Token 名称，供应用自己的 Tailwind 构建使用 |
 | 状态 | [`stores/modules/theme.ts`](../frontend/src/stores/modules/theme.ts) | 持久化配置、系统明暗偏好、切换动作与动画 |
 | 编辑器状态 | [`useThemeEditor.ts`](../frontend/src/views/theme/composables/useThemeEditor.ts) | 草稿、修改计数、恢复与保存 |
-| 样式桥接 | [`styles/index.css`](../frontend/src/styles/index.css) | 将 CSS Token 暴露为 Tailwind CSS 4 utilities |
-| 样式基线 | [`styles/base.css`](../frontend/src/styles/base.css) | 通过 `@layer base` 提供浏览器基线，通过 `@utility` 提供通用原生滚动条 |
-| 静态基元 | [`styles/tokens.css`](../frontend/src/styles/tokens.css) | 只保留白色、透明色和作用域 `color-scheme` |
 
+独立仓库 `codex-proxy-ui` 是管理端和官方插件页面的共享组件源码；组件不得反向依赖管理端 Store、路由或 API。管理端通过 `@codex-proxy/ui` 公开入口消费组件，插件页面把组件和样式编译进自身静态资源，不在运行时借用宿主模块。
+插件页面的标题与副标题由宿主呈现，内容区只渲染业务；主题变化通过宿主桥同步，接入方式见
+[SDK 页面与宿主桥](../backend/crates/gateway-plugin/sdk/docs/capabilities.md#页面与宿主桥)。
 `theme/` 根目录只保留公开入口 `index.ts` 和唯一类型文件 `types.ts`；内部实现按 `core/`、`derive/`、`runtime/` 分层，不增加嵌套 barrel。
 纯派生模块不访问 DOM，`theme/runtime/browser.ts` 不包含派生规则，Theme Store 不复制算法。
 普通 Map 字段按 camelCase → kebab-case 统一生成 `--cp-*`；Semantic 与 Preset Color 仅维护各自的短角色表。
@@ -154,8 +148,7 @@ interface ThemeCustomization {
 Container 保证 3:1。功能色 Hover/Active 相对中性 Container 保证 3:1，Base 不做该校正。`text` 依据页面、
 容器、浮层和交互填充等中性 Surface 校正；`on-container` 单独依据语义 Container 的默认、Hover、Active 三态
 校正到至少 4.5:1，避免为了彩色底对比度而削弱中性表面上的颜色辨识度。
-`ensureContrast` 以每步 1% 的黑/白混合寻找满足所有配对的颜色；不能满足全部约束时返回最弱配对表现最好的候选，
-因此不承诺任意互相矛盾的自定义前景/背景组合都能达标。
+对比度校正由 UI 库的主题算法统一执行；互相矛盾的自定义前景/背景组合不保证全部达标。
 
 分类、图表与数据强调继续使用 Ant Design Preset Color 的角色结构。Blue、Green、Orange、Red 分别复用
 `colorInfo`、`colorSuccess`、`colorWarning`、`colorError`，保证通用彩色与可编辑语义 Seed 同源；没有语义对应的
@@ -178,7 +171,7 @@ Preset 的实心色使用 P6，普通 Container、Strong Container 与边界按 
 Input、阴影与其他 Component Token 从 Fill、Surface、Primary 和 Semantic 派生，不在常量文件维护整套颜色表。
 
 正常文字同时检查 Layout、Container、Elevated、文字交互背景、三级 Fill，以及控件透明填充在各宿主上的合成色
-和选中 / 选中 Hover 背景（新增配对用于浅色，暗色保持既有中性表面校正）。正文、标题和 Secondary 至少 7:1，
+和浅色的选中 / 选中 Hover 背景。正文、标题和 Secondary 至少 7:1，
 Tertiary 至少 5.5:1，Quaternary 至少 4.5:1；这些是相对全部上述表面的最低目标，对 Container 的实测比值通常更高。
 Disabled 保留独立的弱化颜色，不承担正常信息。控件填充由文字 Seed 和透明度派生，placeholder 继续消费
 Quaternary；主按钮白字与功能色文字遵循各自的容器配对规则。
@@ -220,48 +213,32 @@ Token 直接覆盖时不会自动重算同组件的其他状态；需要保持�
 | Scrollbar | `--cp-scrollbar-thumb-bg / hover-bg` |
 | BrandMark | `--cp-brand-mark-bg` |
 
-主按钮的颜色在 Component 派生入口统一生成：文字保留 `colorTextLightSolid`，默认背景从 Primary Seed 校正到
-4.5:1，Hover/Active 在该背景上分别混入 8% / 16% 黑色，使白字对比度逐级增强；明暗模式共用此规则。
-这组组件状态与全局 `colorPrimaryHover/Active` 分工明确，调整按钮不会反向改写主色 Seed。
-Input、Select、Textarea 与 NumberInput 共用 Input Component Token，普通按钮和图标按钮分别使用 Button Secondary 与
-Icon Button Secondary Token。组件合同统一，明暗配方分别派生：浅色需要改善宿主背景上的辨识度，暗色保留已有的
-Surface 混色与填充层次，不把浅色配方直接套入暗色。暗色输入的聚焦态直接复用原有 Hover 背景与外圈，
-浅色两态都使用 Container 背景与半透明主色外圈，保证点击前后不切换形态。
+组件状态由 UI 库的 Component 派生层统一生成，页面不维护混色系数：
 
-浅色填充与 Surface 共用外观距离，色源和透明度同步平滑过渡。中性基线的色源保留 `colorTextBase` 的色相与
-饱和度，明度向白色提升一半；控件常态、按钮 Hover / Active 的透明度为 7.5% / 10.5% / 14%，避免直接叠白后发灰。
-带色温主题直接使用文字 Seed，常态取 Secondary Fill 强度的 78%，按钮 Hover / Active 为 9% / 12%，
-保留与 Surface 一致的深浅层级。透明填充随页面、卡片和浮层的宿主背景自然合成。
-输入控件常态保持无边，Hover 与 Focus 均使用 Container 背景（默认浅色为白色）和同色、同宽的 3px 半透明主色
-外圈；两种状态的外圈都不受装饰性阴影强度影响。暗色同样将 Hover 与 Focus 的背景、外圈和装饰阴影统一派生。
+| 角色 | 状态与可读性约束 |
+| --- | --- |
+| 主按钮 | 白字背景至少达到 4.5:1；Hover / Active 加深，不反向改写 Primary Seed |
+| 输入控件 | Input、Select、Textarea、NumberInput 共用 Token；常态无边，Hover 与 Focus 保持相同背景和外圈 |
+| 次级操作 | 普通按钮与图标按钮各用自己的 Secondary Token；透明填充与宿主表面合成，`ghost` 无常态底色 |
+| 表格 | 表头、斑马纹、Hover 独立派生；固定列使用不透明合成背景，选中行保留 Primary 语义 |
+| 错误与焦点 | Hover / Focus 不覆盖错误反馈；焦点外圈不受装饰性阴影强度影响 |
+| 浮层头部 | 浅色取 Secondary Fill，深色取 Tertiary Fill；箭头与头部使用同一 Token，不借用表格背景 |
 
-浅色表头、斑马纹、行 Hover 使用独立的内容填充，中性基线透明度为 9.5% / 4.5% / 9%；带色温主题分别复用
-Tertiary / Quaternary / Tertiary 的混色强度（6% / 3.5% / 6%），让斑马纹可辨、Hover 再深一档。
-这些值先与 Container 合成为不透明背景，避免固定列透出滚动内容。暗色表头、斑马纹和行 Hover 继续分别消费
-Tertiary Fill、Quaternary Fill 和 Text Hover，保持已有颜色。
-表格数据单元格的背景统一使用 150ms 淡入淡出，覆盖普通行、斑马纹和选中行，固定列同步过渡；系统偏好减少动态效果时关闭。
-
-选中行使用 Primary Container；浅色选中行 Hover 使用 Primary Container Hover，暗色仅混入 4% 正文色以轻微提亮，
-保留选中语义。错误状态使用 Error Container 与独立外圈，Hover 或 Focus 不覆盖错误反馈；`ghost` 延续无常态底色的
-轻操作角色。输入焦点外圈不乘以 `shadowStrength`，关闭装饰性阴影不会移除焦点反馈。
-
-结构化浮层头部统一使用 `--cp-popover-header-bg`：浅色从 Secondary Fill 派生，
-深色从 Tertiary Fill 派生。健康时间线朝向头部的箭头也使用该值；
-不要把浮层头部重新绑定到表格斑马纹或普通悬停背景。该 Token 可在主题编辑器中单独调整。
+明暗模式分别派生，但共用组件合同。表格背景过渡覆盖普通行、选中行和固定列，尊重减少动态效果偏好。
 
 Theme Editor 只开放真正由对应组件消费的 Component Token。全局 Alias 不放进组件目录，避免一次覆盖同时改变
 多个无关组件。
 
 应用内品牌图标使用 [`AppBrandMark.vue`](../frontend/src/components/AppBrandMark.vue)：浅色模式取
 `colorBgSpotlight`，深色模式取 `colorBgElevated`，保持中性暗面与白色图形；浏览器 favicon 继续使用固定黑白
-图标，不随主题改变。
+图标，不随主题改变，由 `frontend/public/favicon.svg` 提供，页面通过 `/favicon.svg` 引用。
 
 ### 通用颜色消费
 
 主题层禁止声明账号套餐、推理类型或具体页面名称。业务组件只能选择通用 Preset Color 角色，例如 Cyan Container、
 Purple Strong Container 或 Purple Solid；同一组颜色仍由运行时色板统一派生。`styles/tokens.css` 只保留白色、透明色与
 作用域 `color-scheme`，不保存可换肤值或业务标识色。账户活动热力图以 Success Container 为起点、Success Solid
-为终点，按 22% / 46% / 70% 生成中间密度；浅色与暗色使用同一规则，因此不会在浅色背景退化成近白方块。
+为终点生成中间密度；浅色与暗色使用同一规则。
 图表数据系列也只引用通用 Preset Color Token。
 
 ## 预置主题
@@ -386,12 +363,12 @@ Input、Button Secondary 与 Icon Button Secondary 的三个背景 Token 支持 
 仅当值需要在 CSS 函数、SVG 或局部派生中参与计算时，直接读取 `var(--cp-*)`。不在页面组件中重新实现色阶、
 对比度或明暗算法。
 
-`@theme inline` 只注册 Tailwind 名称，不保存主题值。注册表按基础、排版、颜色、圆角、阴影、间距与尺寸排序；
+共享包的 `styles/tailwind.css` 是唯一 `@theme inline` 注册表，只注册 Tailwind 名称，不保存主题值。注册表按基础、排版、颜色、圆角、阴影、间距与尺寸排序；
 颜色再按基元、表面、主色与链接、语义、预设、数据、组件分组。
 Preset 家族按字母排序，每个家族固定使用 `container → container-strong → border → solid → text → on-container`。主题值由
 `initializeTheme()` 在 Vue 挂载前动态生成并提交，不增加 `theme:generate`、`theme:check` 或构建期快照。
 
-全局元素基线统一放进 `styles/base.css` 的 `@layer base`，确保组件 utility 可以按 Tailwind 层级正常覆盖；可复用的
+全局元素基线统一放进共享包 `styles/base.css` 的 `@layer base`，确保组件 utility 可以按 Tailwind 层级正常覆盖；可复用的
 原生滚动条声明使用 Tailwind CSS 4 `@utility`。组件内能等价表达的简单 SVG、渐变、原生外观与伪元素优先使用
 utility / arbitrary variant；Vue Transition、跨浏览器 Range、动态富文本 `:deep()`、复杂纹理与关键帧继续保留局部
 `<style scoped>`，不为追求原子化牺牲可读性。
@@ -419,7 +396,7 @@ utility / arbitrary variant；Vue Transition、跨浏览器 Range、动态富文
 1. 在唯一的 `theme/types.ts` 中声明 Seed、Map 或 Alias 字段。
 2. 在 `theme/core/normalize.ts` 定义合法输入边界。
 3. 在对应派生模块集中生成字段；普通 Map 字段会自动进入 `ThemeTokens` 完整输出。
-4. 如需 Tailwind utility，在 `styles/index.css` 的 `@theme inline` 中映射。
+4. 如需 Tailwind utility，在 `codex-proxy-ui/src/styles/tailwind.css` 的 `@theme inline` 中映射。
 5. 只在确实需要用户控制时加入 Theme Editor；派生细节默认只读。
 
 ### 增加 Component Token

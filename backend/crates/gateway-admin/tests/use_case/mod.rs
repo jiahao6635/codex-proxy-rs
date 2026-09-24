@@ -4,14 +4,15 @@ mod auth;
 mod auth_key;
 mod backup;
 mod client_keys;
+mod credentials;
 mod freeze_recovery;
 mod import_tasks;
 mod observability;
-mod openai;
+mod plugin_update;
+mod plugins;
 mod proxies;
 mod settings;
 mod system;
-mod xai;
 
 use std::{
     str::FromStr,
@@ -49,10 +50,10 @@ use gateway_admin::{
         provider_credentials::{
             AuthorizationCommit, AuthorizationStarted, CompleteAuthorization, CredentialDetails,
             CredentialImportCommit, CredentialImportResult, CredentialMutationResult,
-            CredentialRotationCommit, PendingAuthorizationMutation, PrepareCredentialImport,
-            PrepareCredentialRefresh, PrepareCredentialRotation, PreparedAuthorizationCommit,
-            PreparedCredentialImport, PreparedCredentialRotation, ProviderExport,
-            ProviderExportCredentialInput, ProviderModels, ProviderQuota,
+            CredentialRotationCommit, PrepareCredentialImport, PrepareCredentialRefresh,
+            PrepareCredentialRotation, PreparedAuthorizationCommit, PreparedCredentialImport,
+            PreparedCredentialRotation, ProviderExport, ProviderExportCredentialInput,
+            ProviderModels, ProviderQuota,
         },
         settings::{AdminApiKey, AdminApiKeyMutation, ReplaceRuntimeSettings, RuntimeSettings},
         system::{SystemOperationAccepted, SystemUpdateDetail, SystemUpdateStatus, SystemVersion},
@@ -101,6 +102,8 @@ pub(super) struct AdminHarness {
     providers: Vec<Arc<dyn ProviderAdmin>>,
     probe: Arc<dyn AccountProbe>,
     system: Arc<dyn SystemOperations>,
+    plugin_store: Arc<dyn gateway_admin::ports::plugins::PluginStore>,
+    plugin_inspector: Arc<dyn gateway_admin::ports::plugins::PluginPackageInspector>,
     client_key_verifier: Arc<dyn ClientKeyVerifier>,
 }
 
@@ -126,6 +129,8 @@ impl AdminHarness {
             ],
             probe: Arc::new(UnavailableProbe),
             system: Arc::new(UnavailableSystem),
+            plugin_store: Arc::new(plugins::TestPluginPorts),
+            plugin_inspector: Arc::new(plugins::TestPluginPorts),
             client_key_verifier: Arc::new(UnavailableClientKeyVerifier),
         }
     }
@@ -215,6 +220,16 @@ impl AdminHarness {
         self
     }
 
+    pub(super) fn plugins(
+        mut self,
+        store: Arc<dyn gateway_admin::ports::plugins::PluginStore>,
+        inspector: Arc<dyn gateway_admin::ports::plugins::PluginPackageInspector>,
+    ) -> Self {
+        self.plugin_store = store;
+        self.plugin_inspector = inspector;
+        self
+    }
+
     pub(super) async fn build(self) -> AdminServices {
         self.build_bundle().await.services()
     }
@@ -241,10 +256,20 @@ impl AdminHarness {
                 self.observability,
                 self.settings,
                 self.backup,
+                self.plugin_store,
+                Arc::new(plugins::TestPluginPorts),
             ),
             gateway_admin::AdminRuntimePorts {
+                plugin_preparation: Arc::new(plugins::TestPluginPorts),
+                plugin_management: Arc::new(plugins::TestPluginPorts),
+                published_snapshot: gateway_core::runtime::RuntimeSnapshotHandle::default(),
+                plugin_inspector: self.plugin_inspector,
+                plugin_distribution: Arc::new(plugins::TestPluginPorts),
                 pricing_source: Arc::new(UnavailablePricingSource),
-                providers: self.providers,
+                providers: gateway_admin::ports::provider::ProviderAdminRegistry::new(
+                    self.providers,
+                )
+                .unwrap(),
                 snapshot: Arc::new(NoopSnapshot),
                 account_probe: self.probe,
                 proxy_probe: Arc::new(proxies::TestProxies::default()),
@@ -416,6 +441,13 @@ impl AccountGroupStore for UnavailableAccountGroupStore {
 
 #[async_trait]
 impl AccountStore for UnavailableStore {
+    async fn list_plugin_accounts(
+        &self,
+        _: gateway_admin::model::provider_credentials::PluginAccountListQuery,
+    ) -> AdminStoreResult<gateway_admin::model::provider_credentials::PluginAccountPage> {
+        Err(unavailable("plugin accounts"))
+    }
+
     async fn list_accounts(
         &self,
         _: AccountListQuery,
@@ -462,11 +494,25 @@ impl AccountStore for UnavailableStore {
         Err(unavailable("credential"))
     }
 
+    async fn credential_details_by_id(
+        &self,
+        _: &ProviderAccountId,
+    ) -> AdminStoreResult<Option<CredentialDetails>> {
+        Err(unavailable("credential"))
+    }
+
     async fn load_credentials_for_export(
         &self,
         _: &ProviderKind,
         _: &[ProviderAccountId],
     ) -> AdminStoreResult<Vec<ProviderExportCredentialInput>> {
+        Err(unavailable("credential export"))
+    }
+
+    async fn load_credential_for_plugin(
+        &self,
+        _: &ProviderAccountId,
+    ) -> AdminStoreResult<Option<ProviderExportCredentialInput>> {
         Err(unavailable("credential export"))
     }
 
@@ -478,11 +524,21 @@ impl AccountStore for UnavailableStore {
         Err(unavailable("credential import"))
     }
 
+    async fn authorization_receipt(
+        &self,
+        _: &gateway_admin::model::provider_credentials::AuthorizationReceiptKey,
+    ) -> AdminStoreResult<
+        Option<gateway_admin::model::provider_credentials::CredentialBatchMutationResult>,
+    > {
+        Err(unavailable("authorization receipt"))
+    }
+
     async fn commit_authorization(
         &self,
         _: AuthorizationCommit,
         _: &MutationContext,
-    ) -> AdminStoreResult<CredentialMutationResult> {
+    ) -> AdminStoreResult<gateway_admin::model::provider_credentials::AuthorizationCommitResult>
+    {
         Err(unavailable("authorization"))
     }
 
@@ -682,6 +738,10 @@ impl ObservabilityStore for UnavailableStore {
         Err(unavailable("usage records"))
     }
 
+    async fn usage_provider_kinds(&self, _: TimeRange) -> AdminStoreResult<Vec<String>> {
+        Err(unavailable("usage providers"))
+    }
+
     async fn usage_record_detail(&self, _: &str) -> AdminStoreResult<UsageDetail> {
         Err(unavailable("usage detail"))
     }
@@ -784,6 +844,10 @@ impl UnavailableProvider {
     }
 }
 
+pub(super) fn test_provider(kind: &str) -> Arc<dyn ProviderAdmin> {
+    Arc::new(UnavailableProvider::new(kind))
+}
+
 #[async_trait]
 impl ProviderAdmin for UnavailableProvider {
     fn provider_kind(&self) -> &ProviderKind {
@@ -792,7 +856,7 @@ impl ProviderAdmin for UnavailableProvider {
 
     async fn account_unavailable(&self, _: &ProviderAccountId) {}
 
-    fn connection_test_operation(
+    async fn connection_test_operation(
         &self,
         _: &gateway_core::routing::UpstreamModelId,
         _: &str,
@@ -823,7 +887,7 @@ impl ProviderAdmin for UnavailableProvider {
 
     async fn start_authorization(
         &self,
-        _: PendingAuthorizationMutation,
+        _: gateway_admin::model::provider_credentials::PrepareAuthorization,
     ) -> Result<AuthorizationStarted, ProviderAdminError> {
         Err(unsupported_provider())
     }
@@ -955,6 +1019,7 @@ impl AccountProbe for UnavailableProbe {
     fn probe(
         &self,
         _: AccountProbeRequest,
+        _: Option<Arc<gateway_core::routing::RuntimeSnapshot>>,
     ) -> BoxFuture<'_, Result<AccountProbeResult, AccountProbeError>> {
         Box::pin(async {
             Err(GatewayError::new(
@@ -985,6 +1050,7 @@ impl SystemOperations for UnavailableSystem {
     async fn perform_update(
         &self,
         _: Option<String>,
+        _: Arc<dyn gateway_admin::ports::system::SystemUpdatePreflight>,
     ) -> Result<SystemOperationAccepted, SystemOperationError> {
         Err(unavailable_system())
     }
@@ -993,7 +1059,10 @@ impl SystemOperations for UnavailableSystem {
         Err(unavailable_system())
     }
 
-    async fn rollback(&self) -> Result<SystemOperationAccepted, SystemOperationError> {
+    async fn rollback(
+        &self,
+        _: Arc<dyn gateway_admin::ports::system::SystemUpdatePreflight>,
+    ) -> Result<SystemOperationAccepted, SystemOperationError> {
         Err(unavailable_system())
     }
 

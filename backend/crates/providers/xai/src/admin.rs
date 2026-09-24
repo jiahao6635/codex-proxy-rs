@@ -321,6 +321,19 @@ impl XaiAdminProvider {
 
 #[async_trait]
 impl ProviderAdmin for XaiAdminProvider {
+    fn account_capabilities(
+        &self,
+        _account_id: &ProviderAccountId,
+        authentication_kind: &str,
+    ) -> gateway_admin::model::provider_capabilities::ProviderAccountCapabilities {
+        let oauth = authentication_kind == crate::credential::XAI_AUTHENTICATION_KIND_OAUTH;
+        gateway_admin::model::provider_capabilities::ProviderAccountCapabilities {
+            quota: oauth,
+            quota_refresh: oauth,
+            ..Default::default()
+        }
+    }
+
     fn client_profile_options(
         &self,
     ) -> Result<gateway_core::account::OpaqueProviderData, ProviderAdminError> {
@@ -378,6 +391,23 @@ impl ProviderAdmin for XaiAdminProvider {
     fn pricing_catalog(&self) -> gateway_admin::model::pricing::ProviderPricingCatalog {
         crate::transport::canonical::pricing_catalog()
     }
+    fn credential_capabilities(
+        &self,
+    ) -> gateway_admin::model::provider_capabilities::ProviderCredentialCapabilities {
+        use gateway_admin::model::provider_capabilities::{
+            AuthorizationCompletion, ProviderCredentialCapabilities, ProviderLoginCapability,
+        };
+        ProviderCredentialCapabilities {
+            import: Some(serde_json::json!({"type":"object"})),
+            login: Some(ProviderLoginCapability {
+                input_schema: serde_json::json!({"type":"object", "additionalProperties":false}),
+                completion: AuthorizationCompletion::Callback,
+            }),
+            refresh: true,
+            export: true,
+        }
+    }
+
     fn provider_kind(&self) -> &ProviderKind {
         &self.provider_kind
     }
@@ -391,7 +421,7 @@ impl ProviderAdmin for XaiAdminProvider {
         self.quota.invalidate_scheduling(account_ids);
     }
 
-    fn connection_test_operation(
+    async fn connection_test_operation(
         &self,
         upstream_model: &UpstreamModelId,
         input_text: &str,
@@ -586,8 +616,17 @@ impl ProviderAdmin for XaiAdminProvider {
 
     async fn start_authorization(
         &self,
-        pending: PendingAuthorizationMutation,
+        command: gateway_admin::model::provider_credentials::PrepareAuthorization,
     ) -> Result<AuthorizationStarted, ProviderAdminError> {
+        if !command
+            .input
+            .expose_to_provider()
+            .expose_to_provider()
+            .is_empty()
+        {
+            return Err(provider_error(ProviderAdminErrorKind::Invalid));
+        }
+        let pending = command.pending;
         if pending.provider_kind() != &self.provider_kind {
             return Err(provider_error(ProviderAdminErrorKind::Invalid));
         }
@@ -901,16 +940,19 @@ impl XaiAdminProvider {
                         .with_outbound_proxy(stored.mutation.outbound_proxy().cloned()),
                     credential: prepared.credential,
                 };
-                PreparedAuthorizationCredential::Create(prepared_create(prepared, Utc::now())?)
+                PreparedAuthorizationCredential::Create(vec![prepared_create(
+                    prepared,
+                    Utc::now(),
+                )?])
             }
             AuthorizationMutationTarget::Reauthorize { .. } => {
                 let current =
                     current.ok_or_else(|| provider_error(ProviderAdminErrorKind::Internal))?;
                 let prepared = verified_rotation(current, tokens)?;
-                PreparedAuthorizationCredential::Reauthorize(prepared_rotation(
+                PreparedAuthorizationCredential::Reauthorize(Box::new(prepared_rotation(
                     prepared,
                     self.provider_kind.clone(),
-                )?)
+                )?))
             }
         };
         Ok(PreparedAuthorizationCommit::new(

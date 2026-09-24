@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import type { SystemUpdateDetail } from '@/api'
+import { BaseButton, BaseConfirmModal, BaseEmpty, BaseMarkdown, BaseModal, BaseScrollbar, toast } from '@codex-proxy/ui'
+
 import {
   ArrowUpCircle,
   Circle,
@@ -8,16 +10,8 @@ import {
   RefreshCw,
   Terminal,
 } from '@lucide/vue'
-
 import { storeToRefs } from 'pinia'
 import { computed, nextTick, shallowRef, useTemplateRef, watch } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
-import BaseEmpty from '@/components/base/BaseEmpty.vue'
-import BaseMarkdown from '@/components/base/BaseMarkdown/index.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
-import { toast } from '@/components/base/BaseToast'
 import { normalizeSystemVersion, useSystemUpdateStore } from '@/stores/modules/system-update'
 import { errorMessage } from '@/utils/async'
 import { formatTime } from '@/utils/date'

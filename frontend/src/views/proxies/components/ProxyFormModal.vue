@@ -1,14 +1,8 @@
 <script setup lang="ts">
 import type { OutboundProxyRecord, RequestLocation } from '@/api'
+import { BaseButton, BaseForm, BaseFormItem, BaseIconButton, BaseInput, BaseModal, BaseSwitch } from '@codex-proxy/ui'
 import { Eye, EyeOff, Save, Wifi } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseForm from '@/components/base/BaseForm/index.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import RequestLocationFields from '@/components/RequestLocationFields.vue'
 
 const props = defineProps<{

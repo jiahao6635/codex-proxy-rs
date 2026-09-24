@@ -1,7 +1,7 @@
-import { shallowRef } from 'vue'
+import { toast } from '@codex-proxy/ui'
 
+import { shallowRef } from 'vue'
 import { ApiError } from '@/api/request'
-import { toast } from '@/components/base/BaseToast'
 import { errorMessage, withMinimumDuration } from '@/utils/async'
 
 type MaybePromise<T> = T | Promise<T>

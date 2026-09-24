@@ -857,33 +857,26 @@ async fn legacy_urls_join_one_catalog_entry_and_invalid_batch_rolls_back() {
 
 #[tokio::test]
 async fn migration_backfills_shared_proxies_without_changing_credentials() {
-    let Some(database) = TestDatabase::create("proxy_backfill").await else {
+    let Some(database) = TestDatabase::create_through("proxy_backfill", 4).await else {
         return;
     };
-    let accounts = PgProviderAccountRepository::new(database.pool.clone());
+    // 从真实旧 schema 正向升级，不拆卸最新结构，避免遗漏后续增加的引用约束。
     for id in ["acct_one", "acct_two", "acct_direct"] {
-        accounts
-            .insert_provider_account(account(id, id))
-            .await
-            .unwrap();
+        let proxy_url = (id != "acct_direct").then_some("http://user:secret@127.0.0.1:8080/");
+        sqlx::query(
+            "insert into provider_accounts (
+                id,provider_kind,name,authentication_kind,provider_credentials_json,
+                has_refresh_token,credential_observed_at,created_at,updated_at,outbound_proxy_url
+             ) values ($1,'openai',$1,'oauth','{}',false,now(),now(),now(),$2)",
+        )
+        .bind(id)
+        .bind(proxy_url)
+        .execute(&database.pool)
+        .await
+        .unwrap();
     }
-    // 回退到迁移前的结构，随后完整重放同一份位置迁移。
-    sqlx::raw_sql("alter table runtime_settings drop column request_location_json, drop column request_location_enabled;
-        alter table provider_accounts drop column outbound_proxy_id; drop table outbound_proxies;
-        update provider_accounts set outbound_proxy_url = 'http://user:secret@127.0.0.1:8080/' where id <> 'acct_direct';")
-        .execute(&database.pool).await.unwrap();
-    sqlx::raw_sql(include_str!(
-        "../../../../migrations/0005_managed_outbound_proxies.sql"
-    ))
-    .execute(&database.pool)
-    .await
-    .unwrap();
-    sqlx::raw_sql(include_str!(
-        "../../../../migrations/0011_proxy_request_location.sql"
-    ))
-    .execute(&database.pool)
-    .await
-    .unwrap();
+    super::TEST_MIGRATOR.run(&database.pool).await.unwrap();
+    let accounts = PgProviderAccountRepository::new(database.pool.clone());
     let inherited = gateway_core::account::ProviderAccountStore::list_accounts(&accounts)
         .await
         .unwrap();

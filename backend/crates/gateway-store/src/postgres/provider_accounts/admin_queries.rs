@@ -7,6 +7,7 @@ pub(crate) struct AdminAccountPageRows {
     pub(crate) accounts: Vec<ProviderAccountSummary>,
     pub(crate) total: u64,
     pub(crate) summary: AccountSummary,
+    pub(crate) providers: Vec<String>,
 }
 
 pub(crate) async fn load_admin_account_page(
@@ -60,7 +61,7 @@ pub(crate) async fn load_admin_account_page(
 
     let statement = format!(
         "with account_statuses as (
-           select a.id,
+           select a.id, a.provider_kind,
                   case
                     when not a.enabled then 'disabled'
                     when a.credential_state <> 'ready'
@@ -80,7 +81,8 @@ pub(crate) async fn load_admin_account_page(
                     as summary_rate_limited,
                   count(*) filter (where admin_status = 'disabled')::bigint
                     as summary_disabled,
-                  count(*) filter (where admin_status = 'error')::bigint as summary_error
+                  count(*) filter (where admin_status = 'error')::bigint as summary_error,
+                  coalesce(array_agg(distinct provider_kind order by provider_kind), '{{}}'::text[]) as providers
              from account_statuses
          ),
          filtered as materialized (
@@ -127,6 +129,7 @@ pub(crate) async fn load_admin_account_page(
                 global_summary.summary_total, global_summary.summary_normal,
                 global_summary.summary_quota_exhausted, global_summary.summary_rate_limited,
                 global_summary.summary_disabled, global_summary.summary_error,
+                global_summary.providers,
                 settings.config_revision
            from filtered_total
            cross join global_summary
@@ -169,6 +172,13 @@ pub(crate) async fn load_admin_account_page(
     })?;
     let config_revision = revision_from_row(metadata)?;
     let total = unsigned_metadata(metadata, "filtered_total")?;
+    let providers = metadata.try_get("providers").map_err(|_| {
+        AdminStoreError::new(
+            AdminStoreErrorKind::Invalid,
+            ENTITY,
+            "persisted account providers are invalid",
+        )
+    })?;
     let summary = AccountSummary {
         total: unsigned_metadata(metadata, "summary_total")?,
         normal: unsigned_metadata(metadata, "summary_normal")?,
@@ -193,6 +203,7 @@ pub(crate) async fn load_admin_account_page(
         accounts,
         total,
         summary,
+        providers,
     })
 }
 

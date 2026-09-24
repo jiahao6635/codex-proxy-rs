@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use chrono::Utc;
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, future::BoxFuture};
 use gateway_core::account::{
     AccountFeedbackStats, AccountWeight, CredentialState, OpaqueProviderData, ProviderAccountId,
     ProviderAccountStore as _, QuotaAccessChange, QuotaAccessState, QuotaEvidence,
@@ -15,6 +15,11 @@ use gateway_core::account::{
 };
 use gateway_core::engine::continuation::{
     ContinuationBinding, NativeContinuationPin, PreviousResponseId,
+};
+use gateway_core::engine::execution::ClientTransport;
+use gateway_core::engine::middleware::{
+    FrozenMiddlewarePlan, MiddlewareContext, MiddlewareError, MiddlewareHeader, MiddlewareMount,
+    MiddlewareNext, MiddlewarePlan, MiddlewareRequest, MiddlewareResponse,
 };
 use gateway_core::engine::provider::{Provider as _, ProviderRequest};
 use gateway_core::engine::{
@@ -38,6 +43,7 @@ use gateway_core::routing::{
     ProviderKind, ProviderModel, PublicModelId, RoutingContext, RuntimeAccount,
     RuntimeAccountDirectory, RuntimeSnapshot, UpstreamModelId,
 };
+use gateway_core::runtime::extensions::{ExtensionSetId, ExtensionSetLease, ExtensionSetReference};
 use gateway_core::upstream::UpstreamSendState;
 use provider_openai::config::DEFAULT_STREAM_MAX_RETRIES;
 use provider_openai::credential::{
@@ -65,6 +71,432 @@ use crate::support::{
     TestLeaseCoordinator, account_policy, catalog_cache, profile, secret,
 };
 use crate::transport::accept_codex_test_websocket;
+
+#[tokio::test]
+async fn native_openai_translates_a_non_native_source_before_encoding() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(CAPTURE_COMPLETED_SSE),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let translations = Arc::new(Mutex::new(0_usize));
+    let source = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "example-source",
+            Map::from_iter([("opaque".to_owned(), json!("source-only"))]),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))])),
+    ));
+    let mut stream = provider_with_base_url(&store, server.uri())
+        .execute(
+            planned_request("openai", source),
+            context_with_middleware(
+                "req_native_translate",
+                Arc::new(TranslationMiddleware {
+                    translations: Arc::clone(&translations),
+                    target: Map::from_iter([
+                        ("model".to_owned(), json!("ignored-by-forced-model")),
+                        ("input".to_owned(), json!("translated")),
+                        ("stream".to_owned(), json!(true)),
+                    ]),
+                }),
+                false,
+            ),
+        )
+        .await
+        .expect("registered translation should run before native encoding");
+    assert!(server.received_requests().await.unwrap().is_empty());
+    while let Some(event) = stream.next().await {
+        event.expect("translated request response");
+    }
+    assert_eq!(*translations.lock().unwrap(), 1);
+    let requests = server.received_requests().await.unwrap();
+    let sent = captured_request_body(&requests[0]);
+    assert_eq!(sent["input"][0]["content"][0]["text"], "translated");
+    assert_eq!(sent["model"], "gpt-5.4");
+}
+
+#[tokio::test]
+async fn native_openai_rejects_missing_translation_before_send() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let server = MockServer::start().await;
+    let source = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "example-source",
+            Map::from_iter([("opaque".to_owned(), json!("source-only"))]),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))])),
+    ));
+    let error = match provider_with_base_url(&store, server.uri())
+        .execute(
+            planned_request("openai", source),
+            context_with_middleware(
+                "req_native_translate_missing",
+                Arc::new(PassThroughMiddleware),
+                false,
+            ),
+        )
+        .await
+    {
+        Ok(_) => panic!("missing translation pair must be explicit"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_openai_rejects_capability_expanding_translation_before_send() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let server = MockServer::start().await;
+    let source = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "example-source",
+            Map::from_iter([("opaque".to_owned(), json!("source-only"))]),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))])),
+    ));
+    let translations = Arc::new(Mutex::new(0));
+    let error = match provider_with_base_url(&store, server.uri())
+        .execute(
+            planned_request("openai", source),
+            context_with_middleware(
+                "req_native_translate_expansion",
+                Arc::new(TranslationMiddleware {
+                    translations: Arc::clone(&translations),
+                    target: json!({
+                        "model":"ignored-by-forced-model",
+                        "input":"translated",
+                        "tools":[{"type":"function", "name":"new_capability"}]
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                }),
+                false,
+            ),
+        )
+        .await
+    {
+        Ok(_) => panic!("translation cannot expand routed capabilities"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    assert_eq!(*translations.lock().unwrap(), 1);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_openai_revalidates_translated_transport_without_reselecting() {
+    let store = Arc::new(MemoryAccountStore::default());
+    let upstream = MockServer::start().await;
+    store
+        .seed_api_key(
+            "acct_provider_contract",
+            upstream.uri(),
+            provider_openai::credential::ApiKeyTransport::Http,
+        )
+        .await;
+    let source = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "example-source",
+            Map::from_iter([("opaque".to_owned(), json!("source-only"))]),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(true))])),
+    ));
+    let error = match provider(&store)
+        .execute(
+            planned_request("openai", source),
+            context_with_middleware(
+                "req_native_translate_transport",
+                Arc::new(TranslationMiddleware {
+                    translations: Arc::new(Mutex::new(0)),
+                    target: json!({
+                        "model": "ignored-by-forced-model",
+                        "input": [],
+                        "store": false,
+                        "generate": false
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                }),
+                false,
+            ),
+        )
+        .await
+    {
+        Ok(_) => panic!("selected HTTP account cannot satisfy translated WebSocket request"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ProviderErrorKind::Unsupported);
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_openai_claims_translated_session_affinity_before_send() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let server = MockServer::start().await;
+    let affinity = Arc::new(MemorySessionAffinity::default());
+    let source = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "example-source",
+            Map::from_iter([("opaque".to_owned(), json!("source-only"))]),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([
+            ("conversation_id".to_owned(), json!("translated-session")),
+            ("use_websocket".to_owned(), json!(false)),
+        ])),
+    ));
+    let stream = provider_with_affinity_and_base_url(&store, Arc::clone(&affinity), server.uri())
+        .execute(
+            planned_request("openai", source),
+            context_with_middleware(
+                "req_native_translate_affinity",
+                Arc::new(TranslationMiddleware {
+                    translations: Arc::new(Mutex::new(0)),
+                    target: json!({
+                        "model": "ignored-by-forced-model",
+                        "input": "translated",
+                        "stream": true
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                }),
+                false,
+            ),
+        )
+        .await
+        .expect("translated session should keep the selected account");
+    assert_eq!(
+        stream.metadata().provider_account_id().as_str(),
+        "acct_provider_contract"
+    );
+    assert_eq!(affinity.binding_count(), 1);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn attempt_middleware_runs_once_before_native_encoding_and_fast_policy() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(CAPTURE_COMPLETED_SSE),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "openai",
+            json!({"model":"gpt-5.6-sol", "input":"hello", "unknown":{"preserved":true}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))])),
+    ));
+    let mut stream = provider_with_base_url(&store, server.uri())
+        .execute(
+            planned_request("openai", operation),
+            context_with_middleware(
+                "req_native_normalize",
+                Arc::new(RecordingMiddleware {
+                    observed: Arc::clone(&observed),
+                    replacement: ("service_tier".to_owned(), json!("priority")),
+                    request_headers: vec![
+                        MiddlewareHeader::new(
+                            "x-business-context",
+                            Bytes::from_static(b"tenant-public"),
+                        ),
+                        MiddlewareHeader::new(
+                            "x-business-context",
+                            Bytes::from_static(b"trace-public"),
+                        ),
+                    ],
+                }),
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(server.received_requests().await.unwrap().is_empty());
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    {
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0]["input"], "hello");
+    }
+    let requests = server.received_requests().await.unwrap();
+    let sent = captured_request_body(&requests[0]);
+    assert_eq!(sent["service_tier"], "default");
+    assert_eq!(sent["unknown"]["preserved"], true);
+    assert_eq!(
+        captured_header_values(&requests[0], "x-business-context"),
+        vec![b"tenant-public".to_vec(), b"trace-public".to_vec()],
+    );
+
+    let mut conflict = provider_with_base_url(&store, server.uri())
+        .execute(
+            planned_request("openai", http_generate_operation()),
+            context_with_middleware(
+                "req_native_header_conflict",
+                Arc::new(RecordingMiddleware {
+                    observed: Arc::default(),
+                    replacement: ("service_tier".to_owned(), json!("priority")),
+                    request_headers: vec![MiddlewareHeader::new(
+                        "x-codex-routing-hint",
+                        Bytes::from_static(b"plugin-value"),
+                    )],
+                }),
+                false,
+            ),
+        )
+        .await
+        .expect("header validation remains on the cold Provider stream");
+    let Some(Err(error)) = conflict.next().await else {
+        panic!("a Provider-managed header collision must fail before send")
+    };
+    assert_eq!(error.kind(), ProviderErrorKind::Protocol);
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn attempt_middleware_rejects_non_text_websocket_headers_before_opening() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let server = MockServer::start().await;
+    let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "openai",
+            json!({"model":"gpt-5.4", "input":"hello"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(true))])),
+    ));
+
+    let error = provider_with_base_url(&store, server.uri())
+        .execute(
+            planned_request("openai", operation),
+            context_with_middleware(
+                "req_native_websocket_obs_text",
+                Arc::new(RecordingMiddleware {
+                    observed: Arc::default(),
+                    replacement: ("service_tier".to_owned(), json!("priority")),
+                    request_headers: vec![MiddlewareHeader::new(
+                        "x-business-context",
+                        Bytes::from_static(&[0x80]),
+                    )],
+                }),
+                false,
+            ),
+        )
+        .await
+        .err()
+        .expect("WebSocket headers must be representable before opening");
+
+    assert_eq!(error.kind(), ProviderErrorKind::Protocol);
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn attempt_middleware_can_change_reasoning_before_native_encoding() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(CAPTURE_COMPLETED_SSE),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "openai",
+            json!({
+                "model":"gpt-5.6-sol",
+                "input":"hello",
+                "reasoning":{"effort":"future-level","summary":"detailed"},
+                "unknown":{"preserved":true}
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))])),
+    ));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut stream = provider_with_base_url(&store, server.uri())
+        .execute(
+            planned_request("openai", operation),
+            context_with_middleware(
+                "req_native_reasoning",
+                Arc::new(RecordingMiddleware {
+                    observed: Arc::clone(&observed),
+                    replacement: ("reasoning".to_owned(), json!({"effort":"high"})),
+                    request_headers: Vec::new(),
+                }),
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    let body = captured_request_body(&requests[0]);
+    assert_eq!(body["reasoning"], json!({"effort":"high"}));
+    assert_eq!(
+        body.pointer("/input/0/content/0/text"),
+        Some(&json!("hello"))
+    );
+    assert_eq!(body["unknown"]["preserved"], true);
+    assert_eq!(
+        observed.lock().unwrap()[0]["reasoning"]["effort"],
+        "future-level"
+    );
+}
 
 #[tokio::test]
 async fn responses_bill_sent_model_and_observe_unpriced_response_without_rewriting_it() {
@@ -251,7 +683,7 @@ async fn selected_proxy_location_overrides_global_and_reloads_without_mutating_c
     ].into_iter().enumerate() {
         let location = location.map(|value| serde_json::from_value::<RequestLocation>(value).unwrap());
         store.set_egress(account_id, Some(OutboundProxy::parse(&proxy.uri()).unwrap()), location);
-        let mut stream = provider.execute(planned_request("openai", operation.clone()), context_with_state_owner_and_location(&format!("req_proxy_location_{index}"), account_id, global_enabled.then(global_request_location))).await.expect("prepare");
+        let mut stream = Arc::clone(&provider).execute(planned_request("openai", operation.clone()), context_with_state_owner_and_location(&format!("req_proxy_location_{index}"), account_id, global_enabled.then(global_request_location))).await.expect("prepare");
         while let Some(event) = stream.next().await { event.expect("proxy response"); }
         let requests = proxy.received_requests().await.unwrap();
         let body = captured_request_body(requests.last().expect("request reached selected proxy"));
@@ -557,18 +989,18 @@ fn wire_profile() -> CodexWireProfileState {
     })
 }
 
-fn provider(store: &Arc<MemoryAccountStore>) -> CodexProvider {
+fn provider(store: &Arc<MemoryAccountStore>) -> Arc<CodexProvider> {
     provider_with_affinity(store, Arc::new(MemorySessionAffinity::default()))
 }
 
 fn provider_with_affinity(
     store: &Arc<MemoryAccountStore>,
     session_affinity: Arc<MemorySessionAffinity>,
-) -> CodexProvider {
+) -> Arc<CodexProvider> {
     provider_with_affinity_and_base_url(store, session_affinity, OFFICIAL_CODEX_BASE_URL.to_owned())
 }
 
-fn provider_with_base_url(store: &Arc<MemoryAccountStore>, base_url: String) -> CodexProvider {
+fn provider_with_base_url(store: &Arc<MemoryAccountStore>, base_url: String) -> Arc<CodexProvider> {
     provider_with_base_url_and_retry_budget(
         store,
         base_url,
@@ -580,7 +1012,7 @@ fn provider_with_base_url_and_retry_budget(
     store: &Arc<MemoryAccountStore>,
     base_url: String,
     stream_max_retries: u32,
-) -> CodexProvider {
+) -> Arc<CodexProvider> {
     provider_and_quota_with_affinity_and_base_url_and_leases(
         store,
         Arc::new(MemorySessionAffinity::default()),
@@ -594,7 +1026,7 @@ fn provider_with_base_url_and_retry_budget(
 fn provider_with_leases(
     store: &Arc<MemoryAccountStore>,
     leases: Arc<TestLeaseCoordinator>,
-) -> CodexProvider {
+) -> Arc<CodexProvider> {
     provider_with_affinity_and_base_url_and_leases(
         store,
         Arc::new(MemorySessionAffinity::default()),
@@ -607,7 +1039,7 @@ fn provider_with_affinity_and_base_url(
     store: &Arc<MemoryAccountStore>,
     session_affinity: Arc<MemorySessionAffinity>,
     base_url: String,
-) -> CodexProvider {
+) -> Arc<CodexProvider> {
     provider_with_affinity_and_base_url_and_leases(
         store,
         session_affinity,
@@ -621,7 +1053,7 @@ fn provider_with_affinity_and_base_url_and_leases(
     session_affinity: Arc<MemorySessionAffinity>,
     base_url: String,
     leases: Arc<TestLeaseCoordinator>,
-) -> CodexProvider {
+) -> Arc<CodexProvider> {
     provider_and_quota_with_affinity_and_base_url_and_leases(
         store,
         session_affinity,
@@ -638,7 +1070,7 @@ fn provider_and_quota_with_affinity_and_base_url_and_leases(
     base_url: String,
     leases: Arc<TestLeaseCoordinator>,
     stream_max_retries: u32,
-) -> (CodexProvider, Arc<CodexCredentialQuotaService>) {
+) -> (Arc<CodexProvider>, Arc<CodexCredentialQuotaService>) {
     let (provider, quota, _) = provider_and_quota_with_runtime_ports(
         store,
         session_affinity,
@@ -660,7 +1092,7 @@ fn provider_and_quota_with_runtime_ports(
     cooldowns: Arc<MemoryCooldownPort>,
     policy: Arc<dyn gateway_core::provider_ports::ProviderRuntimePolicyPort>,
 ) -> (
-    CodexProvider,
+    Arc<CodexProvider>,
     Arc<CodexCredentialQuotaService>,
     Arc<CodexWebSocketPool>,
 ) {
@@ -710,7 +1142,7 @@ fn provider_and_quota_with_runtime_ports(
         stream_max_retries,
     )
     .expect("official OpenAI provider");
-    (provider, quota, websocket_pool)
+    (Arc::new(provider), quota, websocket_pool)
 }
 
 async fn create_account(store: &Arc<MemoryAccountStore>, id: &str) {
@@ -852,6 +1284,7 @@ fn planned_provider_endpoint_request(provider_name: &str, operation: Operation) 
     let plan = snapshot
         .plan_provider_endpoint(
             &provider,
+            None,
             &operation,
             account_scope,
             &RoutingContext::default(),
@@ -931,6 +1364,118 @@ fn global_request_location() -> gateway_core::account::RequestLocation {
         city: "Auckland".to_owned(),
         timezone: "Pacific/Auckland".parse().expect("valid timezone"),
     }
+}
+
+#[derive(Debug)]
+struct TranslationMiddleware {
+    translations: Arc<Mutex<usize>>,
+    target: Map<String, Value>,
+}
+
+impl MiddlewarePlan for TranslationMiddleware {
+    fn handle(
+        &self,
+        context: MiddlewareContext,
+        request: MiddlewareRequest,
+        next: Box<dyn MiddlewareNext>,
+    ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
+        assert_eq!(context.mount(), MiddlewareMount::Attempt);
+        assert!(context.account_id().is_some());
+        *self.translations.lock().unwrap() += 1;
+        let (_, headers, _) = request.into_parts();
+        next.run(MiddlewareRequest::new(
+            "openai",
+            headers,
+            Bytes::from(serde_json::to_vec(&self.target).unwrap()),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct PassThroughMiddleware;
+
+impl MiddlewarePlan for PassThroughMiddleware {
+    fn handle(
+        &self,
+        _: MiddlewareContext,
+        request: MiddlewareRequest,
+        next: Box<dyn MiddlewareNext>,
+    ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
+        next.run(request)
+    }
+}
+
+#[derive(Debug)]
+struct RecordingMiddleware {
+    observed: Arc<Mutex<Vec<Map<String, Value>>>>,
+    replacement: (String, Value),
+    request_headers: Vec<MiddlewareHeader>,
+}
+
+impl MiddlewarePlan for RecordingMiddleware {
+    fn handle(
+        &self,
+        context: MiddlewareContext,
+        request: MiddlewareRequest,
+        next: Box<dyn MiddlewareNext>,
+    ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
+        assert_eq!(context.mount(), MiddlewareMount::Attempt);
+        assert_eq!(request.protocol(), "openai");
+        let (protocol, mut headers, bytes) = request.into_parts();
+        let mut body: Map<String, Value> = serde_json::from_slice(&bytes).unwrap();
+        self.observed.lock().unwrap().push(body.clone());
+        body.insert(self.replacement.0.clone(), self.replacement.1.clone());
+        headers.extend(self.request_headers.clone());
+        next.run(MiddlewareRequest::new(
+            protocol,
+            headers,
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct TestExtensionLease;
+
+impl ExtensionSetLease for TestExtensionLease {
+    fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+fn context_with_middleware(
+    request_id: &str,
+    plan: Arc<dyn MiddlewarePlan>,
+    disable_fast: bool,
+) -> AttemptContext {
+    let plan = FrozenMiddlewarePlan::new(
+        plan,
+        ExtensionSetReference::new(
+            ExtensionSetId::new(format!("thinking-{request_id}")).unwrap(),
+            Arc::new(TestExtensionLease),
+        ),
+    );
+    AttemptContext::new(
+        RequestAttemptContext::new(
+            ModelRequestId::new(request_id).expect("request id"),
+            ClientApiKeyId::new("key_openai_contract").expect("client key id"),
+        )
+        .with_disable_fast(disable_fast)
+        .with_middleware(
+            Some(plan),
+            Arc::from([]),
+            "/v1/responses".to_owned(),
+            ClientTransport::HttpSse,
+        )
+        .with_request_location(Some(global_request_location())),
+        NonZeroU32::MIN,
+        SystemTime::now() + Duration::from_secs(30),
+        account_policy(),
+        AccountAttemptContext::new(BTreeSet::new(), None, None)
+            .with_account_scope(contract_account_scope()),
+        None,
+        CancellationToken::new(),
+    )
 }
 
 fn context(request_id: &str, cancellation: CancellationToken) -> AttemptContext {
@@ -1862,7 +2407,7 @@ async fn exhausted_account_pool_returns_usage_limit_before_http_or_websocket_net
     let server = MockServer::start().await;
     let provider = provider_with_base_url(&store, server.uri());
     for operation in [http_generate_operation(), generate_operation()] {
-        let Err(error) = provider
+        let Err(error) = Arc::clone(&provider)
             .execute(
                 planned_request("openai", operation),
                 context("req_exhausted_pool", CancellationToken::new()),
@@ -2044,7 +2589,7 @@ async fn image_endpoints_bypass_only_the_text_catalog_and_preserve_the_current_c
             )]));
         let operation = Operation::GenerateImage(ImageRequest::from_raw_json(*kind, payload));
         let request = planned_provider_endpoint_request("openai", operation);
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 request,
                 context(
@@ -2518,7 +3063,7 @@ async fn assert_cross_endpoint_affinity(thread_id: Option<&str>) {
         Arc::clone(&leases),
     );
     let root = Operation::Generate(generate_with_session_context("shared-root", None, None));
-    let root_stream = provider
+    let root_stream = Arc::clone(&provider)
         .execute(
             planned_request("openai", root.clone()),
             context("req_cross_endpoint_root", CancellationToken::new()),
@@ -2532,7 +3077,7 @@ async fn assert_cross_endpoint_affinity(thread_id: Option<&str>) {
         thread_id,
         None,
     ));
-    let first = provider
+    let first = Arc::clone(&provider)
         .execute(
             planned_request("openai", generation.clone()),
             context("req_cross_endpoint_first", CancellationToken::new()),
@@ -2581,7 +3126,7 @@ async fn assert_cross_endpoint_affinity(thread_id: Option<&str>) {
             .continuation
             .affinity_hash
     );
-    let mut same = provider
+    let mut same = Arc::clone(&provider)
         .execute(
             planned_provider_endpoint_request("openai", search.clone()),
             context("req_cross_endpoint_search", CancellationToken::new()),
@@ -2604,7 +3149,7 @@ async fn assert_cross_endpoint_affinity(thread_id: Option<&str>) {
         .lock()
         .expect("busy accounts")
         .insert(first_account.clone());
-    let mut fallback = provider
+    let mut fallback = Arc::clone(&provider)
         .execute(
             planned_provider_endpoint_request("openai", search),
             context("req_cross_endpoint_busy", CancellationToken::new()),
@@ -2629,7 +3174,7 @@ async fn assert_cross_endpoint_affinity(thread_id: Option<&str>) {
     );
     store.set_scheduling(other_account, None, AccountWeight::new(1).expect("weight"));
 
-    let resumed = provider
+    let resumed = Arc::clone(&provider)
         .execute(
             planned_request("openai", generation.clone()),
             context("req_cross_endpoint_resumed", CancellationToken::new()),
@@ -2666,7 +3211,7 @@ async fn assert_cross_endpoint_affinity(thread_id: Option<&str>) {
                 .continuation
                 .affinity_hash
         );
-        let selected_image = provider
+        let selected_image = Arc::clone(&provider)
             .execute(
                 planned_provider_endpoint_request("openai", image),
                 context("req_cross_endpoint_image", CancellationToken::new()),
@@ -2680,7 +3225,7 @@ async fn assert_cross_endpoint_affinity(thread_id: Option<&str>) {
         drop(selected_image);
     }
     if thread_id.is_some() {
-        let root_stream = provider
+        let root_stream = Arc::clone(&provider)
             .execute(
                 planned_request("openai", root),
                 context(
@@ -3029,7 +3574,7 @@ async fn websocket_close_after_delivery_preserves_details_and_reconnects_through
         SESSION_ID,
         "thread-first",
     ));
-    let mut stream = provider
+    let mut stream = Arc::clone(&provider)
         .execute(
             planned_request("openai", first_operation),
             context("req_websocket_close", CancellationToken::new()),
@@ -3184,7 +3729,7 @@ async fn websocket_fast_path_miss_uses_http_and_keeps_background_preconnect() {
         ))
     };
 
-    let mut first = provider
+    let mut first = Arc::clone(&provider)
         .execute(
             planned_request("openai", operation("thread-http-fallback")),
             context("req_fast_path_http", CancellationToken::new()),
@@ -3704,7 +4249,7 @@ async fn ambiguous_websocket_close_reconnects_and_retains_native_continuation() 
         SESSION_ID,
         "thread-first",
     ));
-    let mut stream = provider
+    let mut stream = Arc::clone(&provider)
         .execute(
             planned_request("openai", operation),
             context("req_websocket_normal_close", CancellationToken::new()),
@@ -3777,7 +4322,7 @@ async fn ambiguous_websocket_close_reconnects_and_retains_native_continuation() 
         SESSION_ID,
         "thread-second",
     ));
-    let mut fresh_stream = provider
+    let mut fresh_stream = Arc::clone(&provider)
         .execute(
             planned_request("openai", second_operation),
             context("req_websocket_fresh_retry", CancellationToken::new()),
@@ -3814,7 +4359,7 @@ async fn ambiguous_websocket_close_reconnects_and_retains_native_continuation() 
         )
         .with_provider_session_state(recovered_session),
     );
-    let mut continuation_stream = provider
+    let mut continuation_stream = Arc::clone(&provider)
         .execute(
             planned_request("openai", continuation_operation),
             pinned_continuation_context(
@@ -3842,7 +4387,7 @@ async fn ambiguous_websocket_close_reconnects_and_retains_native_continuation() 
         Some("thread-first"),
         None,
     ));
-    let mut other_stream = provider
+    let mut other_stream = Arc::clone(&provider)
         .execute(
             planned_request("openai", other_operation),
             context("req_other_session_websocket", CancellationToken::new()),
@@ -3933,7 +4478,7 @@ async fn repeated_websocket_failures_exhaust_budget_then_use_http_and_report_htt
             "repeated-close",
             "turn",
         ));
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 planned_request("openai", operation),
                 context(
@@ -3962,7 +4507,7 @@ async fn repeated_websocket_failures_exhaust_budget_then_use_http_and_report_htt
             "repeated-close",
             "turn",
         ));
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 planned_request("openai", operation),
                 context(
@@ -4046,7 +4591,7 @@ async fn websocket_upgrade_required_immediately_enables_session_http_fallback() 
             None,
         ))
     };
-    let mut first = provider
+    let mut first = Arc::clone(&provider)
         .execute(
             planned_request("openai", operation()),
             context("req_upgrade_required", CancellationToken::new()),
@@ -4067,7 +4612,7 @@ async fn websocket_upgrade_required_immediately_enables_session_http_fallback() 
     );
     drop(first);
 
-    let mut second = provider
+    let mut second = Arc::clone(&provider)
         .execute(
             planned_request("openai", operation()),
             context("req_upgrade_required_next_turn", CancellationToken::new()),
@@ -4081,7 +4626,7 @@ async fn websocket_upgrade_required_immediately_enables_session_http_fallback() 
     tokio::time::pause();
     for index in 0..3 {
         tokio::time::advance(Duration::from_secs(5 * 60 * 60)).await;
-        let stream = provider
+        let stream = Arc::clone(&provider)
             .execute(
                 planned_request("openai", operation()),
                 context(
@@ -4093,7 +4638,7 @@ async fn websocket_upgrade_required_immediately_enables_session_http_fallback() 
             .expect("prepare active session");
         assert_eq!(stream.metadata().transport().as_str(), "http_sse");
     }
-    let unrelated = provider
+    let unrelated = Arc::clone(&provider)
         .execute(
             planned_request(
                 "openai",
@@ -4194,7 +4739,7 @@ async fn downstream_websocket_new_chain_should_override_session_and_attempt_http
         }
     });
     let provider = provider_with_base_url(&store, base_url);
-    let mut seed = provider
+    let mut seed = Arc::clone(&provider)
         .execute(
             planned_request(
                 "openai",
@@ -4246,7 +4791,7 @@ async fn downstream_websocket_new_chain_should_override_session_and_attempt_http
             )
             .unwrap(),
         );
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 planned_request("openai", Operation::Generate(request)),
                 attempt,
@@ -5431,7 +5976,7 @@ async fn account_selection_log_should_include_affinity_observation_fields() {
             )]));
         }
         let generation = GenerateRequest::from_protocol_payload(payload);
-        let stream = provider
+        let stream = Arc::clone(&provider)
             .execute(
                 planned_request("openai", Operation::Generate(generation)),
                 context(request_id, CancellationToken::new()),
@@ -5547,7 +6092,7 @@ async fn subagent_requests_should_share_the_root_session_account_affinity_key() 
                 .expect("OpenAI payload")
                 .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))])),
         );
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 planned_request("openai", Operation::Generate(generation)),
                 context(request_id, CancellationToken::new()),
@@ -5611,7 +6156,7 @@ async fn explicit_session_id_should_override_turn_specific_prompt_cache_keys_for
             )])),
         );
 
-        let stream = provider
+        let stream = Arc::clone(&provider)
             .execute(
                 planned_request("openai", Operation::Generate(generation)),
                 context(request_id, CancellationToken::new()),
@@ -5662,7 +6207,7 @@ async fn affinity_quota_switch_should_clear_old_turn_state_without_a_provider_st
     )
     .expect("OpenAI payload")
     .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
-    let first = provider
+    let first = Arc::clone(&provider)
         .execute(
             planned_request(
                 "openai",
@@ -5801,7 +6346,7 @@ async fn thread_spawn_children_should_inherit_the_root_with_independent_scoped_b
                 .affinity_hash
                 .expect("affinity hash"),
         );
-        let stream = provider
+        let stream = Arc::clone(&provider)
             .execute(
                 planned_request("openai", operation),
                 context(request_id, CancellationToken::new()),
@@ -5928,7 +6473,7 @@ async fn child_busy_failover_should_leave_the_running_parent_and_siblings_on_the
         server.uri(),
         Arc::clone(&leases),
     );
-    let child = provider
+    let child = Arc::clone(&provider)
         .execute(
             planned_request("openai", operation("child-one")),
             context("req_child_inherit", CancellationToken::new()),
@@ -5949,7 +6494,7 @@ async fn child_busy_failover_should_leave_the_running_parent_and_siblings_on_the
         .expect("busy accounts")
         .insert(root_account.clone());
     for thread in ["child-one", "cold-child"] {
-        let mut child = provider
+        let mut child = Arc::clone(&provider)
             .execute(
                 planned_request("openai", operation(thread)),
                 context("req_child_busy", CancellationToken::new()),
@@ -5990,7 +6535,7 @@ async fn child_busy_failover_should_leave_the_running_parent_and_siblings_on_the
         ("cold-child", "acct_subagent_b"),
         ("new-sibling", "acct_subagent_a"),
     ] {
-        let stream = provider
+        let stream = Arc::clone(&provider)
             .execute(
                 planned_request("openai", operation(thread)),
                 context("req_after_parent_completion", CancellationToken::new()),
@@ -6046,7 +6591,7 @@ async fn failed_child_failover_should_preserve_both_existing_bindings() {
         Arc::clone(&leases),
     );
     for thread in [None, Some("child")] {
-        let stream = provider
+        let stream = Arc::clone(&provider)
             .execute(
                 planned_request(
                     "openai",
@@ -6075,7 +6620,7 @@ async fn failed_child_failover_should_preserve_both_existing_bindings() {
         )
         .expect("search payload"),
     ));
-    let mut child = provider
+    let mut child = Arc::clone(&provider)
         .execute(
             planned_provider_endpoint_request("openai", search),
             context("req_failed_child", CancellationToken::new()),
@@ -6097,7 +6642,7 @@ async fn failed_child_failover_should_preserve_both_existing_bindings() {
     drop(child);
     leases.busy_accounts.lock().expect("busy accounts").clear();
     for thread in [None, Some("child")] {
-        let stream = provider
+        let stream = Arc::clone(&provider)
             .execute(
                 planned_request(
                     "openai",
@@ -6813,7 +7358,7 @@ fn provider_with_capacity_tracking(
     store: &Arc<MemoryAccountStore>,
     base_url: String,
     cooldowns: Arc<MemoryCooldownPort>,
-) -> (CodexProvider, Arc<CodexWebSocketPool>) {
+) -> (Arc<CodexProvider>, Arc<CodexWebSocketPool>) {
     let (provider, _, pool) = provider_and_quota_with_runtime_ports(
         store,
         Arc::new(MemorySessionAffinity::default()),
@@ -6888,7 +7433,7 @@ async fn capacity_feedback_only_counts_overload_rejections_and_excludes_diagnost
                     } else {
                         http_generate_operation()
                     };
-                    let mut stream = provider
+                    let mut stream = Arc::clone(&provider)
                         .execute(planned_request("openai", operation), attempt)
                         .await
                         .expect("prepare upstream attempt");
@@ -7670,7 +8215,7 @@ async fn exact_websocket_busy_then_replay_scope_relaxation_is_rejected_before_se
     )
     .expect("initial provider session state");
 
-    let mut seed = provider
+    let mut seed = Arc::clone(&provider)
         .execute(
             planned_request("openai", operation(None, initial_session_state)),
             context("req_ws_busy_seed", CancellationToken::new()),
@@ -7694,7 +8239,7 @@ async fn exact_websocket_busy_then_replay_scope_relaxation_is_rejected_before_se
     );
 
     let continuation = operation(Some(CLIENT_PREVIOUS_RESPONSE_ID), session_state);
-    let mut busy = provider
+    let mut busy = Arc::clone(&provider)
         .execute(
             planned_request("openai", continuation.clone()),
             pinned_continuation_context(
@@ -7719,7 +8264,7 @@ async fn exact_websocket_busy_then_replay_scope_relaxation_is_rejected_before_se
         }
     }
 
-    let mut exact = provider
+    let mut exact = Arc::clone(&provider)
         .execute(
             planned_request("openai", continuation.clone()),
             pinned_continuation_context(
@@ -7761,7 +8306,7 @@ async fn exact_websocket_busy_then_replay_scope_relaxation_is_rejected_before_se
         ),
         ("req_ws_busy_replay_any", 3, ContinuationAttempt::ReplayAny),
     ] {
-        let result = provider
+        let result = Arc::clone(&provider)
             .execute(
                 planned_request("openai", continuation.clone()),
                 pinned_continuation_context(
@@ -8556,7 +9101,7 @@ async fn completed_websocket_response_resets_consecutive_failure_budget() {
             "budget-reset",
             "turn",
         ));
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(
                 planned_request("openai", operation),
                 context(
@@ -8624,7 +9169,7 @@ async fn connection_limit_rejection_requests_one_provider_retry_and_reconnects_i
             "turn",
         ))
     };
-    let mut stream = provider
+    let mut stream = Arc::clone(&provider)
         .execute(
             planned_request("openai", operation()),
             context("req_rejected", CancellationToken::new()),
@@ -8890,7 +9435,7 @@ async fn assert_websocket_failure_headers(headers: Value, request_id: Option<&st
         ))
     };
     if reuse {
-        let mut first = provider
+        let mut first = Arc::clone(&provider)
             .execute(
                 planned_request("openai", operation()),
                 context("req_ws_initial", CancellationToken::new()),
@@ -9101,7 +9646,7 @@ async fn api_key_native_endpoints_preserve_bodies_headers_and_own_base_url() {
                 )),
                 _ => Operation::Search(StandaloneSearchRequest::from_raw_json(payload)),
             };
-            let mut stream = provider
+            let mut stream = Arc::clone(&provider)
                 .execute(
                     planned_provider_endpoint_request("openai", operation),
                     context(
@@ -9424,7 +9969,7 @@ async fn disabled_api_key_diagnostic_preserves_authentication_and_transport_cons
         .mount(&upstream)
         .await;
     let provider = provider_with_base_url(&store, oauth.uri());
-    let mut stream = provider
+    let mut stream = Arc::clone(&provider)
         .execute(
             planned_request("openai", generate_operation()),
             diagnostic_context("req_disabled_api_http", account_id),
@@ -9458,7 +10003,7 @@ async fn disabled_api_key_diagnostic_preserves_authentication_and_transport_cons
         )
         .expect("search payload"),
     ));
-    let result = provider
+    let result = Arc::clone(&provider)
         .execute(
             planned_request("openai", warmup),
             diagnostic_context("req_disabled_api_restricted", account_id),
@@ -9514,7 +10059,7 @@ async fn api_key_http_account_is_rejected_before_websocket_warmup_or_old_revisio
         .unwrap(),
     ));
     assert!(
-        provider
+        Arc::clone(&provider)
             .execute(
                 planned_request("openai", warmup),
                 diagnostic_context("req_api_warmup", "acct_provider_contract")
@@ -9968,7 +10513,7 @@ async fn quota_continuation_full_client_replay_selects_another_account() {
         "quota-replay",
         "turn",
     ));
-    let mut stream = provider
+    let mut stream = Arc::clone(&provider)
         .execute(
             planned_request("openai", first),
             context("req_quota_first", CancellationToken::new()),
@@ -9983,7 +10528,7 @@ async fn quota_continuation_full_client_replay_selects_another_account() {
         event.unwrap();
     }
     drop(stream);
-    let mut stream = provider
+    let mut stream = Arc::clone(&provider)
         .execute(
             planned_request("openai", quota_continuation_operation(true)),
             context("req_quota_delta", CancellationToken::new())
@@ -10165,7 +10710,7 @@ async fn fast_policy_changes_preserve_the_websocket_continuation_and_meter_each_
         } else {
             ContinuationAttempt::None
         });
-        let mut stream = provider
+        let mut stream = Arc::clone(&provider)
             .execute(planned_request("openai", operation), context)
             .await
             .unwrap();

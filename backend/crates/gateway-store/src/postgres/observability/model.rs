@@ -782,6 +782,7 @@ pub trait ObservabilityRepository: Send + Sync {
         query: ProviderAccountUsageQuery,
     ) -> StoreResult<Vec<ProviderAccountUsageObservation>>;
     async fn list_usage_records(&self, query: UsageRecordQuery) -> StoreResult<UsageRecordPage>;
+    async fn usage_provider_kinds(&self, range: ObservabilityRange) -> StoreResult<Vec<String>>;
     async fn usage_record_detail(&self, request_id: &str) -> StoreResult<UsageRecordDetail>;
     async fn usage_summary(
         &self,

@@ -4,6 +4,7 @@ use std::{borrow::Cow, fmt, net::IpAddr};
 
 use axum::http::HeaderMap;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use bytes::Bytes;
 use gateway_core::operation::{GenerateRequest, Operation, ProtocolPayload, ProviderSessionState};
 use gateway_protocol::openai::{
     X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER, X_OPENAI_MEMGEN_REQUEST_HEADER,
@@ -331,6 +332,20 @@ pub fn decode_request_with_headers(
 ) -> Result<DecodedResponsesRequest, RequestDecodeError> {
     let body = decompress_request_body(body, headers, max_decompressed_bytes)?;
     decode_request_inner(&body, &OpenAiRequestHeaders::from_headers(headers))
+}
+
+/// 解码请求并返回已经解除 HTTP content encoding 的中间件正文。
+///
+/// 外层中间件只接收有界的协议正文；terminal 会用中间件返回的正文重新解码，
+/// 因而不能把压缩字节与已经移除的传输编码语义混用。
+pub(crate) fn decode_request_with_body(
+    body: &[u8],
+    headers: &HeaderMap,
+    max_decompressed_bytes: usize,
+) -> Result<(DecodedResponsesRequest, Bytes), RequestDecodeError> {
+    let body = decompress_request_body(body, headers, max_decompressed_bytes)?;
+    let decoded = decode_request_inner(&body, &OpenAiRequestHeaders::from_headers(headers))?;
+    Ok((decoded, Bytes::copy_from_slice(&body)))
 }
 
 /// zstd 回溯窗口独立于输出上限，调整设置不能放大解码器内部窗口分配。

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Proxy 插件开发"
+  short_description: "从能力选择到 SDK 实现、管理页面、打包与验证的插件开发指南"
+  default_prompt: "使用 $plugin-dev 为 Codex Proxy RS 开发插件，先确认需要的能力，再按公开 SDK 实现、打包并验证。"

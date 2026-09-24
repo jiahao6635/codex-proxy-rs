@@ -1,14 +1,8 @@
 <script setup lang="ts">
+import { BaseCard, BaseCheckbox, BaseForm, BaseFormItem, BaseInput, BasePopover, BaseSwitch } from '@codex-proxy/ui'
+
 import { Activity, CircleAlert, Gauge, Snowflake, Timer } from '@lucide/vue'
 import { useId } from 'vue'
-
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseForm from '@/components/base/BaseForm/index.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
-import BasePopover from '@/components/base/BasePopover.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
 
 const enabled = defineModel<boolean>('enabled', { required: true })
 const threshold = defineModel<string>('threshold', { required: true })

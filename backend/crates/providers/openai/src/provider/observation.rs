@@ -812,5 +812,13 @@ pub(super) fn map_selection_error(error: CredentialSelectionError) -> ProviderEr
             ProviderErrorKind::ProviderInfrastructureUnavailable,
             UpstreamSendState::NotSent,
         ),
+        CredentialSelectionError::PolicyRejected => provider_error(
+            ProviderErrorKind::RequestPolicyDenied,
+            UpstreamSendState::NotSent,
+        ),
+        CredentialSelectionError::PolicyUnavailable => provider_error(
+            ProviderErrorKind::Unavailable,
+            UpstreamSendState::NotSent,
+        ),
     }
 }

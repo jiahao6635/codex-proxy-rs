@@ -3,11 +3,9 @@ import type { AccountRow } from '../constants'
 import type { ApiKeyAccountForm } from '../utils/upstreamApiKey'
 import type { AccountGroup, AccountModelAccess } from '@/api'
 
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseTextarea from '@/components/base/BaseTextarea.vue'
+import { BaseButton, BaseFormItem, BaseModal, BaseTextarea } from '@codex-proxy/ui'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
+import { isOpenAiApiKeyAccount } from '../utils/upstreamApiKey'
 import AccountApiKeyFields from './AccountApiKeyFields.vue'
 import AccountIdentityCell from './AccountIdentityCell.vue'
 import AccountPlanBadge from './AccountPlanBadge.vue'
@@ -63,7 +61,7 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
         </div>
       </div>
 
-      <section v-if="account.authenticationKind === 'api_key'" class="grid gap-4">
+      <section v-if="isOpenAiApiKeyAccount(account)" class="grid gap-4">
         <h3 class="m-0 text-cp font-heavy text-cp-text">
           上游连接
         </h3>
@@ -109,7 +107,7 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
       <BaseButton
         variant="primary"
         :loading="saving"
-        :disabled="!account || groupsLoading || (account.authenticationKind === 'api_key' && !configurationReady)"
+        :disabled="!account || groupsLoading || (isOpenAiApiKeyAccount(account) && !configurationReady)"
         @click="emit('save')"
       >
         保存更改

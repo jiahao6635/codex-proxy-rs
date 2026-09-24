@@ -1,6 +1,6 @@
 <script setup lang="ts">
+import { BaseConfirmModal } from '@codex-proxy/ui'
 import { onMounted } from 'vue'
-import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
 import { useAdminApiKey } from '../composables/useAdminApiKey'
 import AdminApiKeyCard from './AdminApiKeyCard.vue'
 import AdminPasswordCard from './AdminPasswordCard.vue'

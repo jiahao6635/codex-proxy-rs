@@ -1,10 +1,8 @@
 <script setup lang="ts">
+import type { BaseTableColumn } from '@codex-proxy/ui'
 import type { PricingRow } from './model'
-import type { BaseTableColumn } from '@/components/base/BaseTable/columns'
+import { BaseCheckbox, BaseIconButton, BaseTable } from '@codex-proxy/ui'
 import { Pencil, Trash2 } from '@lucide/vue'
-import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseTable from '@/components/base/BaseTable/index.vue'
 import { effectivePrice, multiplierText, sourceLabels } from './model'
 import PricingUnit from './PricingUnit.vue'
 

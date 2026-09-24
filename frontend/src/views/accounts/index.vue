@@ -1,16 +1,9 @@
 <script setup lang="ts">
+import { BaseCard, BaseCheckbox, BaseConfirmModal, BasePageHeader, BaseTable, BaseTableColumnSettings, BaseTablePagination, useTableColumns } from '@codex-proxy/ui'
+
 import { ChevronDown } from '@lucide/vue'
 import { ref } from 'vue'
-
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
-import BaseCard from '@/components/base/BaseCard.vue'
-import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
-import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
-import BasePageHeader from '@/components/base/BasePageHeader.vue'
-import BaseTableColumnSettings from '@/components/base/BaseTable/BaseTableColumnSettings.vue'
-import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
-import BaseTable from '@/components/base/BaseTable/index.vue'
-import { useTableColumns } from '@/components/base/BaseTable/useTableColumns'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
@@ -46,6 +39,7 @@ const {
   refreshAccountsSilently,
   searchQuery,
   providerQuery,
+  providers: accountFilterProviders,
   statusQuery,
   groupQuery,
   sort,
@@ -88,8 +82,17 @@ const {
   deletingAccount,
   creatingAccount,
   authorizingOAuth,
+  authorization,
+  authorizationCallback,
+  resetAuthorization,
+  accountProviders,
+  accountProvidersById,
+  accountProvidersLoading,
+  accountProvidersError,
+  loadAccountProviders,
   batchDeleting,
   exportingAccounts,
+  exportDisabledReason,
   reauthorizingAccount,
   createForm,
   handleCreate,
@@ -208,11 +211,13 @@ const {
           v-model:status="statusQuery"
           v-model:provider="providerQuery"
           v-model:group="groupQuery"
+          :providers="accountFilterProviders"
           :groups="groups"
           :groups-loading="groupsLoading"
           :selected-count="selectedIds.size"
           :batch-deleting="batchDeleting"
           :exporting-accounts="exportingAccounts"
+          :export-disabled-reason="exportDisabledReason"
           :has-import-tasks="recentImportTasks.length > 0"
           :active-import-count="activeImportCount"
           @import-tasks="showImportTasks = true"
@@ -320,6 +325,7 @@ const {
             <template #actions="{ row }">
               <AccountTableActions
                 :account="row"
+                :provider="accountProvidersById.get(row.provider)"
                 :deleting="deletingAccount"
                 :recovering="recoveringAccountIds.has(row.id)"
                 :refreshing="refreshingAccountIds.has(row.id)"
@@ -394,6 +400,11 @@ const {
     <AccountCreateModal
       v-model="showCreateModal"
       v-model:form="createForm"
+      v-model:callback="authorizationCallback"
+      :authorization="authorization"
+      :providers="accountProviders"
+      :providers-loading="accountProvidersLoading"
+      :providers-error="accountProvidersError"
       :account="reauthorizingAccount"
       :groups="groups"
       :groups-loading="groupsLoading"
@@ -402,6 +413,8 @@ const {
       :saving="creatingAccount"
       @create="handleCreate"
       @generate-oauth="handleAuthorizeOAuth"
+      @reset-authorization="resetAuthorization"
+      @reload-providers="loadAccountProviders"
     />
 
     <AccountEditModal

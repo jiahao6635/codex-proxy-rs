@@ -197,7 +197,7 @@ fn stdout_filter_directive(directive: &str, persistent_log_enabled: bool) -> Str
     if !persistent_log_enabled {
         format!("{directive},{OAUTH_RECOVERY_LOG_TARGET}=off,{REQUEST_DUMP_LOG_TARGET}=off")
     } else {
-        "off,gateway_startup=info".to_owned()
+        "off,gateway_startup=info,gateway_shutdown=info".to_owned()
     }
 }
 

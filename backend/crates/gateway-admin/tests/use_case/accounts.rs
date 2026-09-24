@@ -29,20 +29,21 @@ use gateway_admin::{
             BatchUpdateAccounts, DeleteAccounts, UpdateAccount,
         },
         observability::TimeRange,
+        provider_capabilities::ProviderCredentialCapabilities,
         provider_credentials::{
             AuthorizationCommit, AuthorizationCommitGuard, AuthorizationCredentialCommit,
             AuthorizationMutationTarget, AuthorizationStarted, CompleteAuthorization,
             ConsumeProviderResetCredit, CredentialCommitGuard, CredentialDetails,
             CredentialImportCommit, CredentialImportResult, CredentialMutationResult,
-            CredentialRotationCommit, PendingAuthorizationMutation, PrepareCredentialImport,
-            PrepareCredentialRefresh, PrepareCredentialRotation, PreparedAuthorizationCommit,
-            PreparedAuthorizationCredential, PreparedCredentialCreate, PreparedCredentialImport,
-            PreparedCredentialRotation, PreparedCredentialRotationFacts, ProviderDocument,
-            ProviderExport, ProviderExportCredentialInput, ProviderModels,
-            ProviderProfileActivityInsights, ProviderProfileStatistics,
-            ProviderProfileStatisticsSummary, ProviderQuota, ProviderQuotaRequest,
-            ProviderQuotaWindow, ProviderResetCreditResult, ProviderSubscription,
-            QuotaLocalUsageAttribution,
+            CredentialRotationCommit, PendingAuthorizationMutation, PluginAccountSaveReason,
+            PrepareCredentialImport, PrepareCredentialRefresh, PrepareCredentialRotation,
+            PreparedAuthorizationCommit, PreparedAuthorizationCredential, PreparedCredentialCreate,
+            PreparedCredentialImport, PreparedCredentialRotation, PreparedCredentialRotationFacts,
+            PreparedPluginAccountSave, ProviderDocument, ProviderExport,
+            ProviderExportCredentialInput, ProviderModels, ProviderProfileActivityInsights,
+            ProviderProfileStatistics, ProviderProfileStatisticsSummary, ProviderQuota,
+            ProviderQuotaRequest, ProviderQuotaWindow, ProviderResetCreditResult,
+            ProviderSubscription, QuotaLocalUsageAttribution,
         },
         quota_forecast_sampling::{QuotaForecastHistory, QuotaForecastUsage},
         settings::{
@@ -65,12 +66,20 @@ pub(super) type EventLog = Arc<Mutex<Vec<&'static str>>>;
 
 pub(super) struct FakeProviderAdmin {
     kind: ProviderKind,
+    credential_capabilities: Mutex<ProviderCredentialCapabilities>,
+    capabilities: Mutex<gateway_admin::model::provider_capabilities::ProviderAccountCapabilities>,
     events: EventLog,
     failure: Mutex<Option<ProviderAdminError>>,
     import_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     quota_failure: Mutex<Option<ProviderAdminErrorKind>>,
     pending: Arc<Mutex<Option<PendingAuthorizationMutation>>>,
     retry_authorization_after_abort: Mutex<bool>,
+    authorization_accounts: Mutex<Option<Vec<PreparedCredentialCreate>>>,
+    authorization_polls: Mutex<
+        std::collections::VecDeque<
+            gateway_admin::model::provider_credentials::PreparedAuthorizationPoll,
+        >,
+    >,
     export_inputs: Mutex<Vec<ProviderExportCredentialInput>>,
     import_account_ids: Mutex<Vec<String>>,
     quota_requests: Mutex<Vec<ProviderQuotaRequest>>,
@@ -86,15 +95,33 @@ pub(super) struct FakeProviderAdmin {
 }
 
 impl FakeProviderAdmin {
+    pub(super) fn set_authorization_accounts(&self, accounts: Vec<PreparedCredentialCreate>) {
+        *self.authorization_accounts.lock().unwrap() = Some(accounts);
+    }
+
+    pub(super) fn queue_authorization_poll(
+        &self,
+        result: gateway_admin::model::provider_credentials::PreparedAuthorizationPoll,
+    ) {
+        self.authorization_polls.lock().unwrap().push_back(result);
+    }
+
     pub(super) fn new(kind: &str, events: EventLog) -> Arc<Self> {
         Arc::new(Self {
             kind: ProviderKind::new(kind).expect("provider kind"),
+            credential_capabilities: Mutex::new(ProviderCredentialCapabilities {
+                export: true,
+                ..Default::default()
+            }),
+            capabilities: Mutex::default(),
             events,
             failure: Mutex::new(None),
             import_gate: Mutex::new(None),
             quota_failure: Mutex::new(None),
             pending: Arc::new(Mutex::new(None)),
             retry_authorization_after_abort: Mutex::new(false),
+            authorization_accounts: Mutex::new(None),
+            authorization_polls: Mutex::default(),
             export_inputs: Mutex::new(Vec::new()),
             import_account_ids: Mutex::new(vec!["acct_prepared".to_owned()]),
             quota_requests: Mutex::new(Vec::new()),
@@ -258,6 +285,17 @@ impl FakeProviderAdmin {
 
 #[async_trait]
 impl ProviderAdmin for FakeProviderAdmin {
+    fn credential_capabilities(&self) -> ProviderCredentialCapabilities {
+        self.credential_capabilities.lock().unwrap().clone()
+    }
+
+    fn account_capabilities(
+        &self,
+        _account_id: &ProviderAccountId,
+        _authentication_kind: &str,
+    ) -> gateway_admin::model::provider_capabilities::ProviderAccountCapabilities {
+        *self.capabilities.lock().unwrap()
+    }
     fn provider_kind(&self) -> &ProviderKind {
         &self.kind
     }
@@ -300,7 +338,7 @@ impl ProviderAdmin for FakeProviderAdmin {
         self.record("provider.account_facts_changed");
     }
 
-    fn connection_test_operation(
+    async fn connection_test_operation(
         &self,
         model: &gateway_core::routing::UpstreamModelId,
         input: &str,
@@ -364,8 +402,9 @@ impl ProviderAdmin for FakeProviderAdmin {
 
     async fn start_authorization(
         &self,
-        pending: PendingAuthorizationMutation,
+        command: gateway_admin::model::provider_credentials::PrepareAuthorization,
     ) -> Result<AuthorizationStarted, ProviderAdminError> {
+        let pending = command.pending;
         self.record("provider.start_authorization");
         self.require_available()?;
         *self.pending.lock().expect("pending authorization") = Some(pending);
@@ -398,12 +437,20 @@ impl ProviderAdmin for FakeProviderAdmin {
         .then(|| pending.clone());
         let credential = match pending.target() {
             AuthorizationMutationTarget::Create { name } => {
-                PreparedAuthorizationCredential::Create(prepared_create(self.kind.clone(), name))
+                PreparedAuthorizationCredential::Create(
+                    self.authorization_accounts
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .unwrap_or_else(|| vec![prepared_create(self.kind.clone(), name)]),
+                )
             }
             AuthorizationMutationTarget::Reauthorize { account_id } => {
                 let mut account = account_record(self.kind.as_str());
                 account.id = account_id.as_str().to_owned();
-                PreparedAuthorizationCredential::Reauthorize(self.prepared_rotation(&account))
+                PreparedAuthorizationCredential::Reauthorize(Box::new(
+                    self.prepared_rotation(&account),
+                ))
             }
         };
         let prepared = PreparedAuthorizationCommit::new(pending, credential);
@@ -417,6 +464,22 @@ impl ProviderAdmin for FakeProviderAdmin {
             }
             None => prepared,
         })
+    }
+
+    async fn poll_authorization(
+        &self,
+        _command: gateway_admin::model::provider_credentials::PollAuthorization,
+    ) -> Result<
+        gateway_admin::model::provider_credentials::PreparedAuthorizationPoll,
+        ProviderAdminError,
+    > {
+        self.record("provider.poll_authorization");
+        self.require_available()?;
+        self.authorization_polls
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(unsupported)
     }
 
     async fn prepare_rotation(
@@ -539,6 +602,12 @@ pub(super) struct FakeAccountStore {
     accounts: Mutex<Vec<AccountRecord>>,
     account_after_probe: Mutex<Option<AccountRecord>>,
     fail_commit: Mutex<bool>,
+    receipts: Mutex<
+        std::collections::BTreeMap<
+            gateway_admin::model::provider_credentials::AuthorizationReceiptKey,
+            gateway_admin::model::provider_credentials::CredentialBatchMutationResult,
+        >,
+    >,
     audit_requests: Mutex<Vec<String>>,
     import_settings: Mutex<Vec<Option<gateway_admin::model::accounts::AccountImportSettings>>>,
     quota_window_usage: Mutex<Vec<AccountUsageWindowResult>>,
@@ -559,6 +628,7 @@ impl FakeAccountStore {
             accounts: Mutex::new(vec![account]),
             account_after_probe: Mutex::new(None),
             fail_commit: Mutex::new(false),
+            receipts: Mutex::new(Default::default()),
             audit_requests: Mutex::new(Vec::new()),
             import_settings: Mutex::new(Vec::new()),
             quota_window_usage: Mutex::new(Vec::new()),
@@ -654,6 +724,17 @@ impl FakeAccountStore {
 
 #[async_trait]
 impl AccountStore for FakeAccountStore {
+    async fn list_plugin_accounts(
+        &self,
+        _: gateway_admin::model::provider_credentials::PluginAccountListQuery,
+    ) -> AdminStoreResult<gateway_admin::model::provider_credentials::PluginAccountPage> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "plugin accounts",
+            "unavailable",
+        ))
+    }
+
     async fn list_accounts(
         &self,
         _: AccountListQuery,
@@ -664,6 +745,12 @@ impl AccountStore for FakeAccountStore {
         let total = accounts.len() as u64;
         Ok(AccountPage {
             config_revision: revision(1),
+            providers: accounts
+                .iter()
+                .map(|account| account.provider_kind.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
             items: accounts.into_iter().map(Self::page_item).collect(),
             total,
             summary: AccountSummary {
@@ -756,6 +843,24 @@ impl AccountStore for FakeAccountStore {
         }))
     }
 
+    async fn credential_details_by_id(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> AdminStoreResult<Option<CredentialDetails>> {
+        self.record("store.credential_details_by_id");
+        let account = self
+            .accounts
+            .lock()
+            .expect("accounts")
+            .iter()
+            .find(|account| account.id == account_id.as_str())
+            .cloned();
+        Ok(account.map(|credential| CredentialDetails {
+            config_revision: revision(1),
+            credential,
+        }))
+    }
+
     async fn load_credentials_for_export(
         &self,
         provider_kind: &ProviderKind,
@@ -782,6 +887,24 @@ impl AccountStore for FakeAccountStore {
                 provider_material: document(),
             })
             .collect())
+    }
+
+    async fn load_credential_for_plugin(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> AdminStoreResult<Option<ProviderExportCredentialInput>> {
+        self.record("store.load_credential_for_plugin");
+        Ok(self
+            .accounts
+            .lock()
+            .expect("accounts")
+            .iter()
+            .find(|account| account.id == account_id.as_str())
+            .cloned()
+            .map(|account| ProviderExportCredentialInput {
+                account,
+                provider_material: document(),
+            }))
     }
 
     async fn commit_credential_import(
@@ -811,26 +934,65 @@ impl AccountStore for FakeAccountStore {
         &self,
         command: AuthorizationCommit,
         context: &MutationContext,
-    ) -> AdminStoreResult<CredentialMutationResult> {
+    ) -> AdminStoreResult<gateway_admin::model::provider_credentials::AuthorizationCommitResult>
+    {
         self.import_settings
             .lock()
             .expect("import settings")
             .push(command.settings);
+        if let Some(result) = self.receipts.lock().unwrap().get(&command.key).cloned() {
+            return Ok(
+                gateway_admin::model::provider_credentials::AuthorizationCommitResult {
+                    result,
+                    newly_committed: false,
+                },
+            );
+        }
         self.record("store.commit_authorization");
         self.record_context(context);
         self.require_commit()?;
-        let (account_id, credential_revision) = match command.credential {
-            AuthorizationCredentialCommit::Create(credential) => (credential.account_id, None),
-            AuthorizationCredentialCommit::Reauthorize(credential) => (
-                credential.account_id,
-                Some(revision(credential.expected_credential_revision.get() + 1)),
-            ),
+        let accounts = match command.credential {
+            AuthorizationCredentialCommit::Create(credentials) => credentials
+                .into_iter()
+                .map(
+                    |credential| gateway_admin::model::provider_credentials::AuthorizedAccount {
+                        account_id: credential.account_id,
+                        credential_revision: None,
+                    },
+                )
+                .collect(),
+            AuthorizationCredentialCommit::Reauthorize(credential) => vec![
+                gateway_admin::model::provider_credentials::AuthorizedAccount {
+                    account_id: credential.account_id,
+                    credential_revision: Some(revision(
+                        credential.expected_credential_revision.get() + 1,
+                    )),
+                },
+            ],
         };
-        Ok(CredentialMutationResult {
+        let result = gateway_admin::model::provider_credentials::CredentialBatchMutationResult {
             config_revision: revision(2),
-            account_id,
-            credential_revision,
-        })
+            accounts,
+        };
+        self.receipts
+            .lock()
+            .unwrap()
+            .insert(command.key, result.clone());
+        Ok(
+            gateway_admin::model::provider_credentials::AuthorizationCommitResult {
+                result,
+                newly_committed: true,
+            },
+        )
+    }
+
+    async fn authorization_receipt(
+        &self,
+        key: &gateway_admin::model::provider_credentials::AuthorizationReceiptKey,
+    ) -> AdminStoreResult<
+        Option<gateway_admin::model::provider_credentials::CredentialBatchMutationResult>,
+    > {
+        Ok(self.receipts.lock().unwrap().get(key).cloned())
     }
 
     async fn commit_credential_rotation(
@@ -997,8 +1159,7 @@ impl SettingsStore for StaticSettingsStore {
     }
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings> {
         Ok(RuntimeSettings {
-            openai_client_profile: None,
-            xai_client_profile: None,
+            request_profiles: Default::default(),
             request_location_enabled: false,
             request_location: Default::default(),
             config_revision: revision(1),
@@ -1259,6 +1420,66 @@ async fn connection_test_should_preserve_disabled_account_status() {
 }
 
 #[tokio::test]
+async fn accounts_export_should_reject_unsupported_before_loading_secrets() {
+    let events = events();
+    let provider = FakeProviderAdmin::new("local-echo", events.clone());
+    provider.credential_capabilities.lock().unwrap().export = false;
+    let store = FakeAccountStore::new("local-echo", events.clone());
+    let error = accounts_service(provider, store)
+        .await
+        .accounts()
+        .export(
+            &context("unsupported-export"),
+            vec![ProviderAccountId::new("acct_test").unwrap()],
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), gateway_admin::model::AdminErrorKind::Invalid);
+    assert_eq!(recorded(&events), ["store.load_account"]);
+}
+
+#[tokio::test]
+async fn accounts_export_should_validate_all_providers_before_loading_any_secret() {
+    for registered in [true, false] {
+        let events = events();
+        let native = FakeProviderAdmin::new("openai", events.clone());
+        let plugin = FakeProviderAdmin::new("z-plugin", events.clone());
+        plugin.credential_capabilities.lock().unwrap().export = false;
+        let store = FakeAccountStore::new("openai", events.clone());
+        let mut other = account_record("z-plugin");
+        other.id = "acct_plugin".to_owned();
+        store.accounts.lock().unwrap().push(other);
+        let mut harness = super::AdminHarness::new()
+            .accounts(store)
+            .settings(Arc::new(StaticSettingsStore))
+            .provider(native);
+        if registered {
+            harness = harness.provider(plugin);
+        }
+        let error = harness
+            .build()
+            .await
+            .accounts()
+            .export(
+                &context("mixed-provider-export"),
+                vec![
+                    ProviderAccountId::new("acct_test").unwrap(),
+                    ProviderAccountId::new("acct_plugin").unwrap(),
+                ],
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), gateway_admin::model::AdminErrorKind::Invalid);
+        assert_eq!(
+            recorded(&events),
+            ["store.load_account", "store.load_account"]
+        );
+    }
+}
+
+#[tokio::test]
 async fn accounts_export_should_pass_store_loaded_timestamps_and_material_to_provider() {
     let provider = FakeProviderAdmin::new("openai", events());
     let store = FakeAccountStore::new("openai", events());
@@ -1319,6 +1540,162 @@ async fn accounts_refresh_should_keep_guard_through_store_commit() {
         ]
     );
     assert_eq!(store.audit_requests(), ["refresh-request"]);
+}
+
+#[tokio::test]
+async fn plugin_account_saves_reuse_commits_and_defer_publication_inside_runtime_calls() {
+    for (reason, commit_event, request_id) in [
+        (
+            PluginAccountSaveReason::ModelDiscovery,
+            "store.commit_refresh",
+            "plugin-model-discovery",
+        ),
+        (
+            PluginAccountSaveReason::Maintenance,
+            "store.commit_refresh",
+            "plugin-maintenance",
+        ),
+        (
+            PluginAccountSaveReason::Explicit,
+            "store.commit_rotation",
+            "plugin-explicit-save",
+        ),
+    ] {
+        let events = events();
+        let provider = FakeProviderAdmin::new("openai", events.clone());
+        let store = FakeAccountStore::new("openai", events.clone());
+        let snapshot = Arc::new(RecordingPluginAccountPublication(events.clone()));
+        let access = gateway_admin::initialize_plugin_accounts(
+            ProviderAdminRegistry::new([provider.clone() as Arc<dyn ProviderAdmin>]).unwrap(),
+            store.clone(),
+            snapshot,
+        );
+
+        let result = access
+            .save(
+                PreparedPluginAccountSave::Replace {
+                    facts: plugin_rotation_facts(&account_record("openai")),
+                    authentication_kind: "oauth".to_owned(),
+                    reason,
+                },
+                &context(request_id),
+            )
+            .await
+            .expect("save prepared plugin account facts");
+        if reason == PluginAccountSaveReason::Explicit {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                provider.quota_started.notified(),
+            )
+            .await
+            .expect("start post-commit quota observation");
+        } else {
+            // Runtime 内保存时仍持有编译或刷新资源，不能重入 Provider/额度查询。
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(result.account_id.as_str(), "acct_test");
+        assert_eq!(result.credential_revision, revision(2));
+        assert_eq!(store.audit_requests(), [request_id]);
+        let mut expected = vec!["store.credential_details", commit_event];
+        if reason == PluginAccountSaveReason::Explicit {
+            expected.extend([
+                "provider.account_facts_changed",
+                "snapshot.publish_committed",
+                "provider.quota",
+            ]);
+        } else {
+            expected.push("snapshot.publish_committed_deferred");
+        }
+        assert_eq!(recorded(&events), expected);
+    }
+}
+
+#[tokio::test]
+async fn plugin_account_reads_resolve_the_authoritative_provider_from_the_account_id() {
+    let events = events();
+    let store = FakeAccountStore::new("xai", events.clone());
+    // 读取端口不能让调用方提供或伪造 Provider；注册表中即使只有另一 Provider，
+    // 也必须按 Store 中该 account ID 的权威事实返回。
+    let registered_provider = FakeProviderAdmin::new("openai", events.clone());
+    let access = gateway_admin::initialize_plugin_accounts(
+        ProviderAdminRegistry::new([registered_provider as Arc<dyn ProviderAdmin>]).unwrap(),
+        store,
+        Arc::new(RecordingPluginAccountPublication(events.clone())),
+    );
+    let account_id = ProviderAccountId::new("acct_test").expect("account ID");
+
+    let runtime = access
+        .get_runtime(&account_id)
+        .await
+        .expect("load plugin account runtime");
+    let credential = access
+        .get_credential(&account_id)
+        .await
+        .expect("load plugin account credential");
+
+    assert_eq!(runtime.provider_kind.as_str(), "xai");
+    assert_eq!(credential.account.provider_kind.as_str(), "xai");
+    assert_eq!(credential.account.id, account_id.as_str());
+    assert_eq!(
+        recorded(&events),
+        [
+            "store.credential_details_by_id",
+            "store.load_credential_for_plugin",
+        ]
+    );
+}
+
+struct RecordingPluginAccountPublication(EventLog);
+
+impl gateway_core::runtime::SnapshotControl for RecordingPluginAccountPublication {
+    fn publish_committed(
+        &self,
+        revision: gateway_core::routing::ConfigRevision,
+    ) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            assert_eq!(revision.get(), 2);
+            self.0.lock().unwrap().push("snapshot.publish_committed");
+        })
+    }
+
+    fn publish_committed_deferred(
+        &self,
+        revision: gateway_core::routing::ConfigRevision,
+    ) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            assert_eq!(revision.get(), 2);
+            self.0
+                .lock()
+                .unwrap()
+                .push("snapshot.publish_committed_deferred");
+        })
+    }
+}
+
+#[tokio::test]
+async fn plugin_account_save_rejects_stale_authentication_kind_before_commit() {
+    let events = events();
+    let provider = FakeProviderAdmin::new("openai", events.clone());
+    let store = FakeAccountStore::new("openai", events.clone());
+    let services = accounts_service(provider, store.clone()).await;
+
+    let error = services
+        .plugin_accounts_handle()
+        .save(
+            PreparedPluginAccountSave::Replace {
+                facts: plugin_rotation_facts(&account_record("openai")),
+                authentication_kind: "api_key".to_owned(),
+                reason: PluginAccountSaveReason::Explicit,
+            },
+            &context("plugin-stale-auth-kind"),
+        )
+        .await
+        .expect_err("authentication kind change must be rejected");
+
+    assert_eq!(error.kind(), gateway_admin::model::AdminErrorKind::Conflict);
+    assert_eq!(recorded(&events), ["store.credential_details"]);
+    assert!(store.audit_requests().is_empty());
 }
 
 #[tokio::test]
@@ -1644,6 +2021,12 @@ async fn accounts_batch_update_should_commit_once_and_notify_each_provider() {
 #[tokio::test]
 async fn accounts_list_should_return_complete_directory_semantics() {
     let provider = FakeProviderAdmin::new("openai", events());
+    let capabilities = gateway_admin::model::provider_capabilities::ProviderAccountCapabilities {
+        quota: true,
+        profile: true,
+        ..Default::default()
+    };
+    *provider.capabilities.lock().unwrap() = capabilities;
     let mut stored = account_record("openai");
     stored.plan_type = Some("  self_serve_business_prolite  ".to_owned());
     let store = FakeAccountStore::with_account(stored, events());
@@ -1665,6 +2048,7 @@ async fn accounts_list_should_return_complete_directory_semantics() {
     assert_eq!(page.summary.total, 1);
     assert_eq!(page.summary.normal, 1);
     let account = page.items.first().expect("account item");
+    assert_eq!(account.capabilities, capabilities);
     assert_eq!(account.account.provider_kind.as_str(), "openai");
     assert_eq!(
         account.projection.status,
@@ -1690,6 +2074,7 @@ async fn accounts_list_should_return_complete_directory_semantics() {
         .await
         .expect("account detail");
     assert_eq!(detail.plan_type_display, account.plan_type_display);
+    assert_eq!(detail.capabilities, account.capabilities);
     assert_eq!(detail.account.plan_type, account.account.plan_type);
 }
 
@@ -2039,6 +2424,11 @@ async fn quota_forecast_reads_raw_snapshot_and_limits_usage_to_observation_time(
         report.forecasts[0].source.as_ref().unwrap().observed_at,
         Some(observed)
     );
+    assert_eq!(
+        report.forecasts[1].source.as_ref().unwrap().label,
+        report.forecasts[0].source.as_ref().unwrap().label,
+        "缺少月窗口时两个展示周期复用同一周窗口"
+    );
     let queries = store.quota_window_queries();
     assert_eq!(queries.len(), 1);
     assert_eq!(queries[0].range.start, reset - TimeDelta::days(7));
@@ -2067,6 +2457,70 @@ async fn quota_forecast_does_not_query_usage_without_a_current_snapshot() {
     );
     assert!(store.quota_window_queries().is_empty());
     assert!(!provider.quota_requests.lock().unwrap()[0].refresh);
+}
+
+#[tokio::test]
+async fn quota_forecast_only_queries_the_two_selected_source_windows() {
+    let provider = FakeProviderAdmin::new("openai", events());
+    let now = Utc::now();
+    let observed = now - TimeDelta::minutes(1);
+    let reset = now + TimeDelta::days(1);
+    let windows = (0..64)
+        .map(|index| {
+            let monthly = index % 2 == 1;
+            ProviderQuotaWindow {
+                key: if monthly {
+                    format!("month-{index}")
+                } else {
+                    format!("week-{index}")
+                },
+                group: if monthly { "monthly" } else { "shortTerm" }.to_owned(),
+                label: format!("window-{index}"),
+                limit_id: None,
+                limit_name: None,
+                role: None,
+                local_usage_attribution: QuotaLocalUsageAttribution::AccountWide,
+                window_seconds: Some(if monthly { 30 } else { 7 } * 86_400),
+                used_percent: Some(20.0),
+                reset_at: Some(reset),
+                limit_reached: false,
+                local_usage: None,
+                provider_data: None,
+            }
+        })
+        .collect();
+    provider.set_quota(ProviderQuota {
+        plan_type: Some("pro".to_owned()),
+        observed_at: Some(observed),
+        windows,
+        ..empty_quota()
+    });
+    let mut account = account_record("openai");
+    account.created_at = now - TimeDelta::days(60);
+    let store = FakeAccountStore::with_account(account, events());
+    let report = accounts_service(provider, store.clone())
+        .await
+        .accounts()
+        .quota_forecast(&ProviderAccountId::new("acct_test").unwrap())
+        .await
+        .expect("quota forecast");
+
+    let queries = store.quota_window_queries();
+    assert_eq!(
+        queries
+            .iter()
+            .map(|query| query.key.as_str())
+            .collect::<Vec<_>>(),
+        ["week-0", "month-1"]
+    );
+    assert_eq!(
+        report.forecasts[0].source.as_ref().unwrap().label,
+        "window-0"
+    );
+    assert_eq!(
+        report.forecasts[1].source.as_ref().unwrap().label,
+        "window-1"
+    );
 }
 
 #[tokio::test]
@@ -2531,6 +2985,52 @@ async fn reset_credit_oauth_refresh_should_reuse_the_exact_consume_command() {
 }
 
 #[tokio::test]
+async fn reset_credit_refresh_without_quota_should_complete_with_the_same_command() {
+    let events = events();
+    let provider = FakeProviderAdmin::new("example", events.clone());
+    provider.fail_next(ProviderAdminErrorKind::CredentialRefreshRequired);
+    *provider.quota_failure.lock().unwrap() = Some(ProviderAdminErrorKind::Unsupported);
+    let store = FakeAccountStore::new("example", events.clone());
+    let services = accounts_service(provider.clone(), store).await;
+    let command = ConsumeProviderResetCredit {
+        account_id: ProviderAccountId::new("acct_test").unwrap(),
+        credit_id: Some("credit_1".into()),
+        redeem_request_id: uuid::Uuid::parse_str("dbabeb20-040e-4e9f-8615-0b7c81e79987").unwrap(),
+    };
+
+    let result = services
+        .accounts()
+        .consume_reset_credit(&context("reset-without-quota"), command.clone())
+        .await
+        .expect("缺少可选额度能力不能中断凭据刷新后的消费重试");
+
+    assert_eq!(result.code, "reset");
+    assert_eq!(provider.reset_credit_commands(), [command.clone(), command]);
+    assert_eq!(
+        recorded(&events)
+            .iter()
+            .filter(|event| **event == "store.commit_refresh")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn accounts_quota_refresh_should_still_reject_an_unsupported_operation() {
+    let provider = FakeProviderAdmin::new("example", events());
+    *provider.quota_failure.lock().unwrap() = Some(ProviderAdminErrorKind::Unsupported);
+    let services = accounts_service(provider, FakeAccountStore::new("example", events())).await;
+
+    let error = services
+        .accounts()
+        .quota(&ProviderAccountId::new("acct_test").unwrap(), true)
+        .await
+        .expect_err("显式刷新不能被解释为空额度投影");
+
+    assert_eq!(error.kind(), gateway_admin::model::AdminErrorKind::Invalid);
+}
+
+#[tokio::test]
 async fn reset_credit_unknown_result_should_keep_a_stable_admin_kind() {
     let events = events();
     let provider = FakeProviderAdmin::new("openai", events.clone());
@@ -2710,7 +3210,7 @@ fn prepared_create(provider_kind: ProviderKind, name: &str) -> PreparedCredentia
     prepared_create_with_id(provider_kind, "acct_prepared", name)
 }
 
-fn prepared_create_with_id(
+pub(super) fn prepared_create_with_id(
     provider_kind: ProviderKind,
     account_id: &str,
     name: &str,
@@ -2744,6 +3244,23 @@ fn rotation_result(command: CredentialRotationCommit) -> CredentialMutationResul
         credential_revision: Some(revision(
             command.prepared.expected_credential_revision.get() + 1,
         )),
+    }
+}
+
+fn plugin_rotation_facts(account: &AccountRecord) -> PreparedCredentialRotationFacts {
+    PreparedCredentialRotationFacts {
+        account_id: ProviderAccountId::new(account.id.clone()).expect("account ID"),
+        provider_kind: account.provider_kind.clone(),
+        expected_credential_revision: account.credential_revision,
+        replacement_identity: None,
+        name: "plugin refreshed account".to_owned(),
+        email: account.email.clone(),
+        plan_type: account.plan_type.clone(),
+        preserve_profile: true,
+        provider_material: document(),
+        has_refresh_token: account.has_refresh_token,
+        access_token_expires_at: account.access_token_expires_at,
+        next_refresh_at: account.next_refresh_at,
     }
 }
 
@@ -2935,6 +3452,7 @@ impl AccountProbe for SuccessfulAccountProbe {
     fn probe(
         &self,
         _: AccountProbeRequest,
+        _: Option<Arc<gateway_core::routing::RuntimeSnapshot>>,
     ) -> BoxFuture<'_, Result<AccountProbeResult, AccountProbeError>> {
         Box::pin(async {
             Ok(AccountProbeResult {
@@ -2950,6 +3468,7 @@ impl AccountProbe for FailingAccountProbe {
     fn probe(
         &self,
         _: AccountProbeRequest,
+        _: Option<Arc<gateway_core::routing::RuntimeSnapshot>>,
     ) -> BoxFuture<'_, Result<AccountProbeResult, AccountProbeError>> {
         Box::pin(async {
             let detail = ClientVisibleUpstreamError::new(
@@ -2979,6 +3498,7 @@ impl AccountProbe for FreeModelQuotaProbe {
     fn probe(
         &self,
         _: AccountProbeRequest,
+        _: Option<Arc<gateway_core::routing::RuntimeSnapshot>>,
     ) -> BoxFuture<'_, Result<AccountProbeResult, AccountProbeError>> {
         Box::pin(async move {
             self.store.set_account_after_probe(account_record("xai"));
@@ -3021,4 +3541,30 @@ pub(super) fn import_settings() -> gateway_admin::model::accounts::AccountImport
                 .expect("group ID"),
         ],
     }
+}
+
+#[tokio::test]
+async fn unregistered_provider_accounts_have_no_live_management_capabilities() {
+    let provider = FakeProviderAdmin::new("openai", events());
+    let store = FakeAccountStore::with_account(account_record("retired-provider"), events());
+    let services = accounts_service(provider, store).await;
+    let page = services
+        .accounts()
+        .list(AccountListQuery {
+            page: 1,
+            page_size: gateway_admin::model::PageSize::new(20).unwrap(),
+            provider_kind: None,
+            group_filter: None,
+            search: None,
+            status: None,
+            sort: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(
+        page.items[0].account.provider_kind.as_str(),
+        "retired-provider"
+    );
+    assert_eq!(page.items[0].capabilities, Default::default());
 }

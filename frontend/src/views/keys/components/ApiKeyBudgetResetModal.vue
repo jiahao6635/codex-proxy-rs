@@ -1,12 +1,9 @@
 <script setup lang="ts">
 import type { ApiKey } from '@/api'
+import { BaseButton, BaseModal, BaseSegmented, toast } from '@codex-proxy/ui'
 import { ArrowRight } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
 import { resetApiKeyBudget } from '@/api'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 
 const props = defineProps<{ apiKey: ApiKey | null }>()

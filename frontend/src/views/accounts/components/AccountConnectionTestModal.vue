@@ -1,11 +1,8 @@
 <script setup lang="ts">
 import type { useAccountConnectionTest } from '../composables/useAccountConnectionTest'
 
+import { BaseButton, BaseIconButton, BaseModal, BaseSelect } from '@codex-proxy/ui'
 import { RefreshCw } from '@lucide/vue'
-import BaseButton from '@/components/base/BaseButton.vue'
-import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseModal from '@/components/base/BaseModal/index.vue'
-import BaseSelect from '@/components/base/BaseSelect.vue'
 import AccountIdentityCell from './AccountIdentityCell.vue'
 import AccountStatusBadge from './AccountStatusBadge/index.vue'
 
