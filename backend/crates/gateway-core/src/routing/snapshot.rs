@@ -345,7 +345,8 @@ impl RuntimeSnapshotCompiler {
             }
             let provider_kinds = catalog_generations.keys().cloned().collect();
             let snapshot =
-                compile_runtime_snapshot(facts, self.catalogs.as_ref(), provider_kinds).await?;
+                compile_runtime_snapshot(facts, self.catalogs.as_ref(), provider_kinds, None)
+                    .await?;
             let observed_generations = self.catalogs.catalog_generations();
             if catalog_generations == observed_generations {
                 return Ok(snapshot.with_provider_catalog_generations(observed_generations));
@@ -353,12 +354,30 @@ impl RuntimeSnapshotCompiler {
         }
         Err(RuntimeSnapshotCompileError::CatalogChanged)
     }
+
+    /// 配置提交只重读持久化事实；沿用已发布目录，交由周期对账刷新上游目录。
+    pub(crate) async fn compile_with_cached_catalog(
+        &self,
+        previous: &RuntimeSnapshot,
+    ) -> Result<RuntimeSnapshot, RuntimeSnapshotCompileError> {
+        let facts = self
+            .store
+            .load_snapshot_facts()
+            .await
+            .map_err(|_| RuntimeSnapshotCompileError::StoreUnavailable)?;
+        if facts.config_revision != facts.observed_current_revision {
+            return Err(RuntimeSnapshotCompileError::RevisionChanged);
+        }
+        let providers = self.catalogs.catalog_generations().into_keys().collect();
+        compile_runtime_snapshot(facts, self.catalogs.as_ref(), providers, Some(previous)).await
+    }
 }
 
 async fn compile_runtime_snapshot(
     facts: SnapshotFacts,
     catalogs: &dyn ProviderCatalogPort,
     provider_kinds: Vec<ProviderKind>,
+    previous: Option<&RuntimeSnapshot>,
 ) -> Result<RuntimeSnapshot, RuntimeSnapshotCompileError> {
     let registered_providers = provider_kinds.iter().cloned().collect::<BTreeSet<_>>();
 
@@ -366,6 +385,26 @@ async fn compile_runtime_snapshot(
     let mut provider_models = Vec::new();
     let mut exhaustive_provider_catalogs = BTreeSet::new();
     for provider in &provider_kinds {
+        if let Some(previous) = previous {
+            if previous.exhaustive_provider_catalogs.contains(provider) {
+                exhaustive_provider_catalogs.insert(provider.clone());
+            }
+            if let Some(models) = previous.provider_models.get(provider) {
+                provider_models.extend(models.iter().map(|(model, capabilities)| {
+                    let compiled =
+                        ProviderModel::new(provider.clone(), model.clone(), capabilities.clone());
+                    match previous
+                        .provider_model_presentations
+                        .get(provider)
+                        .and_then(|presentations| presentations.get(model))
+                    {
+                        Some(presentation) => compiled.with_presentation(presentation.clone()),
+                        None => compiled,
+                    }
+                }));
+            }
+            continue;
+        }
         let Ok(models) = catalogs.query_model_capabilities(provider).await else {
             continue;
         };

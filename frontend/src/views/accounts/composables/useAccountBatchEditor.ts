@@ -94,8 +94,8 @@ export function useAccountBatchEditor(options: {
       })
       showBatchEditModal.value = false
       options.selectedIds.value = new Set()
-      await Promise.all([options.reloadAccounts(), options.reloadGroups()])
       toast.success(`已更新 ${accountIds.length} 个账号`)
+      void Promise.allSettled([options.reloadAccounts(), options.reloadGroups()])
     }, { onError: () => void options.reloadAccounts() })
   }
 

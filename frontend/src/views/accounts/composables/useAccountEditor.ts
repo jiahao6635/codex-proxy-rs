@@ -133,8 +133,8 @@ export function useAccountEditor(options: {
         await updateAccount(settings)
       }
       showEditModal.value = false
-      await Promise.all([options.reloadAccounts(), options.reloadGroups()])
       toast.success('账号已更新')
+      void Promise.allSettled([options.reloadAccounts(), options.reloadGroups()])
     })
   }
 

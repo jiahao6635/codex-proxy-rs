@@ -141,6 +141,7 @@ pub struct RuntimeSnapshotPublisher {
 enum RefreshMode {
     Required,
     Reconcile,
+    Committed,
 }
 
 impl RuntimeSnapshotPublisher {
@@ -191,7 +192,15 @@ impl RuntimeSnapshotPublisher {
         } else {
             true
         };
-        let snapshot = self.compiler.compile().await.inspect_err(|_| {
+        let compiled = if matches!(mode, RefreshMode::Committed) {
+            match self.snapshots.acquire() {
+                Ok(previous) => self.compiler.compile_with_cached_catalog(&previous).await,
+                Err(_) => self.compiler.compile().await,
+            }
+        } else {
+            self.compiler.compile().await
+        };
+        let snapshot = compiled.inspect_err(|_| {
             // 仅目录代次变化时保留旧快照，下一周期继续对账；配置缺失、变化
             // 或持久 revision 回退均须 fail closed，不按 revision 大小丢弃刷新。
             if configuration_changed {
@@ -216,7 +225,7 @@ impl RuntimeSnapshotPublisher {
 
     /// 数据库提交不能被目录或通知基础设施的暂时故障伪装成回滚。
     async fn publish_committed_inner(&self, committed_revision: ConfigRevision) {
-        let _ = self.refresh().await;
+        let _ = self.refresh_with_mode(RefreshMode::Committed).await;
         let _ = self
             .subscriptions
             .publish_snapshot_revision(committed_revision)

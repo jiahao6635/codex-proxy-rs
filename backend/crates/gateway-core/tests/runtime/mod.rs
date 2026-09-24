@@ -17,8 +17,9 @@ use gateway_core::routing::snapshot::{
     SnapshotStoreError, SnapshotStorePort,
 };
 use gateway_core::routing::{
-    AccountGroupId, ConfigRevision, ProviderCatalogGeneration, ProviderCatalogPort,
-    ProviderCatalogUnavailable, ProviderKind, ProviderModelCapabilities, RuntimeSnapshot,
+    AccountGroupId, ConfigRevision, ModelCapabilities, ProviderCatalogGeneration,
+    ProviderCatalogPort, ProviderCatalogUnavailable, ProviderKind, ProviderModelCapabilities,
+    RuntimeSnapshot, UpstreamModelId,
 };
 use gateway_core::runtime::{
     RuntimeSnapshotHandle, RuntimeSnapshotPublisher, SnapshotControl, SnapshotRevisionStream,
@@ -159,6 +160,62 @@ fn publisher_should_refresh_locally_and_notify_committed_revision() {
             .as_slice(),
         &[revision(2)],
     );
+}
+
+#[test]
+fn committed_account_change_should_publish_without_waiting_for_provider_catalog() {
+    block_on(async {
+        let store = Arc::new(TestSnapshotStore::new(Ok(scoped_facts(9, true))));
+        let catalog = Arc::new(TestCatalog::default());
+        catalog
+            .models
+            .lock()
+            .expect("models lock")
+            .push(ProviderModelCapabilities::new(
+                UpstreamModelId::new("listed-model").expect("model"),
+                ModelCapabilities::new(Default::default(), None),
+            ));
+        let compiler = Arc::new(catalog_compiler(store.clone(), catalog.clone()));
+        let initial = compiler.compile().await.expect("initial snapshot");
+        let provider = ProviderKind::new("audit").expect("provider");
+        let initial_models = initial.public_models_for_provider(&provider);
+        let handle = RuntimeSnapshotHandle::new(initial);
+        let publisher = RuntimeSnapshotPublisher::new(
+            compiler,
+            handle.clone(),
+            Arc::new(TestSnapshotSubscriptions::default()),
+        );
+        *store.facts.lock().expect("facts lock") = Ok(scoped_facts(10, false));
+        *store.current_revision.lock().expect("revision lock") = Ok(revision(10));
+        let (release, gate) = oneshot::channel();
+        *catalog.next_query.lock().expect("catalog gate lock") = Some(gate);
+
+        publisher.publish_committed(revision(10)).await;
+        let committed = handle.acquire().expect("committed snapshot");
+        assert_eq!(committed.revision(), revision(10));
+        assert!(!removed_account_allowed(&committed));
+        assert_eq!(
+            committed.public_models_for_provider(&provider),
+            initial_models
+        );
+        assert_eq!(catalog.queries.load(Ordering::SeqCst), 1);
+        assert_ne!(
+            committed.provider_catalog_generations(),
+            &catalog.catalog_generations(),
+        );
+
+        let mut reconcile = Box::pin(publisher.refresh());
+        assert!(futures::poll!(reconcile.as_mut()).is_pending());
+        release.send(()).expect("release catalog query");
+        reconcile.await.expect("catalog reconciliation");
+        assert_eq!(
+            handle
+                .acquire()
+                .expect("reconciled snapshot")
+                .provider_catalog_generations(),
+            &catalog.catalog_generations(),
+        );
+    });
 }
 
 #[test]
@@ -546,6 +603,7 @@ struct TestCatalog {
     generation: AtomicU64,
     queries: AtomicUsize,
     next_query: Mutex<Option<oneshot::Receiver<()>>>,
+    models: Mutex<Vec<ProviderModelCapabilities>>,
 }
 
 impl ProviderCatalogPort for TestCatalog {
@@ -566,7 +624,7 @@ impl ProviderCatalogPort for TestCatalog {
             if let Some(gate) = gate {
                 gate.await.expect("release catalog query");
             }
-            Ok(Vec::new())
+            Ok(self.models.lock().expect("models lock").clone())
         })
     }
 }
