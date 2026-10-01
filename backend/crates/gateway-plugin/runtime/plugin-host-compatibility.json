@@ -13,6 +13,6 @@
     { "capability": "observer", "versions": [1] },
     { "capability": "command_line", "versions": [1] },
     { "capability": "management", "versions": [1] },
-    { "capability": "maintenance", "versions": [1] }
+    { "capability": "maintenance", "versions": [1, 2] }
   ]
 }

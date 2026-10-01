@@ -27,6 +27,39 @@ struct BlockingCallbacks {
 }
 
 #[derive(Default)]
+struct MaintenanceCallbacks {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CallbackHandler for MaintenanceCallbacks {
+    fn call(
+        &self,
+        context: CallContext,
+        method: String,
+        _params: serde_json::Value,
+        payload: Vec<u8>,
+    ) -> BoxFuture<'static, Result<RpcReply, PluginFault>> {
+        let started = Arc::clone(&self.started);
+        let release = Arc::clone(&self.release);
+        let dropped = Arc::clone(&self.dropped);
+        Box::pin(async move {
+            assert_eq!(context.stage, Stage::Maintenance);
+            assert_eq!(context.timeout_ms, 600_000);
+            assert_eq!(method, "host.model.execute_stream");
+            let _drop = CallbackDrop(dropped);
+            started.notify_one();
+            release.notified().await;
+            Ok(RpcReply {
+                result: json!({}),
+                payload,
+            })
+        })
+    }
+}
+
+#[derive(Default)]
 struct LifecycleCallbacks {
     begun: AtomicUsize,
     finished: AtomicUsize,
@@ -197,10 +230,24 @@ fn prepared_session() -> (
     Handshake,
     gateway_host::process::ProcessSupervisor,
 ) {
+    prepared_session_with_contributions(gateway_plugin_sdk::Contributions::new())
+}
+
+fn prepared_session_with_contributions(
+    contributes: gateway_plugin_sdk::Contributions,
+) -> (
+    tempfile::TempDir,
+    Arc<gateway_plugin_runtime::PreparedPackage>,
+    Handshake,
+    gateway_host::process::ProcessSupervisor,
+) {
     let cache = tempfile::tempdir().unwrap();
     let package = Arc::new(
         ValidatedPackage::read(
-            crate::support::package(crate::support::worker()),
+            crate::support::package_with_contributions(
+                crate::support::worker(),
+                contributes.clone(),
+            ),
             None,
             PackageLimits::default(),
         )
@@ -219,11 +266,136 @@ fn prepared_session() -> (
         generation: 1,
         incarnation: uuid::Uuid::new_v4().to_string(),
         configuration: json!({}),
-        contributes: gateway_plugin_sdk::Contributions::new(),
+        contributes,
     };
     let processes =
         gateway_host::process::ProcessSupervisor::new(std::num::NonZeroUsize::new(128).unwrap());
     (cache, prepared, handshake, processes)
+}
+
+#[tokio::test]
+async fn extended_maintenance_deadline_requires_v2_and_does_not_extend_other_stages() {
+    for version in [1, 2] {
+        let (capability, mut declaration) = crate::support::contribution(
+            gateway_plugin_sdk::Capability::Maintenance,
+            vec![Stage::Maintenance],
+            vec![],
+            vec![],
+        );
+        declaration.version = version;
+        let (_cache, prepared, handshake, processes) = prepared_session_with_contributions(
+            gateway_plugin_sdk::Contributions::from([(capability, declaration)]),
+        );
+        let session = RpcSession::start(
+            prepared,
+            handshake,
+            RpcLimits::default(),
+            &processes,
+            Arc::new(Callbacks::default()),
+        )
+        .await
+        .unwrap();
+        let maintenance = session.context(Stage::Maintenance, Duration::MAX);
+        assert_eq!(
+            maintenance.timeout_ms,
+            if version == 2 { 600_000 } else { 120_000 }
+        );
+        for stage in [Stage::Management, Stage::PublicManagement, Stage::Request] {
+            let mut context = session.context(stage, Duration::MAX);
+            assert_eq!(context.timeout_ms, 120_000);
+            context.timeout_ms = 600_000;
+            assert!(matches!(
+                session.call("echo", context, json!({}), vec![]).await,
+                Err(RpcError::Context)
+            ));
+        }
+        let mut oversized = maintenance;
+        oversized.timeout_ms += 1;
+        assert!(matches!(
+            session
+                .call("plugin.reconcile", oversized, json!({}), vec![])
+                .await,
+            Err(RpcError::Context)
+        ));
+        session.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+#[tokio::test]
+async fn maintenance_v2_model_callback_survives_thirty_seconds_and_is_cancelled_on_shutdown() {
+    let (capability, mut declaration) = crate::support::contribution(
+        gateway_plugin_sdk::Capability::Maintenance,
+        vec![Stage::Maintenance],
+        vec![],
+        vec![],
+    );
+    declaration.version = 2;
+    let (_cache, prepared, mut handshake, processes) = prepared_session_with_contributions(
+        gateway_plugin_sdk::Contributions::from([(capability, declaration)]),
+    );
+    handshake.configuration = json!({"data_queries":[{
+        "method":"host.model.execute_stream", "query":{"fixture":true}
+    }]});
+    let callbacks = Arc::new(MaintenanceCallbacks::default());
+    let session = Arc::new(
+        RpcSession::start(
+            prepared,
+            handshake,
+            RpcLimits::default(),
+            &processes,
+            callbacks.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let mut calling = {
+        let session = session.clone();
+        tokio::spawn(async move {
+            session
+                .call(
+                    "plugin.reconcile",
+                    session.context(Stage::Maintenance, Duration::from_secs(600)),
+                    json!({}),
+                    vec![],
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), callbacks.started.notified())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(31), &mut calling)
+            .await
+            .is_err()
+    );
+    callbacks.release.notify_one();
+    let reply = tokio::time::timeout(Duration::from_secs(5), calling)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.result, json!({}));
+    callbacks.dropped.store(false, Ordering::Release);
+    let calling = {
+        let session = session.clone();
+        tokio::spawn(async move {
+            session
+                .call(
+                    "plugin.reconcile",
+                    session.context(Stage::Maintenance, Duration::from_secs(600)),
+                    json!({}),
+                    vec![],
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), callbacks.started.notified())
+        .await
+        .unwrap();
+    session.shutdown(Duration::from_secs(1)).await;
+    assert!(matches!(calling.await.unwrap(), Err(RpcError::Closed)));
+    assert!(callbacks.dropped.load(Ordering::Acquire));
 }
 
 #[cfg(target_os = "linux")]

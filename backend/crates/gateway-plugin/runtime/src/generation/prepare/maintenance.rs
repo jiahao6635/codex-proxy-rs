@@ -16,7 +16,6 @@ use tokio::{sync::Notify, task::JoinSet};
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_secs(5);
-const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct MaintenanceTask {
     runtime: Arc<PluginRuntime>,
@@ -119,7 +118,7 @@ async fn reconcile(session: Arc<RpcSession>, dirty: Arc<Notify>, cancellation: C
             () = dirty.notified() => {},
             () = tokio::time::sleep(RECONCILE_INTERVAL) => {},
         }
-        let context = session.context(Stage::Maintenance, CALL_TIMEOUT);
+        let context = session.context(Stage::Maintenance, session.maintenance_timeout());
         let instance_id = context.instance_id.clone();
         let result = tokio::select! {
             biased;

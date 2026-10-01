@@ -154,6 +154,30 @@ fn capability_contract_versions_are_checked_independently_of_rpc_version() {
 }
 
 #[test]
+fn maintenance_accepts_explicit_long_call_contract_without_changing_v1() {
+    for version in [1, 2] {
+        let mut manifest = packaged_manifest();
+        manifest.contributes.insert(
+            Capability::Maintenance,
+            ContributionDeclaration {
+                id: "9acme.request-tags.maintenance".into(),
+                version,
+                stages: vec![Stage::Maintenance],
+                input_formats: vec![],
+                output_formats: vec![],
+            },
+        );
+        assert!(manifest.validate().is_ok());
+        manifest
+            .contributes
+            .get_mut(&Capability::Maintenance)
+            .unwrap()
+            .version = 3;
+        assert_eq!(manifest.validate(), Err(ManifestError::Invalid));
+    }
+}
+
+#[test]
 fn package_rejects_file_directory_conflicts_and_missing_declared_files() {
     let mut manifest = packaged_manifest();
     manifest
