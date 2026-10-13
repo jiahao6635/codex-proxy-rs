@@ -224,9 +224,24 @@ export function usageLatencyDetails(record: UsageLatencyRecord) {
   return {
     upstreamDisplay,
     firstOutputDisplay: formatDuration(firstTokenMs),
+    firstOutputSeverity: latencySeverity(firstTokenMs, [10_000, 30_000, 60_000]),
     totalDisplay: formatDuration(totalMs),
+    totalSeverity: latencySeverity(totalMs, [60_000, 180_000, 300_000]),
     sections,
   }
+}
+
+function latencySeverity(ms: number | null, thresholds: readonly [number, number, number]): 'good' | 'warn' | 'slow' | 'critical' | null {
+  if (ms === null)
+    return null
+  // 沿用 sub2api 的固定分档，边界值进入下一档，不改变请求状态
+  if (ms >= thresholds[2])
+    return 'critical'
+  if (ms >= thresholds[1])
+    return 'slow'
+  if (ms >= thresholds[0])
+    return 'warn'
+  return 'good'
 }
 
 export function usageBillingText(record: Pick<UsageCommonRecord, 'billing'>) {

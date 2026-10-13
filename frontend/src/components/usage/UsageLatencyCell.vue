@@ -10,17 +10,41 @@ const props = defineProps<{
 }>()
 
 const latencyDetails = computed(() => usageLatencyDetails(props.record))
+
+const latencyTones = {
+  good: { text: 'text-cp-success-text', color: 'var(--cp-color-success)' },
+  warn: { text: 'text-cp-warning-text', color: 'var(--cp-color-warning)' },
+  // 主题的 Orange 与 Warning 共用色种，混入 Error 让相邻两档可区分
+  slow: { text: 'latency-slow', color: 'color-mix(in oklab, var(--cp-color-warning) 65%, var(--cp-color-error))' },
+  critical: { text: 'text-cp-error-text', color: 'var(--cp-color-error)' },
+}
+
+const latencyBarStyle = computed(() => {
+  const { firstOutputSeverity, totalSeverity } = latencyDetails.value
+  const totalColor = totalSeverity === null ? 'var(--cp-color-fill-tertiary)' : latencyTones[totalSeverity].color
+  const firstColor = firstOutputSeverity === null ? totalColor : latencyTones[firstOutputSeverity].color
+  return { background: `linear-gradient(to bottom, ${firstColor} 40%, ${totalColor} 60%)` }
+})
 </script>
 
 <template>
   <div class="flex items-center justify-end gap-1.5">
+    <span
+      class="w-1 self-stretch shrink-0 rounded-full"
+      :style="latencyBarStyle"
+      aria-hidden="true"
+    />
     <div
       class="grid grid-cols-[auto_auto] items-center justify-end gap-x-2 gap-y-1.5 whitespace-nowrap font-mono text-cp-sm leading-none font-heavy tabular-nums"
     >
       <span class="text-cp-xs text-cp-text-quaternary">首字</span>
-      <span class="text-cp-text-secondary">{{ latencyDetails.firstOutputDisplay }}</span>
+      <span :class="latencyDetails.firstOutputSeverity === null ? 'text-cp-text-quaternary' : latencyTones[latencyDetails.firstOutputSeverity].text">
+        {{ latencyDetails.firstOutputDisplay }}
+      </span>
       <span class="text-cp-xs text-cp-text-quaternary">总耗时</span>
-      <span class="text-cp-text">{{ latencyDetails.totalDisplay }}</span>
+      <span :class="latencyDetails.totalSeverity === null ? 'text-cp-text-quaternary' : latencyTones[latencyDetails.totalSeverity].text">
+        {{ latencyDetails.totalDisplay }}
+      </span>
     </div>
 
     <UsageDetailPopover trigger-label="查看延迟明细">
@@ -58,3 +82,9 @@ const latencyDetails = computed(() => usageLatencyDetails(props.record))
     </UsageDetailPopover>
   </div>
 </template>
+
+<style scoped>
+.latency-slow {
+  color: color-mix(in oklab, var(--cp-color-warning-text) 65%, var(--cp-color-error-text));
+}
+</style>
