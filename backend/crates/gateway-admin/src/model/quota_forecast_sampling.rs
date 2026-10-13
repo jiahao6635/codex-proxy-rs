@@ -142,7 +142,7 @@ pub fn select_forecast_sample(
     };
     history.push(current);
     // 重置边界不在查询起点时，从首个新观测重新计数，避免把旧周期累计带入总量
-    let mut cycle_baseline = interrupted.then(|| &history[0]);
+    let cycle_baseline = interrupted.then(|| &history[0]);
     let mut anchors: Vec<&QuotaForecastPoint> = Vec::new();
     let mut high_water: Option<&QuotaForecastPoint> = None;
     for point in &history {
@@ -155,9 +155,9 @@ pub fn select_forecast_sample(
                 if previous.used_percent - point.used_percent <= 1.0 {
                     continue;
                 }
+                // 同窗口回落不能证明周期重置，只重建采样并保留已记录累计
                 sample.discontinuous = true;
                 anchors.clear();
-                cycle_baseline = Some(point);
             }
         }
         high_water = Some(point);
