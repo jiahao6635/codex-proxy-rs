@@ -104,8 +104,19 @@ impl WebSocketOriginBreaker {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if permit_still_owns_state(circuits.get(origin_key), generation) {
-            circuits.insert(origin_key.to_string(), CircuitState::closed());
+        let Some(state) = circuits.get_mut(origin_key) else {
+            return;
+        };
+        if !permit_still_owns_state(Some(state), generation) {
+            return;
+        }
+        match state {
+            CircuitState::Closed { failures, .. } => {
+                // 保留同轮尚未完成的 opening，让其后续结果继续参与计数
+                failures.clear();
+            }
+            CircuitState::HalfOpen { .. } => *state = CircuitState::closed(),
+            CircuitState::Open { .. } => {}
         }
     }
 
@@ -224,7 +235,7 @@ enum CircuitState {
 impl CircuitState {
     fn closed() -> Self {
         Self::Closed {
-            // 每次恢复都创建新代次，阻止旧 opening 的迟到结果影响新的失败窗口
+            // 初始化或半开恢复时创建新代次，隔离之前熔断周期的迟到结果
             generation: Uuid::new_v4(),
             failures: VecDeque::new(),
         }

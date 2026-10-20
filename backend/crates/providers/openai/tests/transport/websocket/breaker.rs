@@ -1,4 +1,4 @@
-//! 验证 WebSocket 熔断状态恢复后迟到结果的代次隔离
+//! 验证 WebSocket 熔断器的并发建连结果与跨轮次隔离
 
 use std::time::Duration;
 
@@ -14,6 +14,45 @@ fn acquire(breaker: &WebSocketOriginBreaker) -> WebSocketOriginBreakerPermit {
         panic!("expected an opening permit");
     };
     permit
+}
+
+#[test]
+fn closed_success_should_keep_counting_concurrent_failures() {
+    let config = WebSocketOriginBreakerConfig::default();
+    let breaker = WebSocketOriginBreaker::with_config(config);
+    let success = acquire(&breaker);
+    let pending_failures = (0..config.failure_threshold)
+        .map(|_| acquire(&breaker))
+        .collect::<Vec<_>>();
+
+    success.succeed();
+    for permit in pending_failures {
+        permit.fail();
+    }
+
+    assert!(matches!(
+        breaker.try_acquire(ORIGIN),
+        WebSocketOriginBreakerDecision::Open
+    ));
+}
+
+#[test]
+fn concurrent_closed_success_should_clear_previous_failures() {
+    let config = WebSocketOriginBreakerConfig::default();
+    let breaker = WebSocketOriginBreaker::with_config(config);
+    let first_success = acquire(&breaker);
+    let pending_success = acquire(&breaker);
+
+    first_success.succeed();
+    for _ in 0..config.failure_threshold - 1 {
+        acquire(&breaker).fail();
+    }
+    pending_success.succeed();
+    for _ in 0..config.failure_threshold - 1 {
+        acquire(&breaker).fail();
+    }
+
+    acquire(&breaker).succeed();
 }
 
 #[tokio::test(start_paused = true)]
